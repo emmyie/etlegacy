@@ -151,6 +151,11 @@ void DX12_DrawStretchPicGradient(float x, float y, float w, float h,
                                  qhandle_t hShader, const float *gradientColor, int gradientType);
 void DX12_Add2dPolys(polyVert_t *polys, int numverts, qhandle_t hShader);
 
+
+void DX12_StripExtension( const char* in, char* out, int size );
+int DX12_Stricmp( const char* s1, const char* s2 );
+
+
 #endif // _WIN32
 
 #endif // TR_DX12_LOCAL_H

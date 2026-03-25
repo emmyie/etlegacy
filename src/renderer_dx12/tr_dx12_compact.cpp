@@ -32,3 +32,21 @@ void Info_SetValueForKey( char* s, const char* key, const char* value )
 
 	std::strcat( s, newPair );
 }
+
+void DX12_StripExtension( const char* in, char* out, int size )
+{
+	strncpy( out, in, size );
+	out[ size - 1 ] = '\0';
+
+	char* dot = strrchr( out, '.' );
+	if ( dot ) *dot = '\0';
+}
+
+int DX12_Stricmp( const char* s1, const char* s2 )
+{
+#ifdef _WIN32
+	return _stricmp( s1, s2 );
+#else
+	return strcasecmp( s1, s2 );
+#endif
+}
