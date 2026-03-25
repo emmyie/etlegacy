@@ -220,6 +220,11 @@ FILE(GLOB RENDERER_VULKAN_SHADERS
 	"src/renderer_vk/glsl/*/*.glsl"
 )
 
+FILE(GLOB RENDERER_DX12_FILES
+	"src/renderer_dx12/*.cpp"
+	"src/renderer_dx12/*.h"
+)
+
 FILE(GLOB IRC_CLIENT_FILES
 	"src/irc/htable.c"
 	"src/irc/htable.h"

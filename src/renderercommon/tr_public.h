@@ -266,6 +266,10 @@ typedef struct
 
 	qboolean (*GLimp_SplashImage)(qboolean (*LoadSplashImage)(const char *name, byte *data, unsigned int size, unsigned int width, unsigned int height, uint8_t bytes));
 
+	/// Get the platform window handle.
+	/// Returns the Win32 HWND cast to void* on Windows, NULL on other platforms.
+	void *(*GetHWND)(void);
+
 } refimport_t;
 
 /// this is the only function actually exported at the linker level

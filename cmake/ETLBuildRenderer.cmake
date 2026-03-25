@@ -7,6 +7,7 @@ if(NOT APPLE)
 	set(R2_NAME renderer_opengl2_${ARCH})
 	set(R_ES_NAME renderer_opengles_${ARCH})
 	set(R_VULKAN_NAME renderer_vulkan_${ARCH})
+	set(R_DX12_NAME renderer_dx12_${ARCH})
 else()
 	set(R1_NAME renderer_opengl1${LIB_SUFFIX})
 	set(R2_NAME renderer_opengl2${LIB_SUFFIX})
@@ -29,6 +30,10 @@ endif()
 
 if(FEATURE_RENDERER_VULKAN)
 	list(APPEND RENDERERS_BUILDING "vulkan")
+endif()
+
+if(FEATURE_RENDERER_DX12)
+	list(APPEND RENDERERS_BUILDING "dx12")
 endif()
 
 if(RENDERERS_BUILDING)
@@ -182,4 +187,14 @@ if(FEATURE_RENDERER_VULKAN)
 	endif()
 
 	configure_renderer(renderer_vulkan ${R_VULKAN_NAME})
+endif()
+
+if(FEATURE_RENDERER_DX12)
+	add_library(renderer_dx12 ${REND_LIBTYPE} ${RENDERER_DX12_FILES} ${RENDERER_COMMON})
+	target_compile_definitions(renderer_dx12 PRIVATE FEATURE_RENDERER_DX12)
+	target_compile_definitions(client_libraries INTERFACE FEATURE_RENDERER_DX12)
+	target_include_directories(renderer_dx12 PRIVATE src/renderer_dx12)
+	target_link_libraries(renderer_dx12 renderer_libraries d3d12 dxgi d3dcompiler)
+
+	configure_renderer(renderer_dx12 ${R_DX12_NAME})
 endif()

@@ -46,6 +46,7 @@ void IN_Restart(void);
 
 //SDL Window system
 void *GLimp_MainWindow(void);
+void *SDL_GetHWND(void);
 void GLimp_Minimize(void);
 void GLimp_FlashWindow(int);
 

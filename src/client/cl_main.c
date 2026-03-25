@@ -3117,6 +3117,7 @@ void CL_InitRef(void)
 	ri.GLimp_SwapFrame   = GLimp_EndFrame;
 	ri.GLimp_SetGamma    = GLimp_SetGamma;
 	ri.GLimp_SplashImage = GLimp_SplashImage;
+	ri.GetHWND           = SDL_GetHWND;
 
 	//ri.ftol = Q_ftol;
 

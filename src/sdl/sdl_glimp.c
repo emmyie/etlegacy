@@ -174,6 +174,25 @@ void *GLimp_MainWindow(void)
 }
 
 /**
+ * @brief SDL_GetHWND
+ * @return The Win32 HWND for the main window cast to void*, or NULL on non-Windows platforms.
+ *
+ * Used by the DirectX 12 renderer to create its DXGI swap chain.
+ */
+void *SDL_GetHWND(void)
+{
+#ifdef _WIN32
+	SDL_SysWMinfo wmInfo;
+	SDL_VERSION(&wmInfo.version);
+	if (main_window && SDL_GetWindowWMInfo(main_window, &wmInfo))
+	{
+		return (void *)wmInfo.info.win.window;
+	}
+#endif
+	return NULL;
+}
+
+/**
  * @brief Minimize the game so that user is back at the desktop
  */
 void GLimp_Minimize(void)
@@ -715,6 +734,13 @@ static int GLimp_SetMode(glconfig_t *glConfig, int mode, qboolean fullscreen, qb
 		flags |= SDL_WINDOW_VULKAN;
 #ifndef FEATURE_RENDERER_VULKAN
 		Com_Error(ERR_FATAL, "Vulkan subsystem not available in build\n");
+#endif
+	}
+	else if (Q_stricmp(type, "dx12") == 0)
+	{
+		// DX12 renderer: create a plain window without an OpenGL or Vulkan context
+#ifndef FEATURE_RENDERER_DX12
+		Com_Error(ERR_FATAL, "DirectX 12 subsystem not available in build\n");
 #endif
 	}
 	else
