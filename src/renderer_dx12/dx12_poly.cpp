@@ -182,11 +182,11 @@ void DX12_SetScissor(int x, int y, int w, int h)
 	r.right  = (LONG)(x + w);
 	r.bottom = (LONG)(y + h);
 
-	// Clamp to the viewport
-	if (r.left   < 0)                   { r.left   = 0; }
-	if (r.top    < 0)                   { r.top    = 0; }
-	if (r.right  > (LONG)dx12.vidWidth) { r.right  = (LONG)dx12.vidWidth; }
-	if (r.bottom > (LONG)dx12.vidHeight){ r.bottom = (LONG)dx12.vidHeight; }
+	// Clamp to the physical swap-chain viewport
+	if (r.left   < 0)                            { r.left   = 0; }
+	if (r.top    < 0)                            { r.top    = 0; }
+	if (r.right  > dx12.scissorRect.right)       { r.right  = dx12.scissorRect.right; }
+	if (r.bottom > dx12.scissorRect.bottom)      { r.bottom = dx12.scissorRect.bottom; }
 
 	// If scissor changes, flush the in-flight batch before updating
 	if (dx12.batch2DCount > 0 && !DX12_RectsEqual(&r, &dx12.currentScissor))

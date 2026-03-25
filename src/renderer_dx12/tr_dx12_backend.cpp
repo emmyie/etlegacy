@@ -328,12 +328,11 @@ void DX12_BeginFrameRender(void)
 	Com_Memset(&dx12.batch2DTexHandle, 0, sizeof(dx12.batch2DTexHandle));
 	dx12.batch2DTopology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 
-	// Reset scissor to full-screen
-	dx12.currentScissor.left   = 0;
-	dx12.currentScissor.top    = 0;
-	dx12.currentScissor.right  = (LONG)dx12.vidWidth;
-	dx12.currentScissor.bottom = (LONG)dx12.vidHeight;
-	dx12.batch2DScissor        = dx12.currentScissor;
+	// Reset scissor to full-screen (use the physical swap-chain rect set at init,
+	// not dx12.vidWidth/vidHeight which may have been overwritten with the game's
+	// virtual resolution by RE_DX12_BeginRegistration).
+	dx12.currentScissor = dx12.scissorRect;
+	dx12.batch2DScissor = dx12.currentScissor;
 
 	dx12.frameOpen = qtrue;
 }
