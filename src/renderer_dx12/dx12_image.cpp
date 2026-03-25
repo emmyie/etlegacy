@@ -254,13 +254,11 @@ void DX12_LoadImage(const char *name, byte **pic, int *width, int *height)
 	}
 
 	// Strip any existing extension so we can try each one in order
-	//COM_StripExtension(name, localName, sizeof(localName));
 	DX12_StripExtension(name, localName, sizeof(localName));
 
 	for (i = 0; s_exts[i]; i++)
 	{
-		//Com_sprintf(tryName, sizeof(tryName), "%s.%s", localName, s_exts[i]);
-		snprintf( tryName, sizeof(tryName), "%s.%s", localName, s_exts[i] );
+		snprintf(tryName, sizeof(tryName), "%s.%s", localName, s_exts[i]);
 
 		size = dx12.ri.FS_ReadFile(tryName, &buf);
 		if (size <= 0 || !buf)

@@ -321,8 +321,19 @@ void DX12_BeginFrameRender(void)
 	heaps[0] = dx12.srvHeap;
 	dx12.commandList->SetDescriptorHeaps(1, heaps);
 
-	// Reset the 2D vertex ring-buffer for this frame
+	// Reset the 2D vertex ring-buffer and batch state for this frame
 	dx12.quadVBOffset = 0;
+	dx12.batch2DCount = 0;
+	dx12.batch2DStart = 0;
+	Com_Memset(&dx12.batch2DTexHandle, 0, sizeof(dx12.batch2DTexHandle));
+	dx12.batch2DTopology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+
+	// Reset scissor to full-screen
+	dx12.currentScissor.left   = 0;
+	dx12.currentScissor.top    = 0;
+	dx12.currentScissor.right  = (LONG)dx12.vidWidth;
+	dx12.currentScissor.bottom = (LONG)dx12.vidHeight;
+	dx12.batch2DScissor        = dx12.currentScissor;
 
 	dx12.frameOpen = qtrue;
 }
@@ -340,9 +351,6 @@ void DX12_BeginFrameRender(void)
  */
 qboolean R_DX12_Init(void)
 {
-	/*dx12.ri.Printf( PRINT_ALL, "R_DX12_Init: stub success\n" );
-	return qtrue;*/
-
 	HRESULT hr;
 	char    glConfigString[1024];
 	glconfig_t glConfig;

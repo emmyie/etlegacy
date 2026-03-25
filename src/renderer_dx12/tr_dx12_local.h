@@ -93,6 +93,16 @@ typedef struct
 	float    color2D[4];    ///< Current 2D modulate color set by RE_DX12_SetColor
 	qboolean frameOpen;     ///< qtrue between DX12_BeginFrameRender and R_DX12_SwapBuffers
 
+	// Active scissor rectangle for new draw calls (full-screen by default)
+	D3D12_RECT currentScissor;
+
+	// 2D draw batch – accumulates consecutive draws with same texture/topology/scissor
+	D3D12_GPU_DESCRIPTOR_HANDLE batch2DTexHandle; ///< GPU texture handle for current batch
+	D3D12_PRIMITIVE_TOPOLOGY    batch2DTopology;  ///< Primitive topology for current batch
+	D3D12_RECT                  batch2DScissor;   ///< Scissor rect captured when batch started
+	UINT                        batch2DStart;     ///< Ring-buffer vertex index where batch begins
+	UINT                        batch2DCount;     ///< Number of vertices in current batch
+
 	// Frame state
 	UINT          frameIndex;
 
@@ -150,6 +160,9 @@ void DX12_DrawStretchPicGradient(float x, float y, float w, float h,
                                  float s1, float t1, float s2, float t2,
                                  qhandle_t hShader, const float *gradientColor, int gradientType);
 void DX12_Add2dPolys(polyVert_t *polys, int numverts, qhandle_t hShader);
+void DX12_Flush2D(void);
+void DX12_SetScissor(int x, int y, int w, int h);
+void DX12_DrawString(float x, float y, float scale, const char *text, const fontInfo_t *font);
 
 
 void DX12_StripExtension( const char* in, char* out, int size );

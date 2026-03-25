@@ -13,6 +13,8 @@
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 
+#include <string.h>  // memcpy
+
 dx12Globals_t dx12;
 
 // ---------------------------------------------------------------------------
@@ -155,6 +157,9 @@ static void RE_DX12_EndFrame(int *frontEndMsec, int *backEndMsec)
 		*backEndMsec = 0;
 	}
 
+	// Flush any pending batched 2D draw calls before closing the command list
+	DX12_Flush2D();
+
 	R_DX12_SwapBuffers();
 }
 
@@ -183,9 +188,121 @@ static qhandle_t RE_DX12_RegisterShaderNoMip(const char *name)
 	return DX12_RegisterTexture(name);
 }
 
+// ---------------------------------------------------------------------------
+// RE_DX12_RegisterFont helpers
+// ---------------------------------------------------------------------------
+
+/** @brief Read a little-endian 32-bit int and advance the read pointer. */
+static int DX12_ReadInt32(const unsigned char **p)
+{
+	int v = (int)((*p)[0])
+	        | ((int)((*p)[1]) << 8)
+	        | ((int)((*p)[2]) << 16)
+	        | ((int)((*p)[3]) << 24);
+	*p += 4;
+	return v;
+}
+
+/** @brief Read a little-endian IEEE 754 float and advance the read pointer. */
+static float DX12_ReadFloat32(const unsigned char **p)
+{
+	float v;
+	memcpy(&v, *p, sizeof(float));
+	*p += sizeof(float);
+	return v;
+}
+
 static void RE_DX12_RegisterFont(const char *fontName, int pointSize, void *font, qboolean extended)
 {
-	(void)fontName; (void)pointSize; (void)font; (void)extended;
+	fontInfo_t         *fi   = (fontInfo_t *)font;
+	char                datName[MAX_QPATH];
+	void               *faceData  = NULL;
+	int                 len;
+	const unsigned char *p;
+	int                 i;
+
+	/**
+	 * GLYPH_OLD_FORMAT = sizeof(fontInfo_t) = 20548 bytes:
+	 *   256 × (7 ints + 4 floats + 4 bytes handle + 32 bytes shaderName) = 20480
+	 *   + 4 bytes glyphScale + 64 bytes datName = 20548
+	 */
+	const int GLYPH_OLD_FORMAT = 20548;
+
+	(void)extended; // Extended (UTF-8) font loading is not yet implemented
+
+	if (!fi || !fontName || !fontName[0])
+	{
+		return;
+	}
+
+	Com_Memset(fi, 0, sizeof(fontInfo_t));
+
+	snprintf(datName, sizeof(datName), "fonts/%s_%i.dat", fontName, pointSize);
+
+	len = dx12.ri.FS_ReadFile(datName, &faceData);
+
+	if (len <= 0 || !faceData)
+	{
+		dx12.ri.Printf(PRINT_DEVELOPER,
+		               "RE_DX12_RegisterFont: font file '%s' not found\n", datName);
+		return;
+	}
+
+	if (len != GLYPH_OLD_FORMAT)
+	{
+		dx12.ri.Printf(PRINT_WARNING,
+		               "RE_DX12_RegisterFont: '%s' has unexpected size %d (expected %d)\n",
+		               datName, len, GLYPH_OLD_FORMAT);
+		dx12.ri.FS_FreeFile(faceData);
+		return;
+	}
+
+	p = (const unsigned char *)faceData;
+
+	// Parse glyph data for all 256 ASCII code points
+	for (i = 0; i < GLYPHS_ASCII_PER_FONT; i++)
+	{
+		glyphInfo_t *g = &fi->glyphs[i];
+
+		g->height      = DX12_ReadInt32(&p);
+		g->top         = DX12_ReadInt32(&p);
+		g->bottom      = DX12_ReadInt32(&p);
+		g->pitch       = DX12_ReadInt32(&p);
+		g->xSkip       = DX12_ReadInt32(&p);
+		g->imageWidth  = DX12_ReadInt32(&p);
+		g->imageHeight = DX12_ReadInt32(&p);
+		g->s           = DX12_ReadFloat32(&p);
+		g->t           = DX12_ReadFloat32(&p);
+		g->s2          = DX12_ReadFloat32(&p);
+		g->t2          = DX12_ReadFloat32(&p);
+		p             += 4; // skip stale handle from the original file
+
+		memcpy(g->shaderName, p, sizeof(g->shaderName));
+		p += sizeof(g->shaderName);
+	}
+
+	// Read the scale factor that follows the glyph array
+	fi->glyphScale = DX12_ReadFloat32(&p);
+
+	dx12.ri.FS_FreeFile(faceData);
+	faceData = NULL;
+
+	Q_strncpyz(fi->datName, datName, sizeof(fi->datName));
+
+	// Register a DX12 texture for every glyph shader.  DX12_RegisterTexture
+	// deduplicates by name so multiple font sizes that share atlas pages are
+	// handled correctly.
+	for (i = GLYPH_START; i <= GLYPH_ASCII_END; i++)
+	{
+		if (fi->glyphs[i].shaderName[0])
+		{
+			fi->glyphs[i].glyph = DX12_RegisterTexture(fi->glyphs[i].shaderName);
+		}
+	}
+
+	dx12.ri.Printf(PRINT_DEVELOPER,
+	               "RE_DX12_RegisterFont: loaded '%s' (scale %.3f)\n",
+	               datName, fi->glyphScale);
 }
 
 static void RE_DX12_LoadWorld(const char *name)
@@ -385,9 +502,6 @@ refexport_t *GetRefAPI(int apiVersion, refimport_t *rimp)
 		               REF_API_VERSION, apiVersion);
 		return NULL;
 	}
-
-	/*dx12.ri.Printf( PRINT_ALL, "DX12: InitOpenGLSubSystem ptr = %p\n",
-		( void* )re.InitOpenGLSubSystem );*/
 
 	re.Shutdown = R_DX12_Shutdown;
 

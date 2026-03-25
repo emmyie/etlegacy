@@ -1,10 +1,16 @@
 /**
  * @file dx12_poly.cpp
- * @brief DX12 2D drawing – DrawStretchPic, DrawStretchPicGradient, Add2dPolys.
+ * @brief DX12 2D drawing – DrawStretchPic, DrawStretchPicGradient, Add2dPolys,
+ *        Flush2D, SetScissor, and DrawString.
  *
- * All draws append vertices to the per-frame ring-buffer and issue immediate
- * draw calls into the open command list.  No batching is performed; each call
- * produces one DrawInstanced.
+ * All draws append vertices to the per-frame ring-buffer and defer the actual
+ * GPU draw call until either the texture/topology/scissor changes or
+ * DX12_Flush2D() is called explicitly.  This keeps the number of
+ * SetGraphicsRootDescriptorTable + DrawInstanced invocations low.
+ *
+ * All quads are expanded to 6-vertex TRIANGLELIST so they can be freely
+ * concatenated in the same batch regardless of origin (DrawStretchPic vs
+ * Add2dPolys vs DrawString).
  */
 
 #include "dx12_poly.h"
@@ -31,50 +37,164 @@ static inline float NDC_Y(float y)
 }
 
 // ---------------------------------------------------------------------------
-// Internal: write verts into ring-buffer and issue one draw call
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/** Compare two D3D12_RECT values for equality. */
+static qboolean DX12_RectsEqual(const D3D12_RECT *a, const D3D12_RECT *b)
+{
+	return (a->left == b->left && a->top == b->top
+	        && a->right == b->right && a->bottom == b->bottom)
+	       ? qtrue : qfalse;
+}
+
+// ---------------------------------------------------------------------------
+// DX12_Flush2D
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Append vertices to the frame ring-buffer and draw them.
- * @param[in] verts     Array of vertices to write.
- * @param[in] numVerts  Number of vertices (4 for a quad strip, 3*n for fans).
- * @param[in] topology  D3D primitive topology.
- * @param[in] tex       Texture to bind via SRV descriptor table.
+ * @brief DX12_Flush2D
+ *
+ * Submits the currently accumulated 2D batch as a single DrawInstanced call.
+ * After returning, batch2DCount is 0 and batch2DStart equals quadVBOffset.
+ * No-op when there is nothing pending.
  */
-static void DX12_AppendAndDraw(const dx12QuadVertex_t *verts, int numVerts,
-                                D3D12_PRIMITIVE_TOPOLOGY topology, dx12Texture_t *tex)
+void DX12_Flush2D(void)
 {
 	D3D12_VERTEX_BUFFER_VIEW vbv;
-	dx12QuadVertex_t        *dst;
+
+	if (!dx12.frameOpen || dx12.batch2DCount == 0)
+	{
+		return;
+	}
+
+	vbv.BufferLocation = dx12.quadVertexBuffer->GetGPUVirtualAddress()
+	                     + dx12.batch2DStart * sizeof(dx12QuadVertex_t);
+	vbv.StrideInBytes  = (UINT)sizeof(dx12QuadVertex_t);
+	vbv.SizeInBytes    = dx12.batch2DCount * (UINT)sizeof(dx12QuadVertex_t);
+
+	dx12.commandList->RSSetScissorRects(1, &dx12.batch2DScissor);
+	dx12.commandList->SetGraphicsRootDescriptorTable(0, dx12.batch2DTexHandle);
+	dx12.commandList->IASetPrimitiveTopology(dx12.batch2DTopology);
+	dx12.commandList->IASetVertexBuffers(0, 1, &vbv);
+	dx12.commandList->DrawInstanced(dx12.batch2DCount, 1, 0, 0);
+
+	dx12.batch2DCount = 0;
+	dx12.batch2DStart = dx12.quadVBOffset;
+}
+
+// ---------------------------------------------------------------------------
+// DX12_AppendToBatch
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Append vertices to the current 2D batch, flushing first if needed.
+ *
+ * Flushes the pending batch whenever the texture, topology, or scissor rect
+ * changes.  Also flushes when the ring-buffer does not have enough room.
+ *
+ * @param verts     Source vertex array.
+ * @param numVerts  Number of vertices to append.
+ * @param topology  D3D primitive topology (must be TRIANGLELIST for correct batching).
+ * @param tex       Target texture; compared by GPU handle pointer.
+ */
+static void DX12_AppendToBatch(const dx12QuadVertex_t *verts, int numVerts,
+                                D3D12_PRIMITIVE_TOPOLOGY topology, dx12Texture_t *tex)
+{
+	dx12QuadVertex_t *dst;
 
 	if (!dx12.frameOpen || !tex || !dx12.quadVBMapped)
 	{
 		return;
 	}
 
+	// If the ring-buffer is full, flush what is pending and check again
 	if (dx12.quadVBOffset + (UINT)numVerts > DX12_MAX_2D_VERTS)
 	{
-		dx12.ri.Printf(PRINT_WARNING, "DX12: 2D vertex ring-buffer full; dropping draw\n");
-		return;
+		DX12_Flush2D();
+		if (dx12.quadVBOffset + (UINT)numVerts > DX12_MAX_2D_VERTS)
+		{
+			dx12.ri.Printf(PRINT_WARNING, "DX12: 2D vertex ring-buffer full; dropping draw\n");
+			return;
+		}
 	}
 
-	// Write into mapped upload buffer
+	// Flush the current batch if any draw state has changed
+	if (dx12.batch2DCount > 0)
+	{
+		qboolean flushNeeded = qfalse;
+
+		if (tex->gpuHandle.ptr != dx12.batch2DTexHandle.ptr)
+		{
+			flushNeeded = qtrue;
+		}
+		else if (topology != dx12.batch2DTopology)
+		{
+			flushNeeded = qtrue;
+		}
+		else if (!DX12_RectsEqual(&dx12.currentScissor, &dx12.batch2DScissor))
+		{
+			flushNeeded = qtrue;
+		}
+
+		if (flushNeeded)
+		{
+			DX12_Flush2D();
+		}
+	}
+
+	// Begin a new batch if the current one is empty
+	if (dx12.batch2DCount == 0)
+	{
+		dx12.batch2DStart     = dx12.quadVBOffset;
+		dx12.batch2DTexHandle = tex->gpuHandle;
+		dx12.batch2DTopology  = topology;
+		dx12.batch2DScissor   = dx12.currentScissor;
+	}
+
+	// Write vertices into the ring-buffer
 	dst = (dx12QuadVertex_t *)dx12.quadVBMapped + dx12.quadVBOffset;
 	memcpy(dst, verts, (size_t)numVerts * sizeof(dx12QuadVertex_t));
-
-	// Build a per-draw VBV that points at the slice we just wrote
-	vbv.BufferLocation = dx12.quadVertexBuffer->GetGPUVirtualAddress()
-	                     + dx12.quadVBOffset * sizeof(dx12QuadVertex_t);
-	vbv.StrideInBytes  = (UINT)sizeof(dx12QuadVertex_t);
-	vbv.SizeInBytes    = (UINT)(numVerts * (int)sizeof(dx12QuadVertex_t));
-
-	// Bind the texture and draw
-	dx12.commandList->SetGraphicsRootDescriptorTable(0, tex->gpuHandle);
-	dx12.commandList->IASetPrimitiveTopology(topology);
-	dx12.commandList->IASetVertexBuffers(0, 1, &vbv);
-	dx12.commandList->DrawInstanced((UINT)numVerts, 1, 0, 0);
-
 	dx12.quadVBOffset += (UINT)numVerts;
+	dx12.batch2DCount += (UINT)numVerts;
+}
+
+// ---------------------------------------------------------------------------
+// DX12_SetScissor
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief DX12_SetScissor
+ *
+ * Stores a new scissor rectangle for subsequent draw calls.  If the active
+ * batch uses a different rectangle it is flushed first so the batch and its
+ * matching scissor stay consistent.
+ *
+ * @param x,y   Top-left corner in screen pixels.
+ * @param w,h   Width and height in screen pixels.
+ */
+void DX12_SetScissor(int x, int y, int w, int h)
+{
+	D3D12_RECT r;
+
+	r.left   = (LONG)x;
+	r.top    = (LONG)y;
+	r.right  = (LONG)(x + w);
+	r.bottom = (LONG)(y + h);
+
+	// Clamp to the viewport
+	if (r.left   < 0)                   { r.left   = 0; }
+	if (r.top    < 0)                   { r.top    = 0; }
+	if (r.right  > (LONG)dx12.vidWidth) { r.right  = (LONG)dx12.vidWidth; }
+	if (r.bottom > (LONG)dx12.vidHeight){ r.bottom = (LONG)dx12.vidHeight; }
+
+	// If scissor changes, flush the in-flight batch before updating
+	if (dx12.batch2DCount > 0 && !DX12_RectsEqual(&r, &dx12.currentScissor))
+	{
+		DX12_Flush2D();
+	}
+
+	dx12.currentScissor = r;
 }
 
 // ---------------------------------------------------------------------------
@@ -84,8 +204,15 @@ static void DX12_AppendAndDraw(const dx12QuadVertex_t *verts, int numVerts,
 /**
  * @brief DX12_DrawStretchPic
  *
- * Builds a TRIANGLESTRIP quad (4 vertices) from the given screen-pixel
- * rectangle and UV range, tinted by the current dx12.color2D value.
+ * Appends two triangles (6 vertices, TRIANGLELIST) covering the given
+ * screen-pixel rectangle, tinted by the current dx12.color2D value.
+ *
+ * Vertex layout (quad corners):
+ *   TL = top-left,   TR = top-right
+ *   BL = bottom-left, BR = bottom-right
+ *
+ * Triangle 1: TL, TR, BL
+ * Triangle 2: TR, BR, BL
  */
 void DX12_DrawStretchPic(float x, float y, float w, float h,
                          float s1, float t1, float s2, float t2,
@@ -94,7 +221,7 @@ void DX12_DrawStretchPic(float x, float y, float w, float h,
 	dx12Texture_t   *tex;
 	float            r, g, b, a;
 	float            nx1, ny1, nx2, ny2;
-	dx12QuadVertex_t verts[4];
+	dx12QuadVertex_t verts[6];
 
 	if (!dx12.frameOpen)
 	{
@@ -116,7 +243,7 @@ void DX12_DrawStretchPic(float x, float y, float w, float h,
 	nx2 = NDC_X(x + w);
 	ny2 = NDC_Y(y + h);
 
-	// TRIANGLESTRIP order: TL, TR, BL, BR
+	// Triangle 1: TL, TR, BL
 	verts[0].pos[0]   = nx1; verts[0].pos[1]   = ny1;
 	verts[0].uv[0]    = s1;  verts[0].uv[1]    = t1;
 	verts[0].color[0] = r;   verts[0].color[1] = g;
@@ -132,12 +259,23 @@ void DX12_DrawStretchPic(float x, float y, float w, float h,
 	verts[2].color[0] = r;   verts[2].color[1] = g;
 	verts[2].color[2] = b;   verts[2].color[3] = a;
 
-	verts[3].pos[0]   = nx2; verts[3].pos[1]   = ny2;
-	verts[3].uv[0]    = s2;  verts[3].uv[1]    = t2;
+	// Triangle 2: TR, BR, BL
+	verts[3].pos[0]   = nx2; verts[3].pos[1]   = ny1;
+	verts[3].uv[0]    = s2;  verts[3].uv[1]    = t1;
 	verts[3].color[0] = r;   verts[3].color[1] = g;
 	verts[3].color[2] = b;   verts[3].color[3] = a;
 
-	DX12_AppendAndDraw(verts, 4, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP, tex);
+	verts[4].pos[0]   = nx2; verts[4].pos[1]   = ny2;
+	verts[4].uv[0]    = s2;  verts[4].uv[1]    = t2;
+	verts[4].color[0] = r;   verts[4].color[1] = g;
+	verts[4].color[2] = b;   verts[4].color[3] = a;
+
+	verts[5].pos[0]   = nx1; verts[5].pos[1]   = ny2;
+	verts[5].uv[0]    = s1;  verts[5].uv[1]    = t2;
+	verts[5].color[0] = r;   verts[5].color[1] = g;
+	verts[5].color[2] = b;   verts[5].color[3] = a;
+
+	DX12_AppendToBatch(verts, 6, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, tex);
 }
 
 // ---------------------------------------------------------------------------
@@ -147,8 +285,11 @@ void DX12_DrawStretchPic(float x, float y, float w, float h,
 /**
  * @brief DX12_DrawStretchPicGradient
  *
- * Like DX12_DrawStretchPic but the two "far" corners receive the gradient
- * color.  gradientType 0 = left→right; anything else = top→bottom.
+ * Like DX12_DrawStretchPic, but the two "far" corners receive a different
+ * color (gradientColor) while the "near" corners keep dx12.color2D.
+ *
+ * gradientType == 0  →  left(near) → right(far)  horizontal gradient
+ * any other value    →  top(near)  → bottom(far) vertical gradient
  */
 void DX12_DrawStretchPicGradient(float x, float y, float w, float h,
                                  float s1, float t1, float s2, float t2,
@@ -159,7 +300,11 @@ void DX12_DrawStretchPicGradient(float x, float y, float w, float h,
 	float            r, g, b, a;
 	float            gr, gg, gb, ga;
 	float            nx1, ny1, nx2, ny2;
-	dx12QuadVertex_t verts[4];
+	float            tl_r, tl_g, tl_b, tl_a;  // top-left  color
+	float            tr_r, tr_g, tr_b, tr_a;  // top-right color
+	float            bl_r, bl_g, bl_b, bl_a;  // bottom-left  color
+	float            br_r, br_g, br_b, br_a;  // bottom-right color
+	dx12QuadVertex_t verts[6];
 
 	if (!dx12.frameOpen)
 	{
@@ -188,52 +333,54 @@ void DX12_DrawStretchPicGradient(float x, float y, float w, float h,
 
 	if (gradientType == 0)
 	{
-		// Left edge → base color; right edge → gradient color
-		verts[0].pos[0]   = nx1; verts[0].pos[1]   = ny1;
-		verts[0].uv[0]    = s1;  verts[0].uv[1]    = t1;
-		verts[0].color[0] = r;   verts[0].color[1] = g;
-		verts[0].color[2] = b;   verts[0].color[3] = a;
-
-		verts[1].pos[0]   = nx2; verts[1].pos[1]   = ny1;
-		verts[1].uv[0]    = s2;  verts[1].uv[1]    = t1;
-		verts[1].color[0] = gr;  verts[1].color[1] = gg;
-		verts[1].color[2] = gb;  verts[1].color[3] = ga;
-
-		verts[2].pos[0]   = nx1; verts[2].pos[1]   = ny2;
-		verts[2].uv[0]    = s1;  verts[2].uv[1]    = t2;
-		verts[2].color[0] = r;   verts[2].color[1] = g;
-		verts[2].color[2] = b;   verts[2].color[3] = a;
-
-		verts[3].pos[0]   = nx2; verts[3].pos[1]   = ny2;
-		verts[3].uv[0]    = s2;  verts[3].uv[1]    = t2;
-		verts[3].color[0] = gr;  verts[3].color[1] = gg;
-		verts[3].color[2] = gb;  verts[3].color[3] = ga;
+		// Horizontal: left = base, right = gradient
+		tl_r = r;  tl_g = g;  tl_b = b;  tl_a = a;
+		tr_r = gr; tr_g = gg; tr_b = gb; tr_a = ga;
+		bl_r = r;  bl_g = g;  bl_b = b;  bl_a = a;
+		br_r = gr; br_g = gg; br_b = gb; br_a = ga;
 	}
 	else
 	{
-		// Top edge → base color; bottom edge → gradient color
-		verts[0].pos[0]   = nx1; verts[0].pos[1]   = ny1;
-		verts[0].uv[0]    = s1;  verts[0].uv[1]    = t1;
-		verts[0].color[0] = r;   verts[0].color[1] = g;
-		verts[0].color[2] = b;   verts[0].color[3] = a;
-
-		verts[1].pos[0]   = nx2; verts[1].pos[1]   = ny1;
-		verts[1].uv[0]    = s2;  verts[1].uv[1]    = t1;
-		verts[1].color[0] = r;   verts[1].color[1] = g;
-		verts[1].color[2] = b;   verts[1].color[3] = a;
-
-		verts[2].pos[0]   = nx1; verts[2].pos[1]   = ny2;
-		verts[2].uv[0]    = s1;  verts[2].uv[1]    = t2;
-		verts[2].color[0] = gr;  verts[2].color[1] = gg;
-		verts[2].color[2] = gb;  verts[2].color[3] = ga;
-
-		verts[3].pos[0]   = nx2; verts[3].pos[1]   = ny2;
-		verts[3].uv[0]    = s2;  verts[3].uv[1]    = t2;
-		verts[3].color[0] = gr;  verts[3].color[1] = gg;
-		verts[3].color[2] = gb;  verts[3].color[3] = ga;
+		// Vertical: top = base, bottom = gradient
+		tl_r = r;  tl_g = g;  tl_b = b;  tl_a = a;
+		tr_r = r;  tr_g = g;  tr_b = b;  tr_a = a;
+		bl_r = gr; bl_g = gg; bl_b = gb; bl_a = ga;
+		br_r = gr; br_g = gg; br_b = gb; br_a = ga;
 	}
 
-	DX12_AppendAndDraw(verts, 4, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP, tex);
+	// Triangle 1: TL, TR, BL
+	verts[0].pos[0]   = nx1; verts[0].pos[1]   = ny1;
+	verts[0].uv[0]    = s1;  verts[0].uv[1]    = t1;
+	verts[0].color[0] = tl_r; verts[0].color[1] = tl_g;
+	verts[0].color[2] = tl_b; verts[0].color[3] = tl_a;
+
+	verts[1].pos[0]   = nx2; verts[1].pos[1]   = ny1;
+	verts[1].uv[0]    = s2;  verts[1].uv[1]    = t1;
+	verts[1].color[0] = tr_r; verts[1].color[1] = tr_g;
+	verts[1].color[2] = tr_b; verts[1].color[3] = tr_a;
+
+	verts[2].pos[0]   = nx1; verts[2].pos[1]   = ny2;
+	verts[2].uv[0]    = s1;  verts[2].uv[1]    = t2;
+	verts[2].color[0] = bl_r; verts[2].color[1] = bl_g;
+	verts[2].color[2] = bl_b; verts[2].color[3] = bl_a;
+
+	// Triangle 2: TR, BR, BL
+	verts[3].pos[0]   = nx2; verts[3].pos[1]   = ny1;
+	verts[3].uv[0]    = s2;  verts[3].uv[1]    = t1;
+	verts[3].color[0] = tr_r; verts[3].color[1] = tr_g;
+	verts[3].color[2] = tr_b; verts[3].color[3] = tr_a;
+
+	verts[4].pos[0]   = nx2; verts[4].pos[1]   = ny2;
+	verts[4].uv[0]    = s2;  verts[4].uv[1]    = t2;
+	verts[4].color[0] = br_r; verts[4].color[1] = br_g;
+	verts[4].color[2] = br_b; verts[4].color[3] = br_a;
+
+	verts[5].pos[0]   = nx1; verts[5].pos[1]   = ny2;
+	verts[5].uv[0]    = s1;  verts[5].uv[1]    = t2;
+	verts[5].color[0] = bl_r; verts[5].color[1] = bl_g;
+	verts[5].color[2] = bl_b; verts[5].color[3] = bl_a;
+
+	DX12_AppendToBatch(verts, 6, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, tex);
 }
 
 // ---------------------------------------------------------------------------
@@ -243,12 +390,11 @@ void DX12_DrawStretchPicGradient(float x, float y, float w, float h,
 /**
  * @brief DX12_Add2dPolys
  *
- * Converts polyVert_t screen-space vertices to NDC and draws them as a
- * triangle fan (indices: 0,1,2 ; 0,2,3 ; 0,3,4 ; ...) expanded inline into
- * a TRIANGLELIST vertex buffer.
+ * Fan-expands a polyVert_t array into TRIANGLELIST quads and appends them
+ * to the batch.  Per-vertex colours come from the polyVert_t modulate field.
  *
- * @param polys     Array of polyVert_t.  xyz[0]/xyz[1] are screen-pixel X/Y.
- * @param numverts  Total vertex count (must be ≥ 3).
+ * @param polys     Array of polyVert_t (xyz[0]/xyz[1] = screen-pixel X/Y).
+ * @param numverts  Total vertex count (≥ 3).
  * @param hShader   Texture handle.
  */
 void DX12_Add2dPolys(polyVert_t *polys, int numverts, qhandle_t hShader)
@@ -258,6 +404,7 @@ void DX12_Add2dPolys(polyVert_t *polys, int numverts, qhandle_t hShader)
 	dx12Texture_t *tex;
 	dx12QuadVertex_t *dst;
 	int            i;
+	UINT           startOffset;
 
 	if (!dx12.frameOpen || numverts < 3 || !polys)
 	{
@@ -271,20 +418,58 @@ void DX12_Add2dPolys(polyVert_t *polys, int numverts, qhandle_t hShader)
 	}
 
 	// Fan triangulation: (numverts - 2) triangles, each 3 verts
-	numTris    = numverts - 2;
+	numTris     = numverts - 2;
 	numTriVerts = numTris * 3;
 
+	// Ensure space (flush + abort if still not enough)
 	if (dx12.quadVBOffset + (UINT)numTriVerts > DX12_MAX_2D_VERTS)
 	{
-		dx12.ri.Printf(PRINT_WARNING, "DX12_Add2dPolys: 2D vertex ring-buffer full\n");
-		return;
+		DX12_Flush2D();
+		if (dx12.quadVBOffset + (UINT)numTriVerts > DX12_MAX_2D_VERTS)
+		{
+			dx12.ri.Printf(PRINT_WARNING, "DX12_Add2dPolys: 2D vertex ring-buffer full\n");
+			return;
+		}
 	}
 
-	dst = (dx12QuadVertex_t *)dx12.quadVBMapped + dx12.quadVBOffset;
+	// Check if we need to flush before appending
+	if (dx12.batch2DCount > 0)
+	{
+		qboolean flushNeeded = qfalse;
+
+		if (tex->gpuHandle.ptr != dx12.batch2DTexHandle.ptr)
+		{
+			flushNeeded = qtrue;
+		}
+		else if (D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST != dx12.batch2DTopology)
+		{
+			flushNeeded = qtrue;
+		}
+		else if (!DX12_RectsEqual(&dx12.currentScissor, &dx12.batch2DScissor))
+		{
+			flushNeeded = qtrue;
+		}
+
+		if (flushNeeded)
+		{
+			DX12_Flush2D();
+		}
+	}
+
+	// Start a new batch if empty
+	if (dx12.batch2DCount == 0)
+	{
+		dx12.batch2DStart     = dx12.quadVBOffset;
+		dx12.batch2DTexHandle = tex->gpuHandle;
+		dx12.batch2DTopology  = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+		dx12.batch2DScissor   = dx12.currentScissor;
+	}
+
+	startOffset = dx12.quadVBOffset;
+	dst         = (dx12QuadVertex_t *)dx12.quadVBMapped + startOffset;
 
 	for (i = 0; i < numTris; i++)
 	{
-		// Triangle: fan vertex 0, fan vertex (i+1), fan vertex (i+2)
 		int j;
 
 		for (j = 0; j < 3; j++)
@@ -307,21 +492,122 @@ void DX12_Add2dPolys(polyVert_t *polys, int numverts, qhandle_t hShader)
 		}
 	}
 
+	dx12.quadVBOffset += (UINT)numTriVerts;
+	dx12.batch2DCount += (UINT)numTriVerts;
+}
+
+// ---------------------------------------------------------------------------
+// DX12_DrawString
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief DX12_DrawString
+ *
+ * Iterates through each ASCII character of @p text, looks up the glyph in
+ * @p font, and appends a two-triangle TRIANGLELIST quad to the batch.
+ *
+ * The glyph's @c glyph handle must have been registered via
+ * DX12_RegisterTexture (which RE_DX12_RegisterFont does automatically).
+ * Skips characters whose glyph handle is zero or whose image dimensions
+ * are degenerate.
+ */
+void DX12_DrawString(float x, float y, float scale,
+                     const char *text, const fontInfo_t *font)
+{
+	float       curX;
+	const char *p;
+
+	if (!dx12.frameOpen || !text || !font)
 	{
-		D3D12_VERTEX_BUFFER_VIEW vbv;
-
-		vbv.BufferLocation = dx12.quadVertexBuffer->GetGPUVirtualAddress()
-		                     + dx12.quadVBOffset * sizeof(dx12QuadVertex_t);
-		vbv.StrideInBytes  = (UINT)sizeof(dx12QuadVertex_t);
-		vbv.SizeInBytes    = (UINT)(numTriVerts * (int)sizeof(dx12QuadVertex_t));
-
-		dx12.commandList->SetGraphicsRootDescriptorTable(0, tex->gpuHandle);
-		dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-		dx12.commandList->IASetVertexBuffers(0, 1, &vbv);
-		dx12.commandList->DrawInstanced((UINT)numTriVerts, 1, 0, 0);
+		return;
 	}
 
-	dx12.quadVBOffset += (UINT)numTriVerts;
+	curX = x;
+
+	for (p = text; *p; p++)
+	{
+		const glyphInfo_t *glyph;
+		dx12Texture_t     *tex;
+		dx12QuadVertex_t   verts[6];
+		float              gx, gy, gw, gh;
+		float              nx1, ny1, nx2, ny2;
+		float              r, g, b, a;
+		int                ch;
+
+		ch = (unsigned char)*p;
+
+		if (ch < GLYPH_START || ch > GLYPH_ASCII_END)
+		{
+			continue;
+		}
+
+		glyph = &font->glyphs[ch];
+
+		if (!glyph->imageWidth || !glyph->imageHeight || !glyph->glyph)
+		{
+			curX += (float)glyph->xSkip * scale;
+			continue;
+		}
+
+		tex = DX12_GetTexture(glyph->glyph);
+		if (!tex)
+		{
+			curX += (float)glyph->xSkip * scale;
+			continue;
+		}
+
+		// Glyph quad: x advances by pitch (bearing); y is offset by top
+		gx = curX + (float)glyph->pitch * scale;
+		gy = y - (float)glyph->top * scale;
+		gw = (float)glyph->imageWidth  * scale;
+		gh = (float)glyph->imageHeight * scale;
+
+		nx1 = NDC_X(gx);
+		ny1 = NDC_Y(gy);
+		nx2 = NDC_X(gx + gw);
+		ny2 = NDC_Y(gy + gh);
+
+		r = dx12.color2D[0];
+		g = dx12.color2D[1];
+		b = dx12.color2D[2];
+		a = dx12.color2D[3];
+
+		// Triangle 1: TL, TR, BL
+		verts[0].pos[0]   = nx1;        verts[0].pos[1]   = ny1;
+		verts[0].uv[0]    = glyph->s;   verts[0].uv[1]    = glyph->t;
+		verts[0].color[0] = r;          verts[0].color[1] = g;
+		verts[0].color[2] = b;          verts[0].color[3] = a;
+
+		verts[1].pos[0]   = nx2;        verts[1].pos[1]   = ny1;
+		verts[1].uv[0]    = glyph->s2;  verts[1].uv[1]    = glyph->t;
+		verts[1].color[0] = r;          verts[1].color[1] = g;
+		verts[1].color[2] = b;          verts[1].color[3] = a;
+
+		verts[2].pos[0]   = nx1;        verts[2].pos[1]   = ny2;
+		verts[2].uv[0]    = glyph->s;   verts[2].uv[1]    = glyph->t2;
+		verts[2].color[0] = r;          verts[2].color[1] = g;
+		verts[2].color[2] = b;          verts[2].color[3] = a;
+
+		// Triangle 2: TR, BR, BL
+		verts[3].pos[0]   = nx2;        verts[3].pos[1]   = ny1;
+		verts[3].uv[0]    = glyph->s2;  verts[3].uv[1]    = glyph->t;
+		verts[3].color[0] = r;          verts[3].color[1] = g;
+		verts[3].color[2] = b;          verts[3].color[3] = a;
+
+		verts[4].pos[0]   = nx2;        verts[4].pos[1]   = ny2;
+		verts[4].uv[0]    = glyph->s2;  verts[4].uv[1]    = glyph->t2;
+		verts[4].color[0] = r;          verts[4].color[1] = g;
+		verts[4].color[2] = b;          verts[4].color[3] = a;
+
+		verts[5].pos[0]   = nx1;        verts[5].pos[1]   = ny2;
+		verts[5].uv[0]    = glyph->s;   verts[5].uv[1]    = glyph->t2;
+		verts[5].color[0] = r;          verts[5].color[1] = g;
+		verts[5].color[2] = b;          verts[5].color[3] = a;
+
+		DX12_AppendToBatch(verts, 6, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, tex);
+
+		curX += (float)glyph->xSkip * scale;
+	}
 }
 
 #endif // _WIN32
