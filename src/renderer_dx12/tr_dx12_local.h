@@ -22,14 +22,25 @@
 #define DX12_FRAME_COUNT 2
 
 /**
- * @struct dx12Vertex_t
- * @brief A single colored vertex for the triangle demo
+ * @struct dx12QuadVertex_t
+ * @brief A single vertex for the textured quad (2D clip-space position + UV)
  */
 typedef struct
 {
-	float pos[3];
-	float color[4];
-} dx12Vertex_t;
+	float pos[2];
+	float uv[2];
+} dx12QuadVertex_t;
+
+/**
+ * @struct dx12Texture_t
+ * @brief A DX12 2D texture with its SRV descriptor handles
+ */
+typedef struct
+{
+	ID3D12Resource              *resource;
+	D3D12_CPU_DESCRIPTOR_HANDLE  cpuHandle;
+	D3D12_GPU_DESCRIPTOR_HANDLE  gpuHandle;
+} dx12Texture_t;
 
 /**
  * @struct dx12Globals_t
@@ -55,6 +66,10 @@ typedef struct
 	ID3D12Resource       *renderTargets[DX12_FRAME_COUNT];
 	UINT                 rtvDescriptorSize;
 
+	// SRV descriptor heap (shader-visible, for textures)
+	ID3D12DescriptorHeap *srvHeap;
+	UINT                  srvDescriptorSize;
+
 	// Synchronization
 	ID3D12Fence *fence;
 	UINT64       fenceValues[DX12_FRAME_COUNT];
@@ -64,9 +79,12 @@ typedef struct
 	ID3D12RootSignature  *rootSignature;
 	ID3D12PipelineState  *pipelineState;
 
-	// Vertex buffer
-	ID3D12Resource    *vertexBuffer;
-	D3D12_VERTEX_BUFFER_VIEW vertexBufferView;
+	// Quad vertex buffer (upload heap, updated each draw)
+	ID3D12Resource           *quadVertexBuffer;
+	D3D12_VERTEX_BUFFER_VIEW  quadVertexBufferView;
+
+	// Test texture (checkerboard)
+	dx12Texture_t testTexture;
 
 	// Frame state
 	UINT          frameIndex;
@@ -105,10 +123,12 @@ typedef enum
 } dx12RenderCommand_t;
 
 // Function declarations
-qboolean R_DX12_Init(void);
-void R_DX12_Shutdown(qboolean destroyWindow);
-void R_DX12_RenderCommandList(const void *data);
-void R_DX12_SwapBuffers(void);
+qboolean      R_DX12_Init(void);
+void          R_DX12_Shutdown(qboolean destroyWindow);
+void          R_DX12_RenderCommandList(const void *data);
+void          R_DX12_SwapBuffers(void);
+dx12Texture_t DX12_CreateTextureFromRGBA(const byte *data, int width, int height);
+void          DX12_DrawTexturedQuad(float x, float y, float w, float h, dx12Texture_t *tex);
 
 #endif // _WIN32
 

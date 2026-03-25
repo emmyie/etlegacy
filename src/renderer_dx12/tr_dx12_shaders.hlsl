@@ -30,33 +30,36 @@
  */
 /**
  * @file tr_dx12_shaders.hlsl
- * @brief Minimal vertex and pixel shaders for the DX12 triangle demo
+ * @brief Textured-quad vertex and pixel shaders for the DX12 renderer
  *
- * VSMain: pass-through position and per-vertex color
- * PSMain: output interpolated color
+ * VSMain: transforms 2D clip-space position, passes through UVs
+ * PSMain:  samples the bound texture and outputs the color
  */
+
+Texture2D    g_texture : register(t0);
+SamplerState g_sampler : register(s0);
 
 struct VSInput
 {
-    float3 pos : POSITION;
-    float4 col : COLOR;
+    float2 pos : POSITION;
+    float2 uv  : TEXCOORD;
 };
 
 struct PSInput
 {
     float4 pos : SV_POSITION;
-    float4 col : COLOR;
+    float2 uv  : TEXCOORD;
 };
 
 PSInput VSMain(VSInput input)
 {
     PSInput o;
-    o.pos = float4(input.pos, 1.0);
-    o.col = input.col;
+    o.pos = float4(input.pos, 0.0, 1.0);
+    o.uv  = input.uv;
     return o;
 }
 
 float4 PSMain(PSInput input) : SV_TARGET
 {
-    return input.col;
+    return g_texture.Sample(g_sampler, input.uv);
 }

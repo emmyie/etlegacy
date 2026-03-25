@@ -12,20 +12,23 @@
 // ---------------------------------------------------------------------------
 
 static const char *g_shaderSource =
-	"struct VSInput  { float3 pos : POSITION; float4 col : COLOR; };\n"
-	"struct PSInput  { float4 pos : SV_POSITION; float4 col : COLOR; };\n"
+	"Texture2D    g_texture : register(t0);\n"
+	"SamplerState g_sampler : register(s0);\n"
+	"\n"
+	"struct VSInput { float2 pos : POSITION; float2 uv : TEXCOORD; };\n"
+	"struct PSInput { float4 pos : SV_POSITION; float2 uv : TEXCOORD; };\n"
 	"\n"
 	"PSInput VSMain(VSInput input)\n"
 	"{\n"
 	"    PSInput o;\n"
-	"    o.pos = float4(input.pos, 1.0);\n"
-	"    o.col = input.col;\n"
+	"    o.pos = float4(input.pos, 0.0, 1.0);\n"
+	"    o.uv  = input.uv;\n"
 	"    return o;\n"
 	"}\n"
 	"\n"
 	"float4 PSMain(PSInput input) : SV_TARGET\n"
 	"{\n"
-	"    return input.col;\n"
+	"    return g_texture.Sample(g_sampler, input.uv);\n"
 	"}\n";
 
 // ---------------------------------------------------------------------------
@@ -88,6 +91,209 @@ static void DX12_MoveToNextFrame(void)
 	}
 
 	dx12.fenceValues[dx12.frameIndex] = currentFenceValue + 1;
+}
+
+// ---------------------------------------------------------------------------
+// DX12_CreateTextureFromRGBA
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief DX12_CreateTextureFromRGBA
+ * @param[in] data    RGBA pixel data (width * height * 4 bytes)
+ * @param[in] width   Texture width in pixels
+ * @param[in] height  Texture height in pixels
+ * @return            Populated dx12Texture_t; resource is NULL on failure
+ *
+ * Creates a D3D12 2D texture, uploads the pixel data via an upload heap,
+ * transitions the resource to SRV state, and registers an SRV in slot 0 of
+ * dx12.srvHeap.
+ */
+dx12Texture_t DX12_CreateTextureFromRGBA(const byte *data, int width, int height)
+{
+	dx12Texture_t tex;
+	HRESULT       hr;
+
+	Com_Memset(&tex, 0, sizeof(tex));
+
+	// ---- Default-heap texture resource ----
+	D3D12_HEAP_PROPERTIES defaultHeap = {};
+	defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+	D3D12_RESOURCE_DESC texDesc = {};
+	texDesc.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	texDesc.Width            = (UINT)width;
+	texDesc.Height           = (UINT)height;
+	texDesc.DepthOrArraySize = 1;
+	texDesc.MipLevels        = 1;
+	texDesc.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
+	texDesc.SampleDesc.Count = 1;
+	texDesc.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+	texDesc.Flags            = D3D12_RESOURCE_FLAG_NONE;
+
+	hr = dx12.device->CreateCommittedResource(
+		&defaultHeap,
+		D3D12_HEAP_FLAG_NONE,
+		&texDesc,
+		D3D12_RESOURCE_STATE_COPY_DEST,
+		NULL,
+		IID_PPV_ARGS(&tex.resource)
+		);
+	if (FAILED(hr))
+	{
+		dx12.ri.Printf(PRINT_WARNING, "DX12_CreateTextureFromRGBA: CreateCommittedResource (texture) failed (0x%08lx)\n", hr);
+		return tex;
+	}
+
+	// ---- Upload heap buffer ----
+	D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+	UINT                               numRows;
+	UINT64                             rowSizeBytes;
+	UINT64                             uploadSize;
+	dx12.device->GetCopyableFootprints(&texDesc, 0, 1, 0, &footprint, &numRows, &rowSizeBytes, &uploadSize);
+
+	D3D12_HEAP_PROPERTIES uploadHeap = {};
+	uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+	D3D12_RESOURCE_DESC uploadDesc = {};
+	uploadDesc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+	uploadDesc.Width            = uploadSize;
+	uploadDesc.Height           = 1;
+	uploadDesc.DepthOrArraySize = 1;
+	uploadDesc.MipLevels        = 1;
+	uploadDesc.Format           = DXGI_FORMAT_UNKNOWN;
+	uploadDesc.SampleDesc.Count = 1;
+	uploadDesc.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+	ID3D12Resource *uploadBuffer = NULL;
+	hr = dx12.device->CreateCommittedResource(
+		&uploadHeap,
+		D3D12_HEAP_FLAG_NONE,
+		&uploadDesc,
+		D3D12_RESOURCE_STATE_GENERIC_READ,
+		NULL,
+		IID_PPV_ARGS(&uploadBuffer)
+		);
+	if (FAILED(hr))
+	{
+		dx12.ri.Printf(PRINT_WARNING, "DX12_CreateTextureFromRGBA: CreateCommittedResource (upload) failed (0x%08lx)\n", hr);
+		tex.resource->Release();
+		tex.resource = NULL;
+		return tex;
+	}
+
+	// ---- Copy pixel rows into the upload buffer ----
+	UINT8      *pMapped   = NULL;
+	D3D12_RANGE readRange = { 0, 0 };
+	uploadBuffer->Map(0, &readRange, (void **)&pMapped);
+	for (UINT row = 0; row < numRows; row++)
+	{
+		memcpy(
+			pMapped + footprint.Offset + (UINT64)row * footprint.Footprint.RowPitch,
+			data + (UINT64)row * (UINT)width * 4,
+			(size_t)width * 4
+			);
+	}
+	uploadBuffer->Unmap(0, NULL);
+
+	// ---- Record upload + transition into a command list ----
+	dx12.commandAllocators[0]->Reset();
+	dx12.commandList->Reset(dx12.commandAllocators[0], NULL);
+
+	D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
+	srcLoc.pResource        = uploadBuffer;
+	srcLoc.Type             = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+	srcLoc.PlacedFootprint  = footprint;
+
+	D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
+	dstLoc.pResource        = tex.resource;
+	dstLoc.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	dstLoc.SubresourceIndex = 0;
+
+	dx12.commandList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, NULL);
+
+	D3D12_RESOURCE_BARRIER barrier = {};
+	barrier.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	barrier.Flags                  = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+	barrier.Transition.pResource   = tex.resource;
+	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+	barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	dx12.commandList->ResourceBarrier(1, &barrier);
+
+	dx12.commandList->Close();
+
+	ID3D12CommandList *ppCmdLists[] = { dx12.commandList };
+	dx12.commandQueue->ExecuteCommandLists(1, ppCmdLists);
+
+	// Wait for upload to finish before releasing the staging buffer
+	DX12_WaitForGpu();
+	uploadBuffer->Release();
+
+	// ---- Create SRV in slot 0 of the SRV heap ----
+	D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+	srvDesc.Format                        = DXGI_FORMAT_R8G8B8A8_UNORM;
+	srvDesc.ViewDimension                 = D3D12_SRV_DIMENSION_TEXTURE2D;
+	srvDesc.Shader4ComponentMapping       = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	srvDesc.Texture2D.MipLevels           = 1;
+	srvDesc.Texture2D.MostDetailedMip     = 0;
+	srvDesc.Texture2D.ResourceMinLODClamp = 0.0f;
+
+	tex.cpuHandle = dx12.srvHeap->GetCPUDescriptorHandleForHeapStart();
+	tex.gpuHandle = dx12.srvHeap->GetGPUDescriptorHandleForHeapStart();
+	dx12.device->CreateShaderResourceView(tex.resource, &srvDesc, tex.cpuHandle);
+
+	return tex;
+}
+
+// ---------------------------------------------------------------------------
+// DX12_DrawTexturedQuad
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief DX12_DrawTexturedQuad
+ * @param[in] x    Left edge in screen pixels
+ * @param[in] y    Top edge in screen pixels
+ * @param[in] w    Width in screen pixels
+ * @param[in] h    Height in screen pixels
+ * @param[in] tex  Texture to sample
+ *
+ * Converts pixel coordinates to NDC, writes 4 vertices into the persistent
+ * quad upload buffer, binds the SRV heap, sets the descriptor table, and
+ * issues a 4-vertex TRIANGLESTRIP draw call.
+ *
+ * Assumes the caller has already set the root signature, PSO, viewport and
+ * scissor on dx12.commandList.
+ */
+void DX12_DrawTexturedQuad(float x, float y, float w, float h, dx12Texture_t *tex)
+{
+	// Convert screen-pixel coords to NDC (Y is flipped: screen Y=0 → top)
+	float nx1 = (x / (float)dx12.vidWidth) * 2.0f - 1.0f;
+	float ny1 = 1.0f - (y / (float)dx12.vidHeight) * 2.0f;
+	float nx2 = ((x + w) / (float)dx12.vidWidth) * 2.0f - 1.0f;
+	float ny2 = 1.0f - ((y + h) / (float)dx12.vidHeight) * 2.0f;
+
+	dx12QuadVertex_t verts[4] =
+	{
+		{ { nx1, ny1 }, { 0.0f, 0.0f } },  // top-left
+		{ { nx2, ny1 }, { 1.0f, 0.0f } },  // top-right
+		{ { nx1, ny2 }, { 0.0f, 1.0f } },  // bottom-left
+		{ { nx2, ny2 }, { 1.0f, 1.0f } },  // bottom-right
+	};
+
+	UINT8      *pMapped   = NULL;
+	D3D12_RANGE readRange = { 0, 0 };
+	dx12.quadVertexBuffer->Map(0, &readRange, (void **)&pMapped);
+	memcpy(pMapped, verts, sizeof(verts));
+	dx12.quadVertexBuffer->Unmap(0, NULL);
+
+	// Bind SRV heap and set descriptor table (root param 0 → t0)
+	ID3D12DescriptorHeap *heaps[] = { dx12.srvHeap };
+	dx12.commandList->SetDescriptorHeaps(1, heaps);
+	dx12.commandList->SetGraphicsRootDescriptorTable(0, tex->gpuHandle);
+
+	dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+	dx12.commandList->IASetVertexBuffers(0, 1, &dx12.quadVertexBufferView);
+	dx12.commandList->DrawInstanced(4, 1, 0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -268,6 +474,25 @@ qboolean R_DX12_Init(void)
 	}
 
 	// ----------------------------------------------------------------
+	// SRV Descriptor Heap (shader-visible, 1 slot for the test texture)
+	// ----------------------------------------------------------------
+	{
+		D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc = {};
+		srvHeapDesc.NumDescriptors = 1;
+		srvHeapDesc.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+		srvHeapDesc.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+
+		hr = dx12.device->CreateDescriptorHeap(&srvHeapDesc, IID_PPV_ARGS(&dx12.srvHeap));
+		if (FAILED(hr))
+		{
+			dx12.ri.Error(ERR_FATAL, "R_DX12_Init: CreateDescriptorHeap (SRV) failed (0x%08lx)\n", hr);
+			return qfalse;
+		}
+
+		dx12.srvDescriptorSize = dx12.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+	}
+
+	// ----------------------------------------------------------------
 	// Render Target Views
 	// ----------------------------------------------------------------
 	{
@@ -301,14 +526,45 @@ qboolean R_DX12_Init(void)
 	}
 
 	// ----------------------------------------------------------------
-	// Empty Root Signature
+	// Root Signature: one descriptor table (SRV at t0) + static sampler
 	// ----------------------------------------------------------------
 	{
+		// One SRV range: t0, 1 descriptor
+		D3D12_DESCRIPTOR_RANGE srvRange = {};
+		srvRange.RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+		srvRange.NumDescriptors                    = 1;
+		srvRange.BaseShaderRegister                = 0;
+		srvRange.RegisterSpace                     = 0;
+		srvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+		// Root param 0: descriptor table visible to pixel shader
+		D3D12_ROOT_PARAMETER rootParam = {};
+		rootParam.ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+		rootParam.DescriptorTable.NumDescriptorRanges = 1;
+		rootParam.DescriptorTable.pDescriptorRanges   = &srvRange;
+		rootParam.ShaderVisibility                    = D3D12_SHADER_VISIBILITY_PIXEL;
+
+		// Static linear-clamp sampler at s0
+		D3D12_STATIC_SAMPLER_DESC staticSampler = {};
+		staticSampler.Filter           = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+		staticSampler.AddressU         = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+		staticSampler.AddressV         = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+		staticSampler.AddressW         = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+		staticSampler.MipLODBias       = 0.0f;
+		staticSampler.MaxAnisotropy    = 1;
+		staticSampler.ComparisonFunc   = D3D12_COMPARISON_FUNC_NEVER;
+		staticSampler.BorderColor      = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+		staticSampler.MinLOD           = 0.0f;
+		staticSampler.MaxLOD           = 0.0f;
+		staticSampler.ShaderRegister   = 0;
+		staticSampler.RegisterSpace    = 0;
+		staticSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
 		D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
-		rootSigDesc.NumParameters     = 0;
-		rootSigDesc.pParameters       = NULL;
-		rootSigDesc.NumStaticSamplers = 0;
-		rootSigDesc.pStaticSamplers   = NULL;
+		rootSigDesc.NumParameters     = 1;
+		rootSigDesc.pParameters       = &rootParam;
+		rootSigDesc.NumStaticSamplers = 1;
+		rootSigDesc.pStaticSamplers   = &staticSampler;
 		rootSigDesc.Flags             = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
 		ID3DBlob *signature = NULL;
@@ -390,11 +646,11 @@ qboolean R_DX12_Init(void)
 		}
 		if (errorBlob) { errorBlob->Release(); errorBlob = NULL; }
 
-		// Input layout matching dx12Vertex_t
+		// Input layout matching dx12QuadVertex_t: float2 pos + float2 uv
 		D3D12_INPUT_ELEMENT_DESC inputElementDescs[] =
 		{
-			{ "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT,    0,  0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-			{ "COLOR",    0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+			{ "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0,  0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+			{ "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0,  8, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
 		};
 
 		D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
@@ -474,25 +730,17 @@ qboolean R_DX12_Init(void)
 	dx12.commandList->Close();
 
 	// ----------------------------------------------------------------
-	// Triangle Vertex Buffer
+	// Quad Vertex Buffer (upload heap, 4 vertices, updated each draw)
 	// ----------------------------------------------------------------
 	{
-		dx12Vertex_t triangleVertices[] =
-		{
-			// pos                  color (R, G, B, A)
-			{  { 0.0f,  0.5f, 0.0f }, { 1.0f, 0.0f, 0.0f, 1.0f } },  // top – red
-			{  { 0.5f, -0.5f, 0.0f }, { 0.0f, 1.0f, 0.0f, 1.0f } },  // right – green
-			{ { -0.5f, -0.5f, 0.0f }, { 0.0f, 0.0f, 1.0f, 1.0f } },  // left – blue
-		};
-
-		const UINT vertexBufferSize = sizeof(triangleVertices);
+		const UINT quadVBSize = sizeof(dx12QuadVertex_t) * 4;
 
 		D3D12_HEAP_PROPERTIES heapProps = {};
 		heapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
 
 		D3D12_RESOURCE_DESC resDesc = {};
 		resDesc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
-		resDesc.Width            = vertexBufferSize;
+		resDesc.Width            = quadVBSize;
 		resDesc.Height           = 1;
 		resDesc.DepthOrArraySize = 1;
 		resDesc.MipLevels        = 1;
@@ -506,29 +754,17 @@ qboolean R_DX12_Init(void)
 			&resDesc,
 			D3D12_RESOURCE_STATE_GENERIC_READ,
 			NULL,
-			IID_PPV_ARGS(&dx12.vertexBuffer)
+			IID_PPV_ARGS(&dx12.quadVertexBuffer)
 			);
 		if (FAILED(hr))
 		{
-			dx12.ri.Error(ERR_FATAL, "R_DX12_Init: CreateCommittedResource (vertex buffer) failed (0x%08lx)\n", hr);
+			dx12.ri.Error(ERR_FATAL, "R_DX12_Init: CreateCommittedResource (quad VB) failed (0x%08lx)\n", hr);
 			return qfalse;
 		}
 
-		// Copy vertices to the upload buffer
-		UINT8 *pVertexDataBegin = NULL;
-		D3D12_RANGE readRange   = { 0, 0 };
-		hr = dx12.vertexBuffer->Map(0, &readRange, (void **)&pVertexDataBegin);
-		if (FAILED(hr))
-		{
-			dx12.ri.Error(ERR_FATAL, "R_DX12_Init: vertex buffer Map failed (0x%08lx)\n", hr);
-			return qfalse;
-		}
-		memcpy(pVertexDataBegin, triangleVertices, vertexBufferSize);
-		dx12.vertexBuffer->Unmap(0, NULL);
-
-		dx12.vertexBufferView.BufferLocation = dx12.vertexBuffer->GetGPUVirtualAddress();
-		dx12.vertexBufferView.StrideInBytes  = sizeof(dx12Vertex_t);
-		dx12.vertexBufferView.SizeInBytes    = vertexBufferSize;
+		dx12.quadVertexBufferView.BufferLocation = dx12.quadVertexBuffer->GetGPUVirtualAddress();
+		dx12.quadVertexBufferView.StrideInBytes  = sizeof(dx12QuadVertex_t);
+		dx12.quadVertexBufferView.SizeInBytes    = quadVBSize;
 	}
 
 	// ----------------------------------------------------------------
@@ -564,8 +800,45 @@ qboolean R_DX12_Init(void)
 	dx12.scissorRect.right  = (LONG)dx12.vidWidth;
 	dx12.scissorRect.bottom = (LONG)dx12.vidHeight;
 
+	// ----------------------------------------------------------------
+	// Test texture: 64×64 checkerboard (magenta + black)
+	// ----------------------------------------------------------------
+	{
+		const int   TEX_W    = 64;
+		const int   TEX_H    = 64;
+		const int   CELL     = 8;
+		const int   numBytes = TEX_W * TEX_H * 4;
+		byte       *texData  = (byte *)malloc((size_t)numBytes);
+
+		if (texData)
+		{
+			for (int py = 0; py < TEX_H; py++)
+			{
+				for (int px = 0; px < TEX_W; px++)
+				{
+					int  idx   = (py * TEX_W + px) * 4;
+					int  white = (((px / CELL) + (py / CELL)) % 2 == 0);
+					texData[idx + 0] = white ? 255 : 128; // R
+					texData[idx + 1] = white ? 255 :   0; // G
+					texData[idx + 2] = white ? 255 : 128; // B
+					texData[idx + 3] = 255;               // A
+				}
+			}
+
+			dx12.testTexture = DX12_CreateTextureFromRGBA(texData, TEX_W, TEX_H);
+			free(texData);
+		}
+
+		if (!dx12.testTexture.resource)
+		{
+			dx12.ri.Error(ERR_FATAL, "R_DX12_Init: test texture creation failed\n");
+			return qfalse;
+		}
+	}
+
 	dx12.initialized = qtrue;
 	dx12.ri.Printf(PRINT_ALL, "R_DX12: Initialized (%dx%d)\n", dx12.vidWidth, dx12.vidHeight);
+	return qtrue;
 }
 
 // ---------------------------------------------------------------------------
@@ -619,17 +892,18 @@ void R_DX12_SwapBuffers(void)
 
 	dx12.commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, NULL);
 
-	// Clear to a dark blue/grey background
+	// Clear to a dark background
 	const float clearColor[] = { 0.05f, 0.05f, 0.15f, 1.0f };
 	dx12.commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, NULL);
 
-	// Bind pipeline state objects and draw the triangle
+	// Bind root signature + PSO, then draw the textured quad
 	dx12.commandList->SetGraphicsRootSignature(dx12.rootSignature);
+	dx12.commandList->SetPipelineState(dx12.pipelineState);
 	dx12.commandList->RSSetViewports(1, &dx12.viewport);
 	dx12.commandList->RSSetScissorRects(1, &dx12.scissorRect);
-	dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-	dx12.commandList->IASetVertexBuffers(0, 1, &dx12.vertexBufferView);
-	dx12.commandList->DrawInstanced(3, 1, 0, 0);
+
+	DX12_DrawTexturedQuad(0.0f, 0.0f, (float)dx12.vidWidth, (float)dx12.vidHeight,
+	                      &dx12.testTexture);
 
 	// Transition back buffer: RENDER_TARGET → PRESENT
 	D3D12_RESOURCE_BARRIER barrierToPresent = {};
@@ -734,10 +1008,16 @@ void R_DX12_Shutdown(qboolean destroyWindow)
 		dx12.fence = NULL;
 	}
 
-	if (dx12.vertexBuffer)
+	if (dx12.testTexture.resource)
 	{
-		dx12.vertexBuffer->Release();
-		dx12.vertexBuffer = NULL;
+		dx12.testTexture.resource->Release();
+		dx12.testTexture.resource = NULL;
+	}
+
+	if (dx12.quadVertexBuffer)
+	{
+		dx12.quadVertexBuffer->Release();
+		dx12.quadVertexBuffer = NULL;
 	}
 
 	if (dx12.pipelineState)
@@ -780,6 +1060,12 @@ void R_DX12_Shutdown(qboolean destroyWindow)
 	{
 		dx12.rtvHeap->Release();
 		dx12.rtvHeap = NULL;
+	}
+
+	if (dx12.srvHeap)
+	{
+		dx12.srvHeap->Release();
+		dx12.srvHeap = NULL;
 	}
 
 	if (dx12.swapChain)
