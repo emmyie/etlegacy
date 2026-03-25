@@ -1,9 +1,11 @@
 /**
  * @file tr_dx12_main.cpp
- * @brief DirectX 12 renderer – main entry point and stub implementations
+ * @brief DirectX 12 renderer – main entry point and refexport_t implementations
  */
 
 #include "tr_dx12_local.h"
+#include "dx12_shader.h"
+#include "dx12_poly.h"
 
 #ifdef _WIN32
 
@@ -77,16 +79,27 @@ static void RE_DX12_RenderScene(const refdef_t *fd)
 
 static void RE_DX12_SetColor(const float *rgba)
 {
-	(void)rgba;
+	if (rgba)
+	{
+		dx12.color2D[0] = rgba[0];
+		dx12.color2D[1] = rgba[1];
+		dx12.color2D[2] = rgba[2];
+		dx12.color2D[3] = rgba[3];
+	}
+	else
+	{
+		dx12.color2D[0] = 1.0f;
+		dx12.color2D[1] = 1.0f;
+		dx12.color2D[2] = 1.0f;
+		dx12.color2D[3] = 1.0f;
+	}
 }
 
 static void RE_DX12_DrawStretchPic(float x, float y, float w, float h,
                                     float s1, float t1, float s2, float t2,
                                     qhandle_t hShader)
 {
-	(void)x; (void)y; (void)w; (void)h;
-	(void)s1; (void)t1; (void)s2; (void)t2;
-	(void)hShader;
+	DX12_DrawStretchPic(x, y, w, h, s1, t1, s2, t2, hShader);
 }
 
 static void RE_DX12_DrawRotatedPic(float x, float y, float w, float h,
@@ -103,14 +116,13 @@ static void RE_DX12_DrawStretchPicGradient(float x, float y, float w, float h,
                                             qhandle_t hShader, const float *gradientColor,
                                             int gradientType)
 {
-	(void)x; (void)y; (void)w; (void)h;
-	(void)s1; (void)t1; (void)s2; (void)t2;
-	(void)hShader; (void)gradientColor; (void)gradientType;
+	DX12_DrawStretchPicGradient(x, y, w, h, s1, t1, s2, t2,
+	                            hShader, gradientColor, gradientType);
 }
 
 static void RE_DX12_Add2dPolys(polyVert_t *polys, int numverts, qhandle_t hShader)
 {
-	(void)polys; (void)numverts; (void)hShader;
+	DX12_Add2dPolys(polys, numverts, hShader);
 }
 
 static void RE_DX12_DrawStretchRaw(int x, int y, int w, int h, int cols, int rows,
@@ -129,7 +141,7 @@ static void RE_DX12_UploadCinematic(int w, int h, int cols, int rows,
 
 static void RE_DX12_BeginFrame(void)
 {
-	// Frame begin; actual work done in SwapBuffers
+	DX12_BeginFrameRender();
 }
 
 static void RE_DX12_EndFrame(int *frontEndMsec, int *backEndMsec)
@@ -163,12 +175,12 @@ static qhandle_t RE_DX12_RegisterSkin(const char *name)
 
 static qhandle_t RE_DX12_RegisterShader(const char *name)
 {
-	(void)name; return 0;
+	return DX12_RegisterTexture(name);
 }
 
 static qhandle_t RE_DX12_RegisterShaderNoMip(const char *name)
 {
-	(void)name; return 0;
+	return DX12_RegisterTexture(name);
 }
 
 static void RE_DX12_RegisterFont(const char *fontName, int pointSize, void *font, qboolean extended)

@@ -29,40 +29,36 @@
  * id Software LLC, c/o ZeniMax Media Inc., Suite 120, Rockville, Maryland 20850 USA.
  */
 /**
- * @file tr_dx12_shaders.hlsl
- * @brief Textured-quad vertex and pixel shaders for the DX12 renderer
+ * @file dx12_shader.h
+ * @brief DX12 texture registry – no GL, no renderer_common dependency.
  *
- * VSMain: passes 2D clip-space position, UVs, and per-vertex modulate color
- * PSMain: samples the bound texture and multiplies by the vertex color
+ * A flat array of up to DX12_MAX_TEXTURES entries.  Index 0 is always a
+ * 1×1 opaque-white fallback texture used whenever a shader handle is invalid.
+ * Handles returned by DX12_RegisterTexture() are indices into this array.
  */
 
-Texture2D    g_texture : register(t0);
-SamplerState g_sampler : register(s0);
+#ifndef DX12_SHADER_H
+#define DX12_SHADER_H
 
-struct VSInput
-{
-    float2 pos : POSITION;
-    float2 uv  : TEXCOORD;
-    float4 col : COLOR;
-};
+#ifdef _WIN32
 
-struct PSInput
-{
-    float4 pos : SV_POSITION;
-    float2 uv  : TEXCOORD;
-    float4 col : COLOR;
-};
+#include "tr_dx12_local.h"
 
-PSInput VSMain(VSInput input)
+/**
+ * @struct dx12ShaderEntry_t
+ * @brief One slot in the DX12 texture registry.
+ */
+typedef struct
 {
-    PSInput o;
-    o.pos = float4(input.pos, 0.0, 1.0);
-    o.uv  = input.uv;
-    o.col = input.col;
-    return o;
-}
+	char          name[MAX_QPATH]; ///< Game-path used to load this texture
+	int           width;           ///< Original image width
+	int           height;          ///< Original image height
+	dx12Texture_t tex;             ///< D3D12 resource + SRV handles
+	qboolean      valid;           ///< qtrue once successfully uploaded
+} dx12ShaderEntry_t;
 
-float4 PSMain(PSInput input) : SV_TARGET
-{
-    return g_texture.Sample(g_sampler, input.uv) * input.col;
-}
+extern dx12ShaderEntry_t dx12Shaders[DX12_MAX_TEXTURES];
+extern int               dx12NumShaders;
+
+#endif // _WIN32
+#endif // DX12_SHADER_H

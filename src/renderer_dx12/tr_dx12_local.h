@@ -19,16 +19,21 @@
 #include <dxgi1_4.h>
 #include <d3dcompiler.h>
 
-#define DX12_FRAME_COUNT 2
+#define DX12_FRAME_COUNT    2
+#define DX12_MAX_TEXTURES   1024  ///< Max simultaneously loaded textures
+/// Per-frame 2D vertex budget.  Strip quads need 4 verts each; fan-expanded
+/// polygons need (numverts-2)*3 verts.  24576 comfortably fits ~4000 UI calls.
+#define DX12_MAX_2D_VERTS   24576
 
 /**
  * @struct dx12QuadVertex_t
- * @brief A single vertex for the textured quad (2D clip-space position + UV)
+ * @brief A single 2D vertex: NDC position, UV, and per-vertex RGBA color
  */
 typedef struct
 {
-	float pos[2];
-	float uv[2];
+	float pos[2];    ///< NDC clip-space position (X, Y)
+	float uv[2];     ///< Texture coordinates (S, T)
+	float color[4];  ///< Modulate color (R, G, B, A) in [0, 1]
 } dx12QuadVertex_t;
 
 /**
@@ -79,12 +84,14 @@ typedef struct
 	ID3D12RootSignature  *rootSignature;
 	ID3D12PipelineState  *pipelineState;
 
-	// Quad vertex buffer (upload heap, updated each draw)
-	ID3D12Resource           *quadVertexBuffer;
-	D3D12_VERTEX_BUFFER_VIEW  quadVertexBufferView;
+	// 2D vertex ring-buffer (upload heap, persistently mapped)
+	ID3D12Resource *quadVertexBuffer;   ///< DX12_MAX_2D_VERTS * sizeof(dx12QuadVertex_t) bytes
+	UINT8          *quadVBMapped;       ///< Persistently-mapped CPU pointer
+	UINT            quadVBOffset;       ///< Next free vertex index (reset each frame)
 
-	// Test texture (checkerboard)
-	dx12Texture_t testTexture;
+	// Per-frame state
+	float    color2D[4];    ///< Current 2D modulate color set by RE_DX12_SetColor
+	qboolean frameOpen;     ///< qtrue between DX12_BeginFrameRender and R_DX12_SwapBuffers
 
 	// Frame state
 	UINT          frameIndex;
@@ -122,13 +129,27 @@ typedef enum
 	RC_FINISH
 } dx12RenderCommand_t;
 
-// Function declarations
+// Function declarations – backend (tr_dx12_backend.cpp)
 qboolean      R_DX12_Init(void);
 void          R_DX12_Shutdown(qboolean destroyWindow);
 void          R_DX12_RenderCommandList(const void *data);
 void          R_DX12_SwapBuffers(void);
-dx12Texture_t DX12_CreateTextureFromRGBA(const byte *data, int width, int height);
-void          DX12_DrawTexturedQuad(float x, float y, float w, float h, dx12Texture_t *tex);
+void          DX12_BeginFrameRender(void);
+dx12Texture_t DX12_CreateTextureFromRGBA(const byte *data, int width, int height, int srvSlot);
+
+// Function declarations – texture registry (dx12_shader.cpp)
+void      DX12_InitTextures(void);
+void      DX12_ShutdownTextures(void);
+qhandle_t DX12_RegisterTexture(const char *name);
+dx12Texture_t *DX12_GetTexture(qhandle_t handle);
+
+// Function declarations – 2D drawing (dx12_poly.cpp)
+void DX12_DrawStretchPic(float x, float y, float w, float h,
+                         float s1, float t1, float s2, float t2, qhandle_t hShader);
+void DX12_DrawStretchPicGradient(float x, float y, float w, float h,
+                                 float s1, float t1, float s2, float t2,
+                                 qhandle_t hShader, const float *gradientColor, int gradientType);
+void DX12_Add2dPolys(polyVert_t *polys, int numverts, qhandle_t hShader);
 
 #endif // _WIN32
 
