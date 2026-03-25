@@ -223,6 +223,8 @@ FILE(GLOB RENDERER_VULKAN_SHADERS
 FILE(GLOB RENDERER_DX12_FILES
 	"src/renderer_dx12/*.cpp"
 	"src/renderer_dx12/*.h"
+	"src/renderer_dx12/*.c"
+	"src/renderer_dx12/*.hpp"
 )
 
 FILE(GLOB IRC_CLIENT_FILES

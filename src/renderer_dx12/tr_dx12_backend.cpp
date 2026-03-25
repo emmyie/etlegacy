@@ -1,33 +1,3 @@
-/*
- * Wolfenstein: Enemy Territory GPL Source Code
- * Copyright (C) 1999-2010 id Software LLC, a ZeniMax Media company.
- *
- * ET: Legacy
- * Copyright (C) 2012-2024 ET:Legacy team <mail@etlegacy.com>
- *
- * This file is part of ET: Legacy - http://www.etlegacy.com
- *
- * ET: Legacy is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * ET: Legacy is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with ET: Legacy. If not, see <http://www.gnu.org/licenses/>.
- *
- * In addition, Wolfenstein: Enemy Territory GPL Source Code is also
- * subject to certain additional terms. You should have received a copy
- * of these additional terms immediately following the terms and conditions
- * of the GNU General Public License which accompanied the source code.
- * If not, please request a copy in writing from id Software at the address below.
- *
- * id Software LLC, c/o ZeniMax Media Inc., Suite 120, Rockville, Maryland 20850 USA.
- */
 /**
  * @file tr_dx12_backend.cpp
  * @brief DirectX 12 renderer backend – initialization, rendering and shutdown
@@ -131,8 +101,11 @@ static void DX12_MoveToNextFrame(void)
  * render targets, command allocators, command list, fence, root signature,
  * PSO and vertex buffer for the triangle demo.
  */
-void R_DX12_Init(void)
+qboolean R_DX12_Init(void)
 {
+	/*dx12.ri.Printf( PRINT_ALL, "R_DX12_Init: stub success\n" );
+	return qtrue;*/
+
 	HRESULT hr;
 	char    glConfigString[1024];
 	glconfig_t glConfig;
@@ -161,7 +134,7 @@ void R_DX12_Init(void)
 	if (!dx12.hWnd)
 	{
 		dx12.ri.Error(ERR_FATAL, "R_DX12_Init: could not obtain a valid window handle\n");
-		return;
+		return qfalse;
 	}
 
 	dx12.vidWidth  = glConfig.vidWidth  > 0 ? glConfig.vidWidth  : 1280;
@@ -187,7 +160,7 @@ void R_DX12_Init(void)
 	if (FAILED(hr))
 	{
 		dx12.ri.Error(ERR_FATAL, "R_DX12_Init: CreateDXGIFactory1 failed (0x%08lx)\n", hr);
-		return;
+		return qfalse;
 	}
 
 	// ----------------------------------------------------------------
@@ -208,7 +181,7 @@ void R_DX12_Init(void)
 		{
 			factory->Release();
 			dx12.ri.Error(ERR_FATAL, "R_DX12_Init: D3D12CreateDevice failed (0x%08lx)\n", hr);
-			return;
+			return qfalse;
 		}
 		dx12.ri.Printf(PRINT_ALL, "R_DX12: Using WARP software device\n");
 	}
@@ -226,7 +199,7 @@ void R_DX12_Init(void)
 		{
 			factory->Release();
 			dx12.ri.Error(ERR_FATAL, "R_DX12_Init: CreateCommandQueue failed (0x%08lx)\n", hr);
-			return;
+			return qfalse;
 		}
 	}
 
@@ -256,7 +229,7 @@ void R_DX12_Init(void)
 		{
 			factory->Release();
 			dx12.ri.Error(ERR_FATAL, "R_DX12_Init: CreateSwapChainForHwnd failed (0x%08lx)\n", hr);
-			return;
+			return qfalse;
 		}
 
 		factory->MakeWindowAssociation(dx12.hWnd, DXGI_MWA_NO_ALT_ENTER);
@@ -267,7 +240,7 @@ void R_DX12_Init(void)
 		{
 			factory->Release();
 			dx12.ri.Error(ERR_FATAL, "R_DX12_Init: QueryInterface(IDXGISwapChain3) failed (0x%08lx)\n", hr);
-			return;
+			return qfalse;
 		}
 
 		dx12.frameIndex = dx12.swapChain->GetCurrentBackBufferIndex();
@@ -288,7 +261,7 @@ void R_DX12_Init(void)
 		if (FAILED(hr))
 		{
 			dx12.ri.Error(ERR_FATAL, "R_DX12_Init: CreateDescriptorHeap failed (0x%08lx)\n", hr);
-			return;
+			return qfalse;
 		}
 
 		dx12.rtvDescriptorSize = dx12.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
@@ -306,7 +279,7 @@ void R_DX12_Init(void)
 			if (FAILED(hr))
 			{
 				dx12.ri.Error(ERR_FATAL, "R_DX12_Init: GetBuffer(%u) failed (0x%08lx)\n", i, hr);
-				return;
+				return qfalse;
 			}
 			dx12.device->CreateRenderTargetView(dx12.renderTargets[i], NULL, rtvHandle);
 			rtvHandle.ptr += dx12.rtvDescriptorSize;
@@ -323,7 +296,7 @@ void R_DX12_Init(void)
 		if (FAILED(hr))
 		{
 			dx12.ri.Error(ERR_FATAL, "R_DX12_Init: CreateCommandAllocator[%u] failed (0x%08lx)\n", i, hr);
-			return;
+			return qfalse;
 		}
 	}
 
@@ -352,7 +325,7 @@ void R_DX12_Init(void)
 				error->Release();
 			}
 			dx12.ri.Error(ERR_FATAL, "R_DX12_Init: D3D12SerializeRootSignature failed (0x%08lx)\n", hr);
-			return;
+			return qfalse;
 		}
 
 		hr = dx12.device->CreateRootSignature(0, signature->GetBufferPointer(),
@@ -367,7 +340,7 @@ void R_DX12_Init(void)
 		if (FAILED(hr))
 		{
 			dx12.ri.Error(ERR_FATAL, "R_DX12_Init: CreateRootSignature failed (0x%08lx)\n", hr);
-			return;
+			return qfalse;
 		}
 	}
 
@@ -397,7 +370,7 @@ void R_DX12_Init(void)
 				errorBlob->Release();
 			}
 			dx12.ri.Error(ERR_FATAL, "R_DX12_Init: vertex shader compile failed (0x%08lx)\n", hr);
-			return;
+			return qfalse;
 		}
 		if (errorBlob) { errorBlob->Release(); errorBlob = NULL; }
 
@@ -413,7 +386,7 @@ void R_DX12_Init(void)
 			}
 			vertexShader->Release();
 			dx12.ri.Error(ERR_FATAL, "R_DX12_Init: pixel shader compile failed (0x%08lx)\n", hr);
-			return;
+			return qfalse;
 		}
 		if (errorBlob) { errorBlob->Release(); errorBlob = NULL; }
 
@@ -480,7 +453,7 @@ void R_DX12_Init(void)
 		if (FAILED(hr))
 		{
 			dx12.ri.Error(ERR_FATAL, "R_DX12_Init: CreateGraphicsPipelineState failed (0x%08lx)\n", hr);
-			return;
+			return qfalse;
 		}
 	}
 
@@ -494,7 +467,7 @@ void R_DX12_Init(void)
 	if (FAILED(hr))
 	{
 		dx12.ri.Error(ERR_FATAL, "R_DX12_Init: CreateCommandList failed (0x%08lx)\n", hr);
-		return;
+		return qfalse;
 	}
 
 	// Command lists are created in the recording state; close immediately.
@@ -538,7 +511,7 @@ void R_DX12_Init(void)
 		if (FAILED(hr))
 		{
 			dx12.ri.Error(ERR_FATAL, "R_DX12_Init: CreateCommittedResource (vertex buffer) failed (0x%08lx)\n", hr);
-			return;
+			return qfalse;
 		}
 
 		// Copy vertices to the upload buffer
@@ -548,7 +521,7 @@ void R_DX12_Init(void)
 		if (FAILED(hr))
 		{
 			dx12.ri.Error(ERR_FATAL, "R_DX12_Init: vertex buffer Map failed (0x%08lx)\n", hr);
-			return;
+			return qfalse;
 		}
 		memcpy(pVertexDataBegin, triangleVertices, vertexBufferSize);
 		dx12.vertexBuffer->Unmap(0, NULL);
@@ -565,7 +538,7 @@ void R_DX12_Init(void)
 	if (FAILED(hr))
 	{
 		dx12.ri.Error(ERR_FATAL, "R_DX12_Init: CreateFence failed (0x%08lx)\n", hr);
-		return;
+		return qfalse;
 	}
 	dx12.fenceValues[dx12.frameIndex] = 1;
 
@@ -573,7 +546,7 @@ void R_DX12_Init(void)
 	if (!dx12.fenceEvent)
 	{
 		dx12.ri.Error(ERR_FATAL, "R_DX12_Init: CreateEvent failed\n");
-		return;
+		return qfalse;
 	}
 
 	// ----------------------------------------------------------------
