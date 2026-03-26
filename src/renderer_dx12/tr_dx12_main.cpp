@@ -34,6 +34,12 @@ static void RE_DX12_BeginRegistration(glconfig_t *config)
 
 	Com_Memset(config, 0, sizeof(*config));
 
+	// Make sure core DX12 is initialized before any texture/shader registration
+	if ( !dx12.initialized )
+	{
+		R_DX12_Init( );   // creates device, queues, heaps, PSO, VB, textures, etc.
+	}
+
 	r_mode        = dx12.ri.Cvar_Get("r_mode", "4", 0);
 	r_customwidth = dx12.ri.Cvar_Get("r_customwidth", "1280", 0);
 	r_customheight = dx12.ri.Cvar_Get("r_customheight", "720", 0);
@@ -464,11 +470,13 @@ static void RE_DX12_TakeVideoFrame(int h, int w, byte *captureBuffer, byte *enco
 
 static void RE_DX12_InitOpenGL(void)
 {
+	R_DX12_Init( );
 }
 
 static int RE_DX12_InitOpenGLSubSystem(void)
 {
-	return 1;
+	DX12_InitSwapchain( );
+	return qtrue;
 }
 
 // ---------------------------------------------------------------------------
@@ -563,7 +571,7 @@ refexport_t *GetRefAPI(int apiVersion, refimport_t *rimp)
 	re.InitOpenGL           = RE_DX12_InitOpenGL;
 	re.InitOpenGLSubSystem  = RE_DX12_InitOpenGLSubSystem;
 
-	R_DX12_Init();
+	R_DX12_Init( );
 
 	return &re;
 }

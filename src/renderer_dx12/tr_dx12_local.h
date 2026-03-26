@@ -140,6 +140,7 @@ typedef enum
 } dx12RenderCommand_t;
 
 // Function declarations – backend (tr_dx12_backend.cpp)
+void DX12_InitSwapchain( void );
 qboolean      R_DX12_Init(void);
 void          R_DX12_Shutdown(qboolean destroyWindow);
 void          R_DX12_RenderCommandList(const void *data);

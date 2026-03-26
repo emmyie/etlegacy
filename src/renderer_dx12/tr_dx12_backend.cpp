@@ -337,9 +337,121 @@ void DX12_BeginFrameRender(void)
 	dx12.frameOpen = qtrue;
 }
 
-// ---------------------------------------------------------------------------
-// R_DX12_Init
-// ---------------------------------------------------------------------------
+void DX12_InitSwapchain( void )
+{
+	HRESULT hr;
+
+	// Get window handle and size
+	void* hwndVoid = dx12.ri.GetHWND( );
+	HWND  hwnd = ( HWND )hwndVoid;
+	if ( !hwnd )
+	{
+		dx12.ri.Error( ERR_FATAL, "DX12_InitSwapchain: GetHWND returned NULL\n" );
+	}
+
+	RECT rc;
+	GetClientRect( hwnd, &rc );
+	UINT width = rc.right - rc.left;
+	UINT height = rc.bottom - rc.top;
+	if ( width == 0 || height == 0 )
+	{
+		width = 640;
+		height = 480;
+	}
+
+	dx12.hWnd = hwnd;
+	dx12.vidWidth = ( int )width;
+	dx12.vidHeight = ( int )height;
+
+	// Release old swapchain/render targets if any
+	for ( int i = 0; i < DX12_FRAME_COUNT; i++ )
+	{
+		if ( dx12.renderTargets[ i ] )
+		{
+			dx12.renderTargets[ i ]->Release( );
+			dx12.renderTargets[ i ] = nullptr;
+		}
+	}
+	if ( dx12.swapChain )
+	{
+		dx12.swapChain->Release( );
+		dx12.swapChain = nullptr;
+	}
+
+	// Create a local factory (you don't store one in dx12Globals_t)
+	IDXGIFactory4* factory = nullptr;
+	hr = CreateDXGIFactory1( IID_PPV_ARGS( &factory ) );
+	if ( FAILED( hr ) )
+	{
+		dx12.ri.Error( ERR_FATAL, "DX12_InitSwapchain: CreateDXGIFactory1 failed (0x%08lx)\n", hr );
+	}
+
+	// Describe swapchain
+	DXGI_SWAP_CHAIN_DESC1 scDesc = {};
+	scDesc.Width = width;
+	scDesc.Height = height;
+	scDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	scDesc.SampleDesc.Count = 1;
+	scDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+	scDesc.BufferCount = DX12_FRAME_COUNT;
+	scDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+	scDesc.Scaling = DXGI_SCALING_STRETCH;
+	scDesc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+
+	IDXGISwapChain1* swapChain1 = nullptr;
+	hr = factory->CreateSwapChainForHwnd(
+		dx12.commandQueue,
+		hwnd,
+		&scDesc,
+		nullptr,
+		nullptr,
+		&swapChain1 );
+	factory->Release( );
+
+	if ( FAILED( hr ) )
+	{
+		dx12.ri.Error( ERR_FATAL, "DX12_InitSwapchain: CreateSwapChainForHwnd failed (0x%08lx)\n", hr );
+	}
+
+	hr = swapChain1->QueryInterface( IID_PPV_ARGS( &dx12.swapChain ) );
+	swapChain1->Release( );
+	if ( FAILED( hr ) )
+	{
+		dx12.ri.Error( ERR_FATAL, "DX12_InitSwapchain: QueryInterface IDXGISwapChain3 failed (0x%08lx)\n", hr );
+	}
+
+	dx12.frameIndex = dx12.swapChain->GetCurrentBackBufferIndex( );
+
+	// Create RTVs for each backbuffer
+	D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle =
+		dx12.rtvHeap->GetCPUDescriptorHandleForHeapStart( );
+	for ( UINT i = 0; i < DX12_FRAME_COUNT; i++ )
+	{
+		hr = dx12.swapChain->GetBuffer( i, IID_PPV_ARGS( &dx12.renderTargets[ i ] ) );
+		if ( FAILED( hr ) )
+		{
+			dx12.ri.Error( ERR_FATAL, "DX12_InitSwapchain: GetBuffer[%u] failed (0x%08lx)\n", i, hr );
+		}
+
+		dx12.device->CreateRenderTargetView( dx12.renderTargets[ i ], nullptr, rtvHandle );
+		rtvHandle.ptr += dx12.rtvDescriptorSize;
+	}
+
+	// Set viewport + scissor
+	dx12.viewport.TopLeftX = 0.0f;
+	dx12.viewport.TopLeftY = 0.0f;
+	dx12.viewport.Width = ( float )width;
+	dx12.viewport.Height = ( float )height;
+	dx12.viewport.MinDepth = 0.0f;
+	dx12.viewport.MaxDepth = 1.0f;
+
+	dx12.scissorRect.left = 0;
+	dx12.scissorRect.top = 0;
+	dx12.scissorRect.right = ( LONG )width;
+	dx12.scissorRect.bottom = ( LONG )height;
+
+	dx12.currentScissor = dx12.scissorRect;
+}
 
 /**
  * @brief R_DX12_Init
@@ -448,9 +560,31 @@ qboolean R_DX12_Init(void)
 	}
 
 	// ----------------------------------------------------------------
-	// Swap Chain
+	// RTV Descriptor Heap
 	// ----------------------------------------------------------------
 	{
+		D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc = {};
+		rtvHeapDesc.NumDescriptors = DX12_FRAME_COUNT;
+		rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+		rtvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+
+		hr = dx12.device->CreateDescriptorHeap( &rtvHeapDesc, IID_PPV_ARGS( &dx12.rtvHeap ) );
+		if ( FAILED( hr ) )
+		{
+			dx12.ri.Error( ERR_FATAL, "R_DX12_Init: CreateDescriptorHeap failed (0x%08lx)\n", hr );
+			return qfalse;
+		}
+
+		dx12.rtvDescriptorSize = dx12.device->GetDescriptorHandleIncrementSize( D3D12_DESCRIPTOR_HEAP_TYPE_RTV );
+	}
+
+	// ----------------------------------------------------------------
+	// Swap Chain
+	// ----------------------------------------------------------------
+
+	DX12_InitSwapchain();
+
+	/*{
 		DXGI_SWAP_CHAIN_DESC1 swapChainDesc = {};
 		swapChainDesc.BufferCount       = DX12_FRAME_COUNT;
 		swapChainDesc.Width             = (UINT)dx12.vidWidth;
@@ -488,28 +622,9 @@ qboolean R_DX12_Init(void)
 		}
 
 		dx12.frameIndex = dx12.swapChain->GetCurrentBackBufferIndex();
-	}
+	}*/
 
 	factory->Release();
-
-	// ----------------------------------------------------------------
-	// RTV Descriptor Heap
-	// ----------------------------------------------------------------
-	{
-		D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc = {};
-		rtvHeapDesc.NumDescriptors = DX12_FRAME_COUNT;
-		rtvHeapDesc.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-		rtvHeapDesc.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
-
-		hr = dx12.device->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&dx12.rtvHeap));
-		if (FAILED(hr))
-		{
-			dx12.ri.Error(ERR_FATAL, "R_DX12_Init: CreateDescriptorHeap failed (0x%08lx)\n", hr);
-			return qfalse;
-		}
-
-		dx12.rtvDescriptorSize = dx12.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-	}
 
 	// ----------------------------------------------------------------
 	// SRV Descriptor Heap (shader-visible, DX12_MAX_TEXTURES slots)
