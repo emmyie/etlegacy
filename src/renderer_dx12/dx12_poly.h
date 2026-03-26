@@ -29,6 +29,25 @@ void DX12_DrawStretchPic(float x, float y, float w, float h,
                          qhandle_t hShader);
 
 /**
+ * @brief Draw a textured quad rotated about its own center.
+ *
+ * Matches the ET:Legacy GL renderer's DrawRotatedPic convention:
+ * @p angle is a fraction of a full counter-clockwise turn (0.0 = unrotated,
+ * 1.0 = full rotation).  The quad is centred at (x + w/2, y + h/2) and its
+ * corners lie at radius sqrt((w/2)^2 + (h/2)^2) from the centre.
+ *
+ * @param x,y     Top-left of the bounding box, in screen pixels.
+ * @param w,h     Width and height in screen pixels.
+ * @param s1,t1   UV for the unrotated top-left corner.
+ * @param s2,t2   UV for the unrotated bottom-right corner.
+ * @param hShader Texture handle from DX12_RegisterTexture().
+ * @param angle   Rotation in [0, 1] (fraction of a CCW full turn).
+ */
+void DX12_DrawRotatedPic(float x, float y, float w, float h,
+                         float s1, float t1, float s2, float t2,
+                         qhandle_t hShader, float angle);
+
+/**
  * @brief Draw a textured quad with a gradient modulate across two corners.
  *
  * @param gradientColor  RGBA [0,1] color applied to the gradient side.

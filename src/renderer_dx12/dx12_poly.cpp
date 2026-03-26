@@ -19,6 +19,7 @@
 #ifdef _WIN32
 
 #include <string.h>   // memcpy
+#include <math.h>     // cosf, sinf, sqrtf
 
 // ---------------------------------------------------------------------------
 // Coordinate-conversion helpers
@@ -421,6 +422,107 @@ void DX12_DrawStretchPic(float x, float y, float w, float h,
 	verts[5].uv[0]    = s1;  verts[5].uv[1]    = t2;
 	verts[5].color[0] = r;   verts[5].color[1] = g;
 	verts[5].color[2] = b;   verts[5].color[3] = a;
+
+	DX12_AppendToBatch(verts, 6, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, tex);
+}
+
+// ---------------------------------------------------------------------------
+// DX12_DrawRotatedPic
+// ---------------------------------------------------------------------------
+
+#ifndef M_PI_DX12
+#define M_PI_DX12 3.14159265358979323846f
+#endif
+
+/**
+ * @brief DX12_DrawRotatedPic
+ *
+ * Draws a textured quad rotated about its own center.
+ * Matches the ET:Legacy GL renderer's RE_RotatedPic / RB_RotatedPic behaviour:
+ *   - cx = x + w/2, cy = y + h/2 (center in screen pixels)
+ *   - r  = sqrt((w/2)^2 + (h/2)^2)  (radius to corners)
+ *   - Four corners at angles: A, A+π/2, A+π, A+3π/2  where A = angle * 2π
+ *
+ * @param x,y     Top-left of the bounding box, in screen pixels.
+ * @param w,h     Width and height in screen pixels.
+ * @param s1,t1   UV for corner 0 (angle A).
+ * @param s2,t2   UV for corner 2 (angle A+π).
+ * @param hShader Texture handle.
+ * @param angle   Rotation amount in [0, 1] (fraction of a full CCW turn).
+ */
+void DX12_DrawRotatedPic(float x, float y, float w, float h,
+                         float s1, float t1, float s2, float t2,
+                         qhandle_t hShader, float angle)
+{
+	dx12Texture_t   *tex;
+	float            r, g, b, a;
+	float            cx, cy, rad;
+	float            a0, a1, a2, a3;
+	float            px[4], py[4];
+	dx12QuadVertex_t verts[6];
+	float            uvs[4][2];
+	float            clr[4];
+	int              i;
+
+	if (!dx12.frameOpen)
+	{
+		return;
+	}
+
+	tex = DX12_GetTexture(hShader);
+	if (!tex)
+	{
+		return;
+	}
+
+	r = dx12.color2D[0];
+	g = dx12.color2D[1];
+	b = dx12.color2D[2];
+	a = dx12.color2D[3];
+
+	// Compute center and corner radius
+	cx  = x + w * 0.5f;
+	cy  = y + h * 0.5f;
+	rad = sqrtf((w * 0.5f) * (w * 0.5f) + (h * 0.5f) * (h * 0.5f));
+
+	// Base angle in radians (angle is [0, 1] fraction of a full turn)
+	a0 = angle * 2.0f * M_PI_DX12;
+	a1 = a0 + 0.5f * M_PI_DX12;
+	a2 = a0 + 1.0f * M_PI_DX12;
+	a3 = a0 + 1.5f * M_PI_DX12;
+
+	// Corner positions in screen pixels
+	px[0] = cx + cosf(a0) * rad;  py[0] = cy + sinf(a0) * rad;
+	px[1] = cx + cosf(a1) * rad;  py[1] = cy + sinf(a1) * rad;
+	px[2] = cx + cosf(a2) * rad;  py[2] = cy + sinf(a2) * rad;
+	px[3] = cx + cosf(a3) * rad;  py[3] = cy + sinf(a3) * rad;
+
+	// UV assignment (GL renderer convention)
+	uvs[0][0] = s1; uvs[0][1] = t1; // corner 0: A
+	uvs[1][0] = s2; uvs[1][1] = t1; // corner 1: A + π/2
+	uvs[2][0] = s2; uvs[2][1] = t2; // corner 2: A + π
+	uvs[3][0] = s1; uvs[3][1] = t2; // corner 3: A + 3π/2
+
+	clr[0] = r; clr[1] = g; clr[2] = b; clr[3] = a;
+
+	// Expand to 6 vertices (two triangles): (0,1,3) and (1,2,3)
+	{
+		static const int idx[6] = { 0, 1, 3, 1, 2, 3 };
+
+		for (i = 0; i < 6; i++)
+		{
+			int ci = idx[i];
+
+			verts[i].pos[0]   = NDC_X(px[ci]);
+			verts[i].pos[1]   = NDC_Y(py[ci]);
+			verts[i].uv[0]    = uvs[ci][0];
+			verts[i].uv[1]    = uvs[ci][1];
+			verts[i].color[0] = clr[0];
+			verts[i].color[1] = clr[1];
+			verts[i].color[2] = clr[2];
+			verts[i].color[3] = clr[3];
+		}
+	}
 
 	DX12_AppendToBatch(verts, 6, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, tex);
 }

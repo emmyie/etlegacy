@@ -115,9 +115,7 @@ static void RE_DX12_DrawRotatedPic(float x, float y, float w, float h,
                                     float s1, float t1, float s2, float t2,
                                     qhandle_t hShader, float angle)
 {
-	(void)x; (void)y; (void)w; (void)h;
-	(void)s1; (void)t1; (void)s2; (void)t2;
-	(void)hShader; (void)angle;
+	DX12_DrawRotatedPic(x, y, w, h, s1, t1, s2, t2, hShader, angle);
 }
 
 static void RE_DX12_DrawStretchPicGradient(float x, float y, float w, float h,
