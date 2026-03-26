@@ -174,6 +174,12 @@ typedef struct
 	ID3D12CommandAllocator    *commandAllocators[DX12_FRAME_COUNT];
 	ID3D12GraphicsCommandList *commandList;
 
+	// Dedicated upload command objects – used exclusively by *UploadBuffer()
+	// helpers so that resource uploads never touch the per-frame rendering
+	// command allocator/list (which may already be open/recording).
+	ID3D12CommandAllocator    *uploadCmdAllocator;
+	ID3D12GraphicsCommandList *uploadCmdList;
+
 	// Render target heap + targets
 	ID3D12DescriptorHeap *rtvHeap;
 	ID3D12Resource       *renderTargets[DX12_FRAME_COUNT];
@@ -255,6 +261,7 @@ void          R_DX12_RenderCommandList(const void *data);
 void          DX12_EndFrame(void);
 void          DX12_BeginFrame(void);
 dx12Texture_t DX12_CreateTextureFromRGBA(const byte *data, int width, int height, int srvSlot);
+void          DX12_WaitForUpload(ID3D12CommandQueue *queue);
 
 // Function declarations – texture registry (dx12_shader.cpp)
 void      DX12_InitTextures(void);

@@ -148,8 +148,8 @@ static qboolean MDL_UploadBuffer(const void *data, UINT64 sizeBytes,
 		uploadBuf->Unmap(0, NULL);
 	}
 
-	// Reset command allocator + list for this transfer
-	hr = dx12.commandAllocators[dx12.frameIndex]->Reset();
+	// Reset dedicated upload command allocator + list for this transfer
+	hr = dx12.uploadCmdAllocator->Reset();
 	if (FAILED(hr))
 	{
 		uploadBuf->Release();
@@ -158,7 +158,7 @@ static qboolean MDL_UploadBuffer(const void *data, UINT64 sizeBytes,
 		return qfalse;
 	}
 
-	hr = dx12.commandList->Reset(dx12.commandAllocators[dx12.frameIndex], NULL);
+	hr = dx12.uploadCmdList->Reset(dx12.uploadCmdAllocator, NULL);
 	if (FAILED(hr))
 	{
 		uploadBuf->Release();
@@ -167,7 +167,7 @@ static qboolean MDL_UploadBuffer(const void *data, UINT64 sizeBytes,
 		return qfalse;
 	}
 
-	dx12.commandList->CopyBufferRegion(*outBuffer, 0, uploadBuf, 0, sizeBytes);
+	dx12.uploadCmdList->CopyBufferRegion(*outBuffer, 0, uploadBuf, 0, sizeBytes);
 
 	{
 		D3D12_RESOURCE_BARRIER barrier = {};
@@ -176,10 +176,10 @@ static qboolean MDL_UploadBuffer(const void *data, UINT64 sizeBytes,
 		barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 		barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
 		barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_GENERIC_READ;
-		dx12.commandList->ResourceBarrier(1, &barrier);
+		dx12.uploadCmdList->ResourceBarrier(1, &barrier);
 	}
 
-	hr = dx12.commandList->Close();
+	hr = dx12.uploadCmdList->Close();
 	if (FAILED(hr))
 	{
 		uploadBuf->Release();
@@ -189,13 +189,9 @@ static qboolean MDL_UploadBuffer(const void *data, UINT64 sizeBytes,
 	}
 
 	{
-		ID3D12CommandList *lists[] = { dx12.commandList };
+		ID3D12CommandList *lists[] = { dx12.uploadCmdList };
 		dx12.commandQueue->ExecuteCommandLists(1, lists);
-
-		dx12.fenceValues[dx12.frameIndex]++;
-		dx12.commandQueue->Signal(dx12.fence, dx12.fenceValues[dx12.frameIndex]);
-		dx12.fence->SetEventOnCompletion(dx12.fenceValues[dx12.frameIndex], dx12.fenceEvent);
-		WaitForSingleObjectEx(dx12.fenceEvent, INFINITE, FALSE);
+		DX12_WaitForUpload(dx12.commandQueue);
 	}
 
 	uploadBuf->Release();

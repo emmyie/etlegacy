@@ -97,7 +97,7 @@ static void DX12_MoveToNextFrame( void )
 	dx12.frameIndex = dx12.swapChain->GetCurrentBackBufferIndex( );
 }
 
-static void DX12_WaitForUpload( ID3D12CommandQueue* queue )
+void DX12_WaitForUpload( ID3D12CommandQueue* queue )
 {
 	ID3D12Fence* fence = NULL;
 	HANDLE event = CreateEvent( NULL, FALSE, FALSE, NULL );
@@ -221,9 +221,9 @@ dx12Texture_t DX12_CreateTextureFromRGBA(const byte *data, int width, int height
 	}
 	uploadBuffer->Unmap(0, NULL);
 
-	// ---- Record upload + transition into the main command list ----
-	dx12.commandAllocators[0]->Reset();
-	dx12.commandList->Reset(dx12.commandAllocators[0], NULL);
+	// ---- Record upload + transition into the dedicated upload command list ----
+	dx12.uploadCmdAllocator->Reset();
+	dx12.uploadCmdList->Reset(dx12.uploadCmdAllocator, NULL);
 
 	D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
 	srcLoc.pResource        = uploadBuffer;
@@ -235,7 +235,7 @@ dx12Texture_t DX12_CreateTextureFromRGBA(const byte *data, int width, int height
 	dstLoc.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
 	dstLoc.SubresourceIndex = 0;
 
-	dx12.commandList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, NULL);
+	dx12.uploadCmdList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, NULL);
 
 	D3D12_RESOURCE_BARRIER barrier = {};
 	barrier.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -244,15 +244,14 @@ dx12Texture_t DX12_CreateTextureFromRGBA(const byte *data, int width, int height
 	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
 	barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-	dx12.commandList->ResourceBarrier(1, &barrier);
+	dx12.uploadCmdList->ResourceBarrier(1, &barrier);
 
-	dx12.commandList->Close();
+	dx12.uploadCmdList->Close();
 
-	ID3D12CommandList *ppCmdLists[] = { dx12.commandList };
+	ID3D12CommandList *ppCmdLists[] = { dx12.uploadCmdList };
 	dx12.commandQueue->ExecuteCommandLists(1, ppCmdLists);
 
 	// Wait for upload to finish before releasing the staging buffer
-	DX12_WaitForGpu();
 	DX12_WaitForUpload( dx12.commandQueue );
 	uploadBuffer->Release();
 
@@ -655,6 +654,32 @@ qboolean R_DX12_Init(void)
 			return qfalse;
 		}
 	}
+
+	// ----------------------------------------------------------------
+	// Dedicated upload command allocator + list
+	// Used exclusively by WLD_UploadBuffer / MDL_UploadBuffer so that
+	// resource uploads never reset the per-frame rendering allocator/list.
+	// ----------------------------------------------------------------
+	hr = dx12.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+	                                         IID_PPV_ARGS(&dx12.uploadCmdAllocator));
+	if (FAILED(hr))
+	{
+		dx12.ri.Error(ERR_FATAL, "R_DX12_Init: CreateCommandAllocator (upload) failed (0x%08lx)\n", hr);
+		return qfalse;
+	}
+
+	hr = dx12.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+	                                    dx12.uploadCmdAllocator, NULL,
+	                                    IID_PPV_ARGS(&dx12.uploadCmdList));
+	if (FAILED(hr))
+	{
+		dx12.ri.Error(ERR_FATAL, "R_DX12_Init: CreateCommandList (upload) failed (0x%08lx)\n", hr);
+		return qfalse;
+	}
+
+	// Command lists are created in the recording state; close immediately so
+	// the first UploadBuffer call can Reset + re-open it.
+	dx12.uploadCmdList->Close();
 
 	// ----------------------------------------------------------------
 	// Root Signature: one descriptor table (SRV at t0) + static sampler
@@ -1118,6 +1143,18 @@ void R_DX12_Shutdown(qboolean destroyWindow)
 	{
 		dx12.commandList->Release();
 		dx12.commandList = NULL;
+	}
+
+	if (dx12.uploadCmdList)
+	{
+		dx12.uploadCmdList->Release();
+		dx12.uploadCmdList = NULL;
+	}
+
+	if (dx12.uploadCmdAllocator)
+	{
+		dx12.uploadCmdAllocator->Release();
+		dx12.uploadCmdAllocator = NULL;
 	}
 
 	for (UINT i = 0; i < DX12_FRAME_COUNT; i++)
