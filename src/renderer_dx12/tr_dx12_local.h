@@ -277,6 +277,10 @@ void DX12_Flush2DBatch(void);
 qhandle_t       DX12_RegisterMaterial(const char *name);
 dx12Material_t *DX12_GetMaterial(qhandle_t handle);
 
+// Function declarations – world geometry (dx12_world.cpp)
+void DX12_LoadWorld(const char *name);
+void DX12_ShutdownWorld(void);
+
 
 void DX12_StripExtension( const char* in, char* out, int size );
 int DX12_Stricmp( const char* s1, const char* s2 );

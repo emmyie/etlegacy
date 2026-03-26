@@ -6,6 +6,7 @@
 #include "tr_dx12_local.h"
 #include "dx12_shader.h"
 #include "dx12_poly.h"
+#include "dx12_world.h"
 
 #ifdef _WIN32
 
@@ -313,7 +314,7 @@ static void RE_DX12_RegisterFont(const char *fontName, int pointSize, void *font
 
 static void RE_DX12_LoadWorld(const char *name)
 {
-	(void)name;
+	DX12_LoadWorld(name);
 }
 
 static qboolean RE_DX12_GetSkinModel(qhandle_t skinid, const char *type, char *name)
