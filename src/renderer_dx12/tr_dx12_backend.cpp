@@ -66,34 +66,49 @@ static void DX12_WaitForGpu(void)
 /**
  * @brief Advance to the next frame, waiting for the GPU if necessary
  */
-static void DX12_MoveToNextFrame(void)
+static void DX12_MoveToNextFrame( void )
 {
+	static UINT64 fenceValue = 0;
 	HRESULT hr;
-	UINT64  currentFenceValue;
 
-	currentFenceValue = dx12.fenceValues[dx12.frameIndex];
-
-	hr = dx12.commandQueue->Signal(dx12.fence, currentFenceValue);
-	if (FAILED(hr))
+	// Signal and bump the global fence value
+	const UINT64 signalValue = ++fenceValue;
+	hr = dx12.commandQueue->Signal( dx12.fence, signalValue );
+	if ( FAILED( hr ) )
 	{
-		dx12.ri.Printf(PRINT_WARNING, "R_DX12: MoveToNextFrame Signal failed (0x%08lx)\n", hr);
+		dx12.ri.Printf( PRINT_WARNING, "R_DX12: MoveToNextFrame Signal failed (0x%08lx)\n", hr );
 		return;
 	}
 
-	dx12.frameIndex = dx12.swapChain->GetCurrentBackBufferIndex();
-
-	if (dx12.fence->GetCompletedValue() < dx12.fenceValues[dx12.frameIndex])
+	// Wait until the GPU has completed this value
+	if ( dx12.fence->GetCompletedValue( ) < signalValue )
 	{
-		hr = dx12.fence->SetEventOnCompletion(dx12.fenceValues[dx12.frameIndex], dx12.fenceEvent);
-		if (FAILED(hr))
+		hr = dx12.fence->SetEventOnCompletion( signalValue, dx12.fenceEvent );
+		if ( FAILED( hr ) )
 		{
-			dx12.ri.Printf(PRINT_WARNING, "R_DX12: MoveToNextFrame SetEventOnCompletion failed (0x%08lx)\n", hr);
+			dx12.ri.Printf( PRINT_WARNING, "R_DX12: MoveToNextFrame SetEventOnCompletion failed (0x%08lx)\n", hr );
 			return;
 		}
-		WaitForSingleObjectEx(dx12.fenceEvent, INFINITE, FALSE);
+		WaitForSingleObjectEx( dx12.fenceEvent, INFINITE, FALSE );
 	}
 
-	dx12.fenceValues[dx12.frameIndex] = currentFenceValue + 1;
+	// Now advance to the next backbuffer
+	dx12.frameIndex = dx12.swapChain->GetCurrentBackBufferIndex( );
+}
+
+static void DX12_WaitForUpload( ID3D12CommandQueue* queue )
+{
+	ID3D12Fence* fence = NULL;
+	HANDLE event = CreateEvent( NULL, FALSE, FALSE, NULL );
+	UINT64 value = 1;
+
+	dx12.device->CreateFence( 0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS( &fence ) );
+	queue->Signal( fence, value );
+	fence->SetEventOnCompletion( value, event );
+	WaitForSingleObject( event, INFINITE );
+
+	CloseHandle( event );
+	fence->Release( );
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +252,7 @@ dx12Texture_t DX12_CreateTextureFromRGBA(const byte *data, int width, int height
 
 	// Wait for upload to finish before releasing the staging buffer
 	DX12_WaitForGpu();
+	DX12_WaitForUpload( dx12.commandQueue );
 	uploadBuffer->Release();
 
 	// ---- Create SRV in the requested slot of the SRV heap ----
