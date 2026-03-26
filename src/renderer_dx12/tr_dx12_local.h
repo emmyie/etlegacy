@@ -164,6 +164,9 @@ void DX12_Add2dPolys(polyVert_t *polys, int numverts, qhandle_t hShader);
 void DX12_Flush2D(void);
 void DX12_SetScissor(int x, int y, int w, int h);
 void DX12_DrawString(float x, float y, float scale, const char *text, const fontInfo_t *font);
+void DX12_Begin2DBatch(D3D12_GPU_DESCRIPTOR_HANDLE texHandle, D3D12_PRIMITIVE_TOPOLOGY topology);
+void DX12_AddQuadToBatch(const dx12QuadVertex_t corners[4]);
+void DX12_Flush2DBatch(void);
 
 
 void DX12_StripExtension( const char* in, char* out, int size );

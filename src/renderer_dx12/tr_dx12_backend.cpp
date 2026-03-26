@@ -584,46 +584,6 @@ qboolean R_DX12_Init(void)
 
 	DX12_InitSwapchain();
 
-	/*{
-		DXGI_SWAP_CHAIN_DESC1 swapChainDesc = {};
-		swapChainDesc.BufferCount       = DX12_FRAME_COUNT;
-		swapChainDesc.Width             = (UINT)dx12.vidWidth;
-		swapChainDesc.Height            = (UINT)dx12.vidHeight;
-		swapChainDesc.Format            = DXGI_FORMAT_R8G8B8A8_UNORM;
-		swapChainDesc.BufferUsage       = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-		swapChainDesc.SwapEffect        = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-		swapChainDesc.SampleDesc.Count  = 1;
-
-		IDXGISwapChain1 *swapChain1 = NULL;
-		hr = factory->CreateSwapChainForHwnd(
-			dx12.commandQueue,
-			dx12.hWnd,
-			&swapChainDesc,
-			NULL,
-			NULL,
-			&swapChain1
-			);
-		if (FAILED(hr))
-		{
-			factory->Release();
-			dx12.ri.Error(ERR_FATAL, "R_DX12_Init: CreateSwapChainForHwnd failed (0x%08lx)\n", hr);
-			return qfalse;
-		}
-
-		factory->MakeWindowAssociation(dx12.hWnd, DXGI_MWA_NO_ALT_ENTER);
-
-		hr = swapChain1->QueryInterface(IID_PPV_ARGS(&dx12.swapChain));
-		swapChain1->Release();
-		if (FAILED(hr))
-		{
-			factory->Release();
-			dx12.ri.Error(ERR_FATAL, "R_DX12_Init: QueryInterface(IDXGISwapChain3) failed (0x%08lx)\n", hr);
-			return qfalse;
-		}
-
-		dx12.frameIndex = dx12.swapChain->GetCurrentBackBufferIndex();
-	}*/
-
 	factory->Release();
 
 	// ----------------------------------------------------------------

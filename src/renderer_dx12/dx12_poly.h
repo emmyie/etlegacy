@@ -54,8 +54,39 @@ void DX12_Add2dPolys(polyVert_t *polys, int numverts, qhandle_t hShader);
  *
  * Must be called before DX12_EndFrame() and whenever a state change
  * (e.g. render target switch) requires the batch to be committed.
+ * Assumes root signature, PSO, and SRV heap are already bound for the frame.
  */
 void DX12_Flush2D(void);
+
+/**
+ * @brief Start an explicit 2D batch for the given texture and topology.
+ *
+ * Any pending batch is flushed first.  All subsequent DX12_AddQuadToBatch()
+ * calls accumulate into this batch until DX12_Flush2DBatch() is called.
+ *
+ * @param texHandle  GPU descriptor handle of the texture to bind.
+ * @param topology   D3D12 primitive topology (TRIANGLELIST or TRIANGLESTRIP).
+ */
+void DX12_Begin2DBatch(D3D12_GPU_DESCRIPTOR_HANDLE texHandle, D3D12_PRIMITIVE_TOPOLOGY topology);
+
+/**
+ * @brief Append one quad to the current explicit batch.
+ *
+ * Corner layout: [0]=TL, [1]=TR, [2]=BL, [3]=BR.  Expands to 6 vertices for
+ * TRIANGLELIST or writes 4 vertices for TRIANGLESTRIP.
+ *
+ * @param corners  Exactly four dx12QuadVertex_t corner vertices.
+ */
+void DX12_AddQuadToBatch(const dx12QuadVertex_t corners[4]);
+
+/**
+ * @brief Flush the explicit batch with full self-contained pipeline state.
+ *
+ * Re-binds root signature, PSO, and SRV descriptor heap before issuing
+ * the DrawInstanced call.  Safe to call even when DX12_BeginFrame() state
+ * may have been overwritten.
+ */
+void DX12_Flush2DBatch(void);
 
 /**
  * @brief Set the 2D scissor rectangle for subsequent draw calls.
