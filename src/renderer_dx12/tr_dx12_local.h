@@ -6,7 +6,10 @@
 #ifndef TR_DX12_LOCAL_H
 #define TR_DX12_LOCAL_H
 
-#include "../qcommon/q_shared.h"
+extern "C" {
+#include "q_shared.h"
+}
+
 #include "../renderercommon/tr_public.h"
 
 #ifdef _WIN32

@@ -190,14 +190,23 @@ if(FEATURE_RENDERER_VULKAN)
 endif()
 
 if(FEATURE_RENDERER_DX12)
-	add_library(renderer_dx12 ${REND_LIBTYPE} ${RENDERER_DX12_FILES})
+	set(RENDERER_DX12_COMMON_SOURCES
+		${CMAKE_SOURCE_DIR}/src/qcommon/q_shared.c
+		${CMAKE_SOURCE_DIR}/src/qcommon/q_math.c
+		${CMAKE_SOURCE_DIR}/src/qcommon/puff.c
+		${CMAKE_SOURCE_DIR}/src/qcommon/md4.c
+	)
+
+	add_library(renderer_dx12 ${REND_LIBTYPE} ${RENDERER_DX12_FILES} ${RENDERER_DX12_COMMON_SOURCES})
+
+	set_source_files_properties(${RENDERER_DX12_COMMON_SOURCES} PROPERTIES LANGUAGE C)
 
     target_compile_definitions(renderer_dx12 PRIVATE FEATURE_RENDERER_DX12)
     target_compile_definitions(client_libraries INTERFACE FEATURE_RENDERER_DX12)
 
     target_include_directories(renderer_dx12 PRIVATE
-        src/qcommon
-        src/renderer_dx12
+        ${CMAKE_SOURCE_DIR}/src/qcommon
+        ${CMAKE_SOURCE_DIR}/src/renderer_dx12
     )
 
     target_link_libraries(renderer_dx12 PRIVATE

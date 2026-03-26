@@ -368,7 +368,8 @@ void DX12_ShutdownWorld(void)
 
 	if (dx12World.entityString)
 	{
-		dx12.ri.Z_Free(dx12World.entityString);
+		dx12.ri.Free(dx12World.entityString);
+		//free( dx12World.entityString );
 		dx12World.entityString = NULL;
 	}
 

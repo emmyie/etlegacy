@@ -424,9 +424,7 @@ static void RE_DX12_DrawDebugText(const vec3_t org, float r, float g, float b,
 
 static qboolean RE_DX12_GetEntityToken(char *buffer, size_t size)
 {
-	const char *s;
-
-	s = COM_Parse(&dx12World.entityParsePoint);
+	auto s = COM_Parse((char** ) & dx12World.entityParsePoint );
 	Q_strncpyz(buffer, s, size);
 
 	if (!dx12World.entityParsePoint || !s[0])

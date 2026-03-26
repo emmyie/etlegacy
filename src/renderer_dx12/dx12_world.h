@@ -180,7 +180,7 @@ typedef struct
 
 	// BSP entity string (LUMP_ENTITIES) – used by RE_DX12_GetEntityToken
 	char       *entityString;     ///< Allocated copy of the raw entity lump text
-	const char *entityParsePoint; ///< Current parse position within entityString
+	char *entityParsePoint; ///< Current parse position within entityString
 
 	qboolean loaded; ///< qtrue after a successful DX12_LoadWorld() call
 } dx12World_t;
