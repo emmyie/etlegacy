@@ -91,7 +91,7 @@ typedef struct
 
 	// Per-frame state
 	float    color2D[4];    ///< Current 2D modulate color set by RE_DX12_SetColor
-	qboolean frameOpen;     ///< qtrue between DX12_BeginFrameRender and R_DX12_SwapBuffers
+	qboolean frameOpen;     ///< qtrue between DX12_BeginFrame and DX12_EndFrame
 
 	// Active scissor rectangle for new draw calls (full-screen by default)
 	D3D12_RECT currentScissor;
@@ -144,8 +144,8 @@ void DX12_InitSwapchain( void );
 qboolean      R_DX12_Init(void);
 void          R_DX12_Shutdown(qboolean destroyWindow);
 void          R_DX12_RenderCommandList(const void *data);
-void          R_DX12_SwapBuffers(void);
-void          DX12_BeginFrameRender(void);
+void          DX12_EndFrame(void);
+void          DX12_BeginFrame(void);
 dx12Texture_t DX12_CreateTextureFromRGBA(const byte *data, int width, int height, int srvSlot);
 
 // Function declarations – texture registry (dx12_shader.cpp)

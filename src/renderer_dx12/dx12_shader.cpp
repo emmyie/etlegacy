@@ -14,7 +14,7 @@
  * shaders even though animation and blending are not implemented.
  *
  * @note Texture registration must happen while no frame is open (i.e. before
- *       the first DX12_BeginFrameRender call or after R_DX12_SwapBuffers),
+ *       the first DX12_BeginFrame call or after DX12_EndFrame),
  *       because DX12_CreateTextureFromRGBA resets the main command allocator.
  */
 

@@ -149,7 +149,7 @@ static void RE_DX12_UploadCinematic(int w, int h, int cols, int rows,
 
 static void RE_DX12_BeginFrame(void)
 {
-	DX12_BeginFrameRender();
+	DX12_BeginFrame();
 }
 
 static void RE_DX12_EndFrame(int *frontEndMsec, int *backEndMsec)
@@ -166,7 +166,7 @@ static void RE_DX12_EndFrame(int *frontEndMsec, int *backEndMsec)
 	// Flush any pending batched 2D draw calls before closing the command list
 	DX12_Flush2D();
 
-	R_DX12_SwapBuffers();
+	DX12_EndFrame();
 }
 
 static qhandle_t RE_DX12_RegisterModel(const char *name)

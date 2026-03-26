@@ -5,7 +5,7 @@
  * All functions write vertices into the per-frame ring-buffer
  * (dx12.quadVBMapped / dx12.quadVBOffset) and issue draw calls against the
  * already-open command list.  They must only be called between
- * DX12_BeginFrameRender() and R_DX12_SwapBuffers().
+ * DX12_BeginFrame() and DX12_EndFrame().
  */
 
 #ifndef DX12_POLY_H
@@ -52,7 +52,7 @@ void DX12_Add2dPolys(polyVert_t *polys, int numverts, qhandle_t hShader);
 /**
  * @brief Flush any pending batched draw calls to the GPU.
  *
- * Must be called before R_DX12_SwapBuffers() and whenever a state change
+ * Must be called before DX12_EndFrame() and whenever a state change
  * (e.g. render target switch) requires the batch to be committed.
  */
 void DX12_Flush2D(void);

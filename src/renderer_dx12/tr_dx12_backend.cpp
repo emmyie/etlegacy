@@ -257,18 +257,18 @@ dx12Texture_t DX12_CreateTextureFromRGBA(const byte *data, int width, int height
 }
 
 // ---------------------------------------------------------------------------
-// DX12_BeginFrameRender
+// DX12_BeginFrame
 // ---------------------------------------------------------------------------
 
 /**
- * @brief DX12_BeginFrameRender
+ * @brief DX12_BeginFrame
  *
  * Opens the command list for the current back-buffer, issues the
  * PRESENT→RENDER_TARGET barrier, clears the screen, and binds the root
  * signature, PSO, viewport, scissor, and SRV heap.  Must be paired with
- * R_DX12_SwapBuffers().
+ * DX12_EndFrame().
  */
-void DX12_BeginFrameRender(void)
+void DX12_BeginFrame(void)
 {
 	HRESULT hr;
 	D3D12_RESOURCE_BARRIER        barrierToRT;
@@ -980,17 +980,17 @@ qboolean R_DX12_Init(void)
 }
 
 // ---------------------------------------------------------------------------
-// R_DX12_SwapBuffers – close frame and present
+// DX12_EndFrame – close frame and present
 // ---------------------------------------------------------------------------
 
 /**
- * @brief R_DX12_SwapBuffers
+ * @brief DX12_EndFrame
  *
  * Transitions the back buffer from RENDER_TARGET to PRESENT, closes and
  * executes the command list, presents the swap chain, and advances to the
- * next frame.  Must be paired with DX12_BeginFrameRender().
+ * next frame.  Must be paired with DX12_BeginFrame().
  */
-void R_DX12_SwapBuffers(void)
+void DX12_EndFrame(void)
 {
 	HRESULT                hr;
 	D3D12_RESOURCE_BARRIER barrierToPresent;
@@ -1040,7 +1040,7 @@ void R_DX12_SwapBuffers(void)
  * @brief R_DX12_RenderCommandList
  * @param[in] data  Render command list buffer
  *
- * Walks the ET:Legacy render command list. Calls R_DX12_SwapBuffers on
+ * Walks the ET:Legacy render command list. Calls DX12_EndFrame on
  * RC_SWAP_BUFFERS; ignores all other commands.
  */
 void R_DX12_RenderCommandList(const void *data)
@@ -1057,7 +1057,7 @@ void R_DX12_RenderCommandList(const void *data)
 		switch (*(const int *)data)
 		{
 		case RC_SWAP_BUFFERS:
-			R_DX12_SwapBuffers();
+			DX12_EndFrame();
 			// Advance past the swapBuffersCommand_t (just an int commandId)
 			data = (const char *)data + sizeof(int);
 			break;
