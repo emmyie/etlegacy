@@ -366,6 +366,12 @@ void DX12_ShutdownWorld(void)
 		dx12World.indexBuffer = NULL;
 	}
 
+	if (dx12World.entityString)
+	{
+		dx12.ri.Z_Free(dx12World.entityString);
+		dx12World.entityString = NULL;
+	}
+
 	Com_Memset(&dx12World, 0, sizeof(dx12World));
 }
 
@@ -430,6 +436,29 @@ void DX12_LoadWorld(const char *name)
 	}
 
 	Q_strncpyz(dx12World.name, name, sizeof(dx12World.name));
+
+	// ----------------------------------------------------------------
+	// 0.  Entity string lump (LUMP_ENTITIES) – needed by GetEntityToken
+	// ----------------------------------------------------------------
+	{
+		lump_t *lump  = &header->lumps[LUMP_ENTITIES];
+		int     len   = lump->filelen;
+
+		if (len > 0)
+		{
+			dx12World.entityString     = (char *)dx12.ri.Z_Malloc(len + 1);
+			Com_Memcpy(dx12World.entityString, fileBase + lump->fileofs, len);
+			dx12World.entityString[len] = '\0';
+		}
+		else
+		{
+			// Provide an empty string so GetEntityToken returns qfalse safely
+			dx12World.entityString    = (char *)dx12.ri.Z_Malloc(1);
+			dx12World.entityString[0] = '\0';
+		}
+
+		dx12World.entityParsePoint = dx12World.entityString;
+	}
 
 	// ----------------------------------------------------------------
 	// 1.  BSP shader lump → register DX12 materials

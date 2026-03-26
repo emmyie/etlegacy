@@ -424,7 +424,19 @@ static void RE_DX12_DrawDebugText(const vec3_t org, float r, float g, float b,
 
 static qboolean RE_DX12_GetEntityToken(char *buffer, size_t size)
 {
-	(void)buffer; (void)size; return qfalse;
+	const char *s;
+
+	s = COM_Parse(&dx12World.entityParsePoint);
+	Q_strncpyz(buffer, s, size);
+
+	if (!dx12World.entityParsePoint || !s[0])
+	{
+		// Reset to allow repeated calls (e.g. after a full parse pass)
+		dx12World.entityParsePoint = dx12World.entityString;
+		return qfalse;
+	}
+
+	return qtrue;
 }
 
 static void RE_DX12_AddPolyBufferToScene(polyBuffer_t *pPolyBuffer)

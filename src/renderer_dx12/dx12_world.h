@@ -178,6 +178,10 @@ typedef struct
 	dx12WorldModel_t models[DX12_MAX_WORLD_MODELS]; ///< Submodel list
 	int              numModels;                     ///< Active entries
 
+	// BSP entity string (LUMP_ENTITIES) – used by RE_DX12_GetEntityToken
+	char       *entityString;     ///< Allocated copy of the raw entity lump text
+	const char *entityParsePoint; ///< Current parse position within entityString
+
 	qboolean loaded; ///< qtrue after a successful DX12_LoadWorld() call
 } dx12World_t;
 
