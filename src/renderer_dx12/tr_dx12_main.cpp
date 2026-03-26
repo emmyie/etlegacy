@@ -8,6 +8,7 @@
 #include "dx12_poly.h"
 #include "dx12_world.h"
 #include "dx12_scene.h"
+#include "dx12_model.h"
 
 #ifdef _WIN32
 
@@ -189,6 +190,7 @@ static int  dx12NumModels = 0;
 static qhandle_t RE_DX12_RegisterModel(const char *name)
 {
 	int i;
+	int slot;
 
 	if (!name || !name[0])
 	{
@@ -213,8 +215,16 @@ static qhandle_t RE_DX12_RegisterModel(const char *name)
 		return 0;
 	}
 
-	Q_strncpyz(dx12ModelNames[dx12NumModels], name, MAX_QPATH);
-	return (qhandle_t)(++dx12NumModels);
+	slot = dx12NumModels;
+	Q_strncpyz(dx12ModelNames[slot], name, MAX_QPATH);
+	dx12NumModels++;
+
+	// Attempt to load MD3 geometry into GPU buffers.
+	// MDX/MDM (skeletal) files are silently skipped: the handle is still
+	// valid for the animation system even without GPU geometry.
+	DX12_LoadMD3(slot, name);
+
+	return (qhandle_t)(slot + 1);
 }
 
 static qhandle_t RE_DX12_RegisterModelAllLODs(const char *name)
@@ -391,12 +401,17 @@ static int RE_DX12_LightForPoint(vec3_t point, vec3_t ambientLight, vec3_t direc
 
 static void RE_DX12_AddPolyToScene(qhandle_t hShader, int numVerts, const polyVert_t *verts)
 {
-	(void)hShader; (void)numVerts; (void)verts;
+	DX12_AddScenePoly(hShader, numVerts, verts);
 }
 
 static void RE_DX12_AddPolysToScene(qhandle_t hShader, int numVerts, const polyVert_t *verts, int numPolys)
 {
-	(void)hShader; (void)numVerts; (void)verts; (void)numPolys;
+	int i;
+
+	for (i = 0; i < numPolys; i++)
+	{
+		DX12_AddScenePoly(hShader, numVerts, verts + i * numVerts);
+	}
 }
 
 static void RE_DX12_AddLightToScene(const vec3_t org, float radius, float intensity,
@@ -445,7 +460,18 @@ static int RE_DX12_LerpTag(orientation_t *tag, const refEntity_t *refent,
 
 static void RE_DX12_ModelBounds(qhandle_t model, vec3_t mins, vec3_t maxs)
 {
-	(void)model; (void)mins; (void)maxs;
+	int idx = (int)model - 1;
+
+	if (idx >= 0 && idx < DX12_MAX_MODELS && dx12ModelData[idx].valid)
+	{
+		VectorCopy(dx12ModelData[idx].mins, mins);
+		VectorCopy(dx12ModelData[idx].maxs, maxs);
+	}
+	else
+	{
+		VectorClear(mins);
+		VectorClear(maxs);
+	}
 }
 
 static void RE_DX12_RemapShader(const char *oldShader, const char *newShader, const char *offsetTime)

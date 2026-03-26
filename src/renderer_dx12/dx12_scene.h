@@ -42,6 +42,7 @@
 #ifdef _WIN32
 
 #include "tr_dx12_local.h"
+#include "dx12_world.h"             // dx12WorldVertex_t (used by poly buffer)
 #include "../renderercommon/tr_public.h"
 
 // ---------------------------------------------------------------------------
@@ -50,6 +51,12 @@
 
 /** Maximum ref-entities buffered between ClearScene and RenderScene. */
 #define DX12_MAX_SCENE_ENTITIES 1024
+
+/** Maximum distinct poly draw-batches per scene (one per unique shader call). */
+#define DX12_MAX_SCENE_POLY_BATCHES 1024
+
+/** Maximum expanded triangle-list vertices stored in the poly buffer. */
+#define DX12_MAX_SCENE_POLYVERTS 8192
 
 /** Near clip plane distance (units).  Matches Q3 defaults. */
 #define DX12_SCENE_NEAR   4.0f
@@ -92,6 +99,22 @@ typedef struct
 } dx12SceneEntity_t;
 
 // ---------------------------------------------------------------------------
+// World-space polygon (decal/effect) batch
+// ---------------------------------------------------------------------------
+
+/**
+ * @struct dx12ScenePolyBatch_t
+ * @brief Descriptor for one poly draw call: a contiguous slice of the poly
+ *        vertex buffer, all sharing the same shader/texture.
+ */
+typedef struct
+{
+	qhandle_t shaderHandle; ///< Texture / material handle
+	int       firstVert;    ///< Index of first vertex in dx12Scene.polyVerts
+	int       numVerts;     ///< Number of consecutive vertices
+} dx12ScenePolyBatch_t;
+
+// ---------------------------------------------------------------------------
 // Scene state
 // ---------------------------------------------------------------------------
 
@@ -113,6 +136,14 @@ typedef struct
 	// Entity list accumulated this frame
 	dx12SceneEntity_t entities[DX12_MAX_SCENE_ENTITIES]; ///< Buffered entities
 	int               numEntities;                       ///< Active count
+
+	// World-space poly (decal/effect) buffer
+	dx12WorldVertex_t  *polyVerts;                         ///< malloc'd staging array (DX12_MAX_SCENE_POLYVERTS)
+	int                 numPolyVerts;                      ///< Vertices used this frame
+	dx12ScenePolyBatch_t polyBatches[DX12_MAX_SCENE_POLY_BATCHES]; ///< Per-shader draw groups
+	int                  numPolyBatches;                   ///< Active batch count
+	ID3D12Resource      *polyVertexBuffer;                 ///< GPU upload-heap VB (persistent)
+	UINT8               *polyVBMapped;                     ///< Persistently-mapped CPU pointer
 
 	qboolean initialized; ///< qtrue after DX12_SceneInit()
 } dx12SceneState_t;
@@ -139,10 +170,24 @@ void DX12_SceneShutdown(void);
 void DX12_AddEntityToScene(const refEntity_t *re);
 
 /**
- * @brief DX12_ClearScene – reset the per-frame entity list.
- * Called at the start of each scene (before adding entities).
+ * @brief DX12_ClearScene – reset the per-frame entity and poly lists.
+ * Called at the start of each scene (before adding entities / polys).
  */
 void DX12_ClearScene(void);
+
+/**
+ * @brief DX12_AddScenePoly – buffer a world-space convex polygon for rendering.
+ *
+ * Expands the polygon from its fan representation to a flat triangle list and
+ * appends it to the per-frame poly staging buffer.  The polygon is rendered
+ * during the next DX12_RenderScene call, after entities and before translucent
+ * world surfaces.
+ *
+ * @param hShader   Texture / material handle for this polygon.
+ * @param numVerts  Number of vertices in @p verts (must be ≥ 3).
+ * @param verts     Polygon vertices in world space (polyVert_t format).
+ */
+void DX12_AddScenePoly(qhandle_t hShader, int numVerts, const polyVert_t *verts);
 
 /**
  * @brief DX12_RenderScene – render a full 3D scene.

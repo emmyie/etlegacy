@@ -51,6 +51,7 @@
 #include "dx12_world.h"
 #include "dx12_shader.h"
 #include "dx12_poly.h"
+#include "dx12_model.h"
 
 #ifdef _WIN32
 
@@ -676,6 +677,61 @@ qboolean DX12_SceneInit(void)
 		}
 	}
 
+	// ----------------------------------------------------------------
+	// Per-frame poly vertex upload buffer (world-space decals / effects)
+	// ----------------------------------------------------------------
+	{
+		D3D12_HEAP_PROPERTIES heapProps = {};
+		D3D12_RESOURCE_DESC   resDesc   = {};
+		D3D12_RANGE           readRange = { 0, 0 };
+		UINT64                polyVBSize;
+
+		polyVBSize = (UINT64)DX12_MAX_SCENE_POLYVERTS * sizeof(dx12WorldVertex_t);
+
+		heapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+		resDesc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+		resDesc.Width            = polyVBSize;
+		resDesc.Height           = 1;
+		resDesc.DepthOrArraySize = 1;
+		resDesc.MipLevels        = 1;
+		resDesc.Format           = DXGI_FORMAT_UNKNOWN;
+		resDesc.SampleDesc.Count = 1;
+		resDesc.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+		hr = dx12.device->CreateCommittedResource(
+			&heapProps,
+			D3D12_HEAP_FLAG_NONE,
+			&resDesc,
+			D3D12_RESOURCE_STATE_GENERIC_READ,
+			NULL,
+			IID_PPV_ARGS(&dx12Scene.polyVertexBuffer));
+
+		if (FAILED(hr))
+		{
+			dx12.ri.Printf(PRINT_WARNING,
+			               "DX12_SceneInit: poly VB creation failed (0x%08lx); polys disabled\n", hr);
+			// Non-fatal: poly rendering simply won't work
+			dx12Scene.polyVertexBuffer = NULL;
+			dx12Scene.polyVBMapped     = NULL;
+		}
+		else
+		{
+			hr = dx12Scene.polyVertexBuffer->Map(0, &readRange, (void **)&dx12Scene.polyVBMapped);
+			if (FAILED(hr))
+			{
+				dx12Scene.polyVertexBuffer->Release();
+				dx12Scene.polyVertexBuffer = NULL;
+				dx12Scene.polyVBMapped     = NULL;
+			}
+		}
+
+		// CPU staging array (always allocate so AddScenePoly can accumulate)
+		dx12Scene.polyVerts = (dx12WorldVertex_t *)malloc(
+			DX12_MAX_SCENE_POLYVERTS * sizeof(dx12WorldVertex_t));
+		// If malloc fails the poly pass will be silently skipped
+	}
+
 	dx12Scene.initialized = qtrue;
 	dx12.ri.Printf(PRINT_ALL, "DX12_SceneInit: 3D scene pipeline ready\n");
 	return qtrue;
@@ -714,6 +770,20 @@ void DX12_SceneShutdown(void)
 		dx12Scene.rootSignature3D = NULL;
 	}
 
+	if (dx12Scene.polyVertexBuffer)
+	{
+		dx12Scene.polyVertexBuffer->Unmap(0, NULL);
+		dx12Scene.polyVertexBuffer->Release();
+		dx12Scene.polyVertexBuffer = NULL;
+		dx12Scene.polyVBMapped     = NULL;
+	}
+
+	if (dx12Scene.polyVerts)
+	{
+		free(dx12Scene.polyVerts);
+		dx12Scene.polyVerts = NULL;
+	}
+
 	Com_Memset(&dx12Scene, 0, sizeof(dx12Scene));
 }
 
@@ -722,11 +792,13 @@ void DX12_SceneShutdown(void)
 // ---------------------------------------------------------------------------
 
 /**
- * @brief DX12_ClearScene – reset the per-frame entity list.
+ * @brief DX12_ClearScene – reset the per-frame entity and poly lists.
  */
 void DX12_ClearScene(void)
 {
-	dx12Scene.numEntities = 0;
+	dx12Scene.numEntities    = 0;
+	dx12Scene.numPolyVerts   = 0;
+	dx12Scene.numPolyBatches = 0;
 }
 
 /**
@@ -750,6 +822,93 @@ void DX12_AddEntityToScene(const refEntity_t *re)
 	ent->axis[0][0] = re->axis[0][0]; ent->axis[0][1] = re->axis[0][1]; ent->axis[0][2] = re->axis[0][2];
 	ent->axis[1][0] = re->axis[1][0]; ent->axis[1][1] = re->axis[1][1]; ent->axis[1][2] = re->axis[1][2];
 	ent->axis[2][0] = re->axis[2][0]; ent->axis[2][1] = re->axis[2][1]; ent->axis[2][2] = re->axis[2][2];
+}
+
+// ---------------------------------------------------------------------------
+// DX12_AddScenePoly
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief DX12_AddScenePoly – buffer a world-space convex polygon.
+ * @param[in] hShader   Texture / material handle for this polygon.
+ * @param[in] numVerts  Number of polygon vertices (must be ≥ 3).
+ * @param[in] verts     Vertices in world space; xyz, st, and byte modulate.
+ *
+ * Expands the polygon from a triangle fan to an explicit triangle list and
+ * appends the result to dx12Scene.polyVerts[].  Consecutive calls that share
+ * the same @p hShader are merged into a single batch to minimise draw calls.
+ */
+void DX12_AddScenePoly(qhandle_t hShader, int numVerts, const polyVert_t *verts)
+{
+	int numTris;
+	int expandedVerts;
+	int i;
+
+	if (numVerts < 3 || !verts || !dx12Scene.polyVerts)
+	{
+		return;
+	}
+
+	// Fan has (numVerts - 2) triangles, each needing 3 vertices
+	numTris      = numVerts - 2;
+	expandedVerts = numTris * 3;
+
+	if (dx12Scene.numPolyVerts + expandedVerts > DX12_MAX_SCENE_POLYVERTS)
+	{
+		dx12.ri.Printf(PRINT_DEVELOPER, "DX12_AddScenePoly: poly vertex buffer full\n");
+		return;
+	}
+
+	if (dx12Scene.numPolyBatches >= DX12_MAX_SCENE_POLY_BATCHES)
+	{
+		dx12.ri.Printf(PRINT_DEVELOPER, "DX12_AddScenePoly: poly batch buffer full\n");
+		return;
+	}
+
+	// Merge with the current batch if the shader is identical
+	if (dx12Scene.numPolyBatches > 0 &&
+	    dx12Scene.polyBatches[dx12Scene.numPolyBatches - 1].shaderHandle == hShader)
+	{
+		dx12Scene.polyBatches[dx12Scene.numPolyBatches - 1].numVerts += expandedVerts;
+	}
+	else
+	{
+		dx12ScenePolyBatch_t *batch = &dx12Scene.polyBatches[dx12Scene.numPolyBatches++];
+		batch->shaderHandle = hShader;
+		batch->firstVert    = dx12Scene.numPolyVerts;
+		batch->numVerts     = expandedVerts;
+	}
+
+	// Expand fan → triangle list and write into the CPU staging buffer
+	for (i = 1; i <= numTris; i++)
+	{
+		const polyVert_t  *v0  = &verts[0];
+		const polyVert_t  *v1  = &verts[i];
+		const polyVert_t  *v2  = &verts[i + 1];
+		dx12WorldVertex_t *dst = &dx12Scene.polyVerts[dx12Scene.numPolyVerts];
+		int                k;
+		const polyVert_t  *src[3] = { v0, v1, v2 };
+
+		for (k = 0; k < 3; k++)
+		{
+			dst[k].xyz[0]    = src[k]->xyz[0];
+			dst[k].xyz[1]    = src[k]->xyz[1];
+			dst[k].xyz[2]    = src[k]->xyz[2];
+			dst[k].st[0]     = src[k]->st[0];
+			dst[k].st[1]     = src[k]->st[1];
+			dst[k].lm[0]     = 0.0f;
+			dst[k].lm[1]     = 0.0f;
+			dst[k].normal[0] = 0.0f;
+			dst[k].normal[1] = 0.0f;
+			dst[k].normal[2] = 1.0f;
+			dst[k].color[0]  = src[k]->modulate[0] / 255.0f;
+			dst[k].color[1]  = src[k]->modulate[1] / 255.0f;
+			dst[k].color[2]  = src[k]->modulate[2] / 255.0f;
+			dst[k].color[3]  = src[k]->modulate[3] / 255.0f;
+		}
+
+		dx12Scene.numPolyVerts += 3;
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -945,10 +1104,80 @@ void DX12_RenderScene(const refdef_t *fd)
 			SCN_UpdateCB(cbSlot, &entCB);
 			entCBGpuVA = cbGpuVA;
 
-			// Entity model rendering is deferred until model loading is
-			// implemented.  The constant buffer is updated so the
-			// per-entity transform is ready when model draw calls are added.
-			(void)entCBGpuVA;
+			// Draw the entity's MD3 surfaces (no-op if model has no geometry)
+			DX12_DrawEntity(ent, entCBGpuVA);
+		}
+	}
+
+	// ----------------------------------------------------------------
+	// 7a. World-space polys (decals, effects)
+	//     Rendered after entities, before translucent world surfaces.
+	//     Uses the same 3D pipeline with identity model matrix.
+	// ----------------------------------------------------------------
+	if (dx12Scene.numPolyVerts > 0 && dx12Scene.polyVerts &&
+	    dx12Scene.polyVertexBuffer && dx12Scene.polyVBMapped)
+	{
+		int b;
+		D3D12_VERTEX_BUFFER_VIEW pvbv = {};
+
+		// Restore identity model matrix for world-space poly verts
+		SCN_UpdateCB(cbSlot, &cb);
+
+		// Upload staging buffer to the GPU upload-heap VB
+		memcpy(dx12Scene.polyVBMapped, dx12Scene.polyVerts,
+		       (size_t)dx12Scene.numPolyVerts * sizeof(dx12WorldVertex_t));
+
+		pvbv.BufferLocation = dx12Scene.polyVertexBuffer->GetGPUVirtualAddress();
+		pvbv.SizeInBytes    = (UINT)dx12Scene.numPolyVerts * (UINT)sizeof(dx12WorldVertex_t);
+		pvbv.StrideInBytes  = (UINT)sizeof(dx12WorldVertex_t);
+
+		dx12.commandList->IASetVertexBuffers(0, 1, &pvbv);
+
+		for (b = 0; b < dx12Scene.numPolyBatches; b++)
+		{
+			const dx12ScenePolyBatch_t *batch = &dx12Scene.polyBatches[b];
+			dx12Texture_t              *polyTex;
+			D3D12_GPU_DESCRIPTOR_HANDLE srvPoly;
+
+			if (batch->numVerts <= 0)
+			{
+				continue;
+			}
+
+			// Resolve poly texture; fall back to white if missing
+			polyTex = DX12_GetTexture(batch->shaderHandle);
+			if (polyTex && polyTex->resource)
+			{
+				srvPoly = polyTex->gpuHandle;
+			}
+			else
+			{
+				srvPoly = dx12.srvHeap->GetGPUDescriptorHandleForHeapStart();
+			}
+
+			dx12.commandList->SetGraphicsRootDescriptorTable(1, srvPoly);
+			dx12.commandList->SetGraphicsRootDescriptorTable(2, srvPoly);
+
+			dx12.commandList->DrawInstanced((UINT)batch->numVerts, 1,
+			                                (UINT)batch->firstVert, 0);
+		}
+
+		// Restore world VB/IB for the translucent pass below
+		if (dx12World.loaded && dx12World.vertexBuffer && dx12World.indexBuffer)
+		{
+			D3D12_VERTEX_BUFFER_VIEW wvbv = {};
+			D3D12_INDEX_BUFFER_VIEW  wibv = {};
+
+			wvbv.BufferLocation = dx12World.vertexBuffer->GetGPUVirtualAddress();
+			wvbv.SizeInBytes    = dx12World.numVertices * (UINT)sizeof(dx12WorldVertex_t);
+			wvbv.StrideInBytes  = (UINT)sizeof(dx12WorldVertex_t);
+
+			wibv.BufferLocation = dx12World.indexBuffer->GetGPUVirtualAddress();
+			wibv.SizeInBytes    = dx12World.numIndexes * (UINT)sizeof(int);
+			wibv.Format         = DXGI_FORMAT_R32_UINT;
+
+			dx12.commandList->IASetVertexBuffers(0, 1, &wvbv);
+			dx12.commandList->IASetIndexBuffer(&wibv);
 		}
 	}
 
