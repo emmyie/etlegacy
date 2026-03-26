@@ -6,6 +6,7 @@
 #include "tr_dx12_local.h"
 #include "dx12_shader.h"
 #include "dx12_world.h"
+#include "dx12_scene.h"
 
 #ifdef _WIN32
 
@@ -953,6 +954,10 @@ qboolean R_DX12_Init(void)
 
 	dx12.initialized = qtrue;
 	dx12.ri.Printf(PRINT_ALL, "R_DX12: Initialized (%dx%d)\n", dx12.vidWidth, dx12.vidHeight);
+
+	// Initialize the 3D scene pipeline after core DX12 objects are ready
+	DX12_SceneInit();
+
 	return qtrue;
 }
 
@@ -1082,6 +1087,7 @@ void R_DX12_Shutdown(qboolean destroyWindow)
 	}
 
 	// Release world geometry first (before texture registry and GPU objects)
+	DX12_SceneShutdown();
 	DX12_ShutdownWorld();
 
 	// Release all D3D12 texture resources

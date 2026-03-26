@@ -281,6 +281,13 @@ dx12Material_t *DX12_GetMaterial(qhandle_t handle);
 void DX12_LoadWorld(const char *name);
 void DX12_ShutdownWorld(void);
 
+// Function declarations – 3D scene rendering (dx12_scene.cpp)
+qboolean DX12_SceneInit(void);
+void     DX12_SceneShutdown(void);
+void     DX12_ClearScene(void);
+void     DX12_AddEntityToScene(const refEntity_t *re);
+void     DX12_RenderScene(const refdef_t *fd);
+
 
 void DX12_StripExtension( const char* in, char* out, int size );
 int DX12_Stricmp( const char* s1, const char* s2 );

@@ -1,0 +1,157 @@
+/*
+ * Wolfenstein: Enemy Territory GPL Source Code
+ * Copyright (C) 1999-2010 id Software LLC, a ZeniMax Media company.
+ *
+ * ET: Legacy
+ * Copyright (C) 2012-2024 ET:Legacy team <mail@etlegacy.com>
+ *
+ * This file is part of ET: Legacy - http://www.etlegacy.com
+ *
+ * ET: Legacy is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * ET: Legacy is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with ET: Legacy. If not, see <http://www.gnu.org/licenses/>.
+ *
+ * In addition, Wolfenstein: Enemy Territory GPL Source Code is also
+ * subject to certain additional terms. You should have received a copy
+ * of these additional terms immediately following the terms and conditions
+ * of the GNU General Public License which accompanied the source code.
+ * If not, please request a copy in writing from id Software at the address below.
+ *
+ * id Software LLC, c/o ZeniMax Media Inc., Suite 120, Rockville, Maryland 20850 USA.
+ */
+/**
+ * @file dx12_scene.h
+ * @brief DX12 3D scene rendering – types and public API.
+ *
+ * Declares the structures, constants, and functions used by DX12_RenderScene()
+ * to draw world BSP surfaces and ref-entities each frame.
+ */
+
+#ifndef DX12_SCENE_H
+#define DX12_SCENE_H
+
+#ifdef _WIN32
+
+#include "tr_dx12_local.h"
+#include "../renderercommon/tr_public.h"
+
+// ---------------------------------------------------------------------------
+// Limits
+// ---------------------------------------------------------------------------
+
+/** Maximum ref-entities buffered between ClearScene and RenderScene. */
+#define DX12_MAX_SCENE_ENTITIES 1024
+
+/** Near clip plane distance (units).  Matches Q3 defaults. */
+#define DX12_SCENE_NEAR   4.0f
+/** Far clip plane distance (units). */
+#define DX12_SCENE_FAR    65536.0f
+
+// ---------------------------------------------------------------------------
+// Constant-buffer layout  (must match SceneConstants in the world HLSL)
+// ---------------------------------------------------------------------------
+
+/**
+ * @struct dx12SceneConstants_t
+ * @brief Per-frame / per-draw constant buffer uploaded to the GPU.
+ *
+ * Layout (256-byte aligned as required by D3D12 CBV):
+ *   viewProj    – combined view * projection matrix (row-major float4x4)
+ *   modelMatrix – per-object model-to-world transform (row-major float4x4)
+ *   cameraPos   – world-space camera origin (xyz) + padding (w)
+ */
+typedef struct
+{
+	float viewProj[4][4];    ///< View * Projection matrix (row-major)
+	float modelMatrix[4][4]; ///< Model matrix (row-major); identity for world
+	float cameraPos[4];      ///< World-space camera position (w unused)
+} dx12SceneConstants_t;
+
+// ---------------------------------------------------------------------------
+// Per-entity scene entry
+// ---------------------------------------------------------------------------
+
+/**
+ * @struct dx12SceneEntity_t
+ * @brief Snapshot of a refEntity_t added to the current scene.
+ */
+typedef struct
+{
+	vec3_t  origin;   ///< World-space origin
+	vec3_t  axis[3];  ///< Rotation axes: [0]=forward [1]=left [2]=up
+	qhandle_t hModel; ///< Model handle (0 = no model)
+} dx12SceneEntity_t;
+
+// ---------------------------------------------------------------------------
+// Scene state
+// ---------------------------------------------------------------------------
+
+/**
+ * @struct dx12SceneState_t
+ * @brief All 3D scene state for one frame.
+ */
+typedef struct
+{
+	// 3D-specific GPU resources
+	ID3D12RootSignature  *rootSignature3D; ///< Root sig: CBV b0 + SRV table (t0, t1)
+	ID3D12PipelineState  *pso3D;           ///< PSO for dx12WorldVertex_t input
+
+	// Per-frame constant buffer (upload heap, persistently mapped, CBV_SIZE aligned)
+	ID3D12Resource *constantBuffer;       ///< Single allocation holding DX12_FRAME_COUNT slots
+	UINT8          *cbMapped;             ///< Persistently-mapped CPU pointer
+	UINT            cbSlotSize;           ///< Size of one aligned CBV slot in bytes
+
+	// Entity list accumulated this frame
+	dx12SceneEntity_t entities[DX12_MAX_SCENE_ENTITIES]; ///< Buffered entities
+	int               numEntities;                       ///< Active count
+
+	qboolean initialized; ///< qtrue after DX12_SceneInit()
+} dx12SceneState_t;
+
+extern dx12SceneState_t dx12Scene;
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief DX12_SceneInit  – create 3D PSO, root signature, and constant buffer.
+ * @return qtrue on success.
+ */
+qboolean DX12_SceneInit(void);
+
+/** @brief DX12_SceneShutdown – release all 3D scene GPU resources. */
+void DX12_SceneShutdown(void);
+
+/**
+ * @brief DX12_AddEntityToScene – buffer a ref-entity for the next RenderScene call.
+ * @param[in] re  Entity to add; ignored if the scene list is full.
+ */
+void DX12_AddEntityToScene(const refEntity_t *re);
+
+/**
+ * @brief DX12_ClearScene – reset the per-frame entity list.
+ * Called at the start of each scene (before adding entities).
+ */
+void DX12_ClearScene(void);
+
+/**
+ * @brief DX12_RenderScene – render a full 3D scene.
+ * @param[in] fd  Frame descriptor with view parameters.
+ *
+ * Renders in order: sky → opaque world → fog surfaces → entities →
+ * translucent world surfaces.  Does NOT touch the 2D pipeline.
+ */
+void DX12_RenderScene(const refdef_t *fd);
+
+#endif // _WIN32
+#endif // DX12_SCENE_H

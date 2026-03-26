@@ -7,6 +7,7 @@
 #include "dx12_shader.h"
 #include "dx12_poly.h"
 #include "dx12_world.h"
+#include "dx12_scene.h"
 
 #ifdef _WIN32
 
@@ -82,8 +83,7 @@ static void RE_DX12_EndRegistration(void)
 
 static void RE_DX12_RenderScene(const refdef_t *fd)
 {
-	(void)fd;
-	// World rendering not implemented; triangle is drawn in SwapBuffers
+	DX12_RenderScene(fd);
 }
 
 static void RE_DX12_SetColor(const float *rgba)
@@ -334,11 +334,12 @@ static void RE_DX12_SetWorldVisData(const byte *vis)
 
 static void RE_DX12_ClearScene(void)
 {
+	DX12_ClearScene();
 }
 
 static void RE_DX12_AddRefEntityToScene(const refEntity_t *re)
 {
-	(void)re;
+	DX12_AddEntityToScene(re);
 }
 
 static int RE_DX12_LightForPoint(vec3_t point, vec3_t ambientLight, vec3_t directedLight, vec3_t lightDir)
