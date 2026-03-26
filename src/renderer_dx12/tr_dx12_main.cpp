@@ -186,12 +186,12 @@ static qhandle_t RE_DX12_RegisterSkin(const char *name)
 
 static qhandle_t RE_DX12_RegisterShader(const char *name)
 {
-	return DX12_RegisterTexture(name);
+	return DX12_RegisterMaterial(name);
 }
 
 static qhandle_t RE_DX12_RegisterShaderNoMip(const char *name)
 {
-	return DX12_RegisterTexture(name);
+	return DX12_RegisterMaterial(name);
 }
 
 // ---------------------------------------------------------------------------

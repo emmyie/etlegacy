@@ -47,6 +47,111 @@ typedef struct
 	D3D12_GPU_DESCRIPTOR_HANDLE  gpuHandle;
 } dx12Texture_t;
 
+// ---------------------------------------------------------------------------
+// Material system types
+// ---------------------------------------------------------------------------
+
+/** Maximum tcMod entries per material stage. */
+#define DX12_MAX_TCMODS          4
+/** Maximum animation frames per animMap stage. */
+#define DX12_MAX_ANIM_FRAMES     16
+/** Maximum rendering stages per material. */
+#define DX12_MAX_MATERIAL_STAGES 8
+/** Maximum simultaneously cached materials. */
+#define DX12_MAX_MATERIALS       1024
+/**
+ * Material handles occupy [DX12_MATERIAL_HANDLE_BASE, …).
+ * DX12_GetTexture() transparently maps a material handle to its
+ * stage-0 texture so existing draw code continues to work unchanged.
+ */
+#define DX12_MATERIAL_HANDLE_BASE DX12_MAX_TEXTURES
+
+/**
+ * @enum dx12TcModType_t
+ * @brief Texture-coordinate modification types for material stages.
+ */
+typedef enum
+{
+	DX12_TMOD_NONE    = 0,
+	DX12_TMOD_SCROLL,
+	DX12_TMOD_ROTATE,
+	DX12_TMOD_STRETCH,
+} dx12TcModType_t;
+
+/**
+ * @enum dx12WaveFunc_t
+ * @brief Waveform function used by tcMod stretch.
+ */
+typedef enum
+{
+	DX12_WAVE_SIN               = 0,
+	DX12_WAVE_SQUARE,
+	DX12_WAVE_TRIANGLE,
+	DX12_WAVE_SAWTOOTH,
+	DX12_WAVE_INVERSE_SAWTOOTH,
+} dx12WaveFunc_t;
+
+/**
+ * @struct dx12Wave_t
+ * @brief Parameters for a periodic waveform (used by tcMod stretch).
+ */
+typedef struct
+{
+	dx12WaveFunc_t func;       ///< Wave function type
+	float          base;       ///< DC offset
+	float          amplitude;  ///< Peak amplitude
+	float          phase;      ///< Phase shift in [0, 1]
+	float          frequency;  ///< Cycles per second
+} dx12Wave_t;
+
+/**
+ * @struct dx12TcMod_t
+ * @brief One texture-coordinate modification entry for a material stage.
+ */
+typedef struct
+{
+	dx12TcModType_t type;
+	float           scroll[2];   ///< DX12_TMOD_SCROLL: UV scroll rates (units/s)
+	float           rotateSpeed; ///< DX12_TMOD_ROTATE: degrees per second (+ = CCW)
+	dx12Wave_t      stretch;     ///< DX12_TMOD_STRETCH: wave envelope
+} dx12TcMod_t;
+
+/**
+ * @struct dx12MaterialStage_t
+ * @brief One rendering stage within a DX12 material.
+ */
+typedef struct
+{
+	qboolean    active;                            ///< qtrue when this slot is in use
+	qhandle_t   texHandle;                         ///< Primary texture (from DX12_RegisterTexture)
+	D3D12_BLEND srcBlend;                          ///< Source blend factor
+	D3D12_BLEND dstBlend;                          ///< Destination blend factor
+	dx12TcMod_t tcMods[DX12_MAX_TCMODS];           ///< Texture-coordinate modifiers
+	int         numTcMods;                         ///< Number of active tcMod entries
+	qhandle_t   animFrames[DX12_MAX_ANIM_FRAMES];  ///< Per-frame texture handles (animMap)
+	int         animNumFrames;                     ///< Number of animation frames
+	float       animFps;                           ///< Animation playback rate (frames/s)
+} dx12MaterialStage_t;
+
+/**
+ * @struct dx12Material_t
+ * @brief Parsed ET .shader script entry cached by DX12_RegisterMaterial().
+ *
+ * The handle returned by DX12_RegisterMaterial() equals
+ * DX12_MATERIAL_HANDLE_BASE + (index into dx12Materials[]).
+ */
+typedef struct
+{
+	char                name[MAX_QPATH];                          ///< Shader name (cache key)
+	dx12MaterialStage_t stages[DX12_MAX_MATERIAL_STAGES];        ///< Rendering stages
+	int                 numStages;                               ///< Number of active stages
+	qboolean            isSky;         ///< surfaceparm sky
+	qboolean            isFog;         ///< surfaceparm fog
+	qboolean            isTranslucent; ///< surfaceparm trans
+	qboolean            isNodraw;      ///< surfaceparm nodraw
+	qboolean            valid;         ///< qtrue once successfully built
+} dx12Material_t;
+
 /**
  * @struct dx12Globals_t
  * @brief All DirectX 12 state for the renderer
@@ -167,6 +272,10 @@ void DX12_DrawString(float x, float y, float scale, const char *text, const font
 void DX12_Begin2DBatch(D3D12_GPU_DESCRIPTOR_HANDLE texHandle, D3D12_PRIMITIVE_TOPOLOGY topology);
 void DX12_AddQuadToBatch(const dx12QuadVertex_t corners[4]);
 void DX12_Flush2DBatch(void);
+
+// Function declarations – material cache (dx12_shader.cpp)
+qhandle_t       DX12_RegisterMaterial(const char *name);
+dx12Material_t *DX12_GetMaterial(qhandle_t handle);
 
 
 void DX12_StripExtension( const char* in, char* out, int size );

@@ -23,10 +23,14 @@
 
 #ifdef _WIN32
 
-#include <string.h>  // strncpy, strchr, etc.
+#include <string.h>   // strncpy, strchr, etc.
+#include <stdlib.h>   // atof
 
 dx12ShaderEntry_t dx12Shaders[DX12_MAX_TEXTURES];
 int               dx12NumShaders = 0;
+
+dx12Material_t dx12Materials[DX12_MAX_MATERIALS];
+int            dx12NumMaterials = 0;
 
 // ---------------------------------------------------------------------------
 // DX12_InitTextures
@@ -44,6 +48,9 @@ void DX12_InitTextures(void)
 
 	Com_Memset(dx12Shaders, 0, sizeof(dx12Shaders));
 	dx12NumShaders = 0;
+
+	Com_Memset(dx12Materials, 0, sizeof(dx12Materials));
+	dx12NumMaterials = 0;
 
 	// Slot 0: 1×1 opaque-white fallback
 	dx12Texture_t fallback = DX12_CreateTextureFromRGBA(white, 1, 1, 0);
@@ -77,6 +84,10 @@ void DX12_InitTextures(void)
 void DX12_ShutdownTextures(void)
 {
 	int i;
+
+	// Clear material cache first (materials hold texture-handle indices, not GPU resources)
+	Com_Memset(dx12Materials, 0, sizeof(dx12Materials));
+	dx12NumMaterials = 0;
 
 	for (i = 0; i < dx12NumShaders; i++)
 	{
@@ -531,6 +542,22 @@ dx12Texture_t *DX12_GetTexture(qhandle_t handle)
 {
 	int idx = (int)handle;
 
+	// Material handle: return the stage-0 texture
+	if (idx >= DX12_MATERIAL_HANDLE_BASE)
+	{
+		int midx = idx - DX12_MATERIAL_HANDLE_BASE;
+
+		if (midx >= 0 && midx < dx12NumMaterials && dx12Materials[midx].valid
+		    && dx12Materials[midx].numStages > 0
+		    && dx12Materials[midx].stages[0].active)
+		{
+			// Recurse with the raw texture handle (always < DX12_MATERIAL_HANDLE_BASE)
+			return DX12_GetTexture(dx12Materials[midx].stages[0].texHandle);
+		}
+		// Fall through to white fallback
+		idx = 0;
+	}
+
 	if (idx >= 0 && idx < dx12NumShaders && dx12Shaders[idx].valid)
 	{
 		return &dx12Shaders[idx].tex;
@@ -542,6 +569,578 @@ dx12Texture_t *DX12_GetTexture(qhandle_t handle)
 		return &dx12Shaders[0].tex;
 	}
 
+	return NULL;
+}
+
+// ---------------------------------------------------------------------------
+// Material parser helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Read one float token from the stream and return its value.
+ *        Advances *pp past the consumed token.
+ */
+static float SH_ParseFloat(const char **pp, const char *end)
+{
+	char tok[64];
+
+	*pp = SH_ReadToken(*pp, end, tok, sizeof(tok));
+	return tok[0] ? (float)atof(tok) : 0.0f;
+}
+
+/**
+ * @brief Map an ET blendfunc token (GL_ONE, SRC_ALPHA, etc.) to a D3D12_BLEND.
+ *        Returns D3D12_BLEND_ONE for any unrecognised token.
+ */
+static D3D12_BLEND SH_ParseBlendFactor(const char *tok)
+{
+	if (!DX12_Stricmp(tok, "GL_ZERO")                || !DX12_Stricmp(tok, "ZERO"))
+	{ return D3D12_BLEND_ZERO; }
+	if (!DX12_Stricmp(tok, "GL_ONE")                 || !DX12_Stricmp(tok, "ONE"))
+	{ return D3D12_BLEND_ONE; }
+	if (!DX12_Stricmp(tok, "GL_SRC_COLOR")           || !DX12_Stricmp(tok, "SRC_COLOR"))
+	{ return D3D12_BLEND_SRC_COLOR; }
+	if (!DX12_Stricmp(tok, "GL_ONE_MINUS_SRC_COLOR") || !DX12_Stricmp(tok, "ONE_MINUS_SRC_COLOR"))
+	{ return D3D12_BLEND_INV_SRC_COLOR; }
+	if (!DX12_Stricmp(tok, "GL_DST_COLOR")           || !DX12_Stricmp(tok, "DST_COLOR"))
+	{ return D3D12_BLEND_DEST_COLOR; }
+	if (!DX12_Stricmp(tok, "GL_ONE_MINUS_DST_COLOR") || !DX12_Stricmp(tok, "ONE_MINUS_DST_COLOR"))
+	{ return D3D12_BLEND_INV_DEST_COLOR; }
+	if (!DX12_Stricmp(tok, "GL_SRC_ALPHA")           || !DX12_Stricmp(tok, "SRC_ALPHA"))
+	{ return D3D12_BLEND_SRC_ALPHA; }
+	if (!DX12_Stricmp(tok, "GL_ONE_MINUS_SRC_ALPHA") || !DX12_Stricmp(tok, "ONE_MINUS_SRC_ALPHA"))
+	{ return D3D12_BLEND_INV_SRC_ALPHA; }
+	if (!DX12_Stricmp(tok, "GL_DST_ALPHA")           || !DX12_Stricmp(tok, "DST_ALPHA"))
+	{ return D3D12_BLEND_DEST_ALPHA; }
+	if (!DX12_Stricmp(tok, "GL_ONE_MINUS_DST_ALPHA") || !DX12_Stricmp(tok, "ONE_MINUS_DST_ALPHA"))
+	{ return D3D12_BLEND_INV_DEST_ALPHA; }
+	if (!DX12_Stricmp(tok, "GL_SRC_ALPHA_SATURATE")  || !DX12_Stricmp(tok, "SRC_ALPHA_SATURATE"))
+	{ return D3D12_BLEND_SRC_ALPHA_SAT; }
+	return D3D12_BLEND_ONE;
+}
+
+/**
+ * @brief Parse one stage block from just after its opening '{' to (and
+ *        including) the closing '}'.
+ *
+ * @param p      Source position (first token after the opening @c {).
+ * @param end    One past the last byte of the source buffer.
+ * @param stage  Stage struct to populate.
+ * @return       Pointer to the first byte after the closing @c }.
+ */
+static const char *SH_ParseStage(const char *p, const char *end,
+                                  dx12MaterialStage_t *stage)
+{
+	char tok[MAX_QPATH];
+
+	stage->active   = qtrue;
+	stage->srcBlend = D3D12_BLEND_ONE;
+	stage->dstBlend = D3D12_BLEND_ZERO;
+
+	while (p < end)
+	{
+		const char *saved;
+
+		p = SH_ReadToken(p, end, tok, sizeof(tok));
+
+		if (!tok[0] || tok[0] == '}')
+		{
+			break;
+		}
+
+		if (tok[0] == '{')
+		{
+			continue; // malformed – skip stray brace
+		}
+
+		// map / clampmap <path>
+		if (!DX12_Stricmp(tok, "map") || !DX12_Stricmp(tok, "clampmap"))
+		{
+			char path[MAX_QPATH];
+
+			p = SH_ReadToken(p, end, path, sizeof(path));
+			if (path[0] && path[0] != '$' && path[0] != '{' && path[0] != '}')
+			{
+				stage->texHandle = DX12_RegisterTexture(path);
+			}
+			continue;
+		}
+
+		// animMap <fps> <frame0> [frame1 …]
+		if (!DX12_Stricmp(tok, "animMap"))
+		{
+			int fi;
+
+			p              = SH_ReadToken(p, end, tok, sizeof(tok));
+			stage->animFps = tok[0] ? (float)atof(tok) : 1.0f;
+
+			for (fi = 0; fi < DX12_MAX_ANIM_FRAMES; fi++)
+			{
+				char frame[MAX_QPATH];
+
+				saved = p;
+				p     = SH_ReadToken(p, end, frame, sizeof(frame));
+
+				if (!frame[0] || frame[0] == '{' || frame[0] == '}')
+				{
+					p = saved;
+					break;
+				}
+
+				// Frame paths must contain '.' or '/' – otherwise it is
+				// likely a directive keyword on the next line
+				if (!strchr(frame, '.') && !strchr(frame, '/')
+				    && !strchr(frame, '\\'))
+				{
+					p = saved;
+					break;
+				}
+
+				stage->animFrames[fi] = DX12_RegisterTexture(frame);
+				stage->animNumFrames++;
+			}
+
+			// Use the first frame as the primary texture if map was absent
+			if (stage->animNumFrames > 0 && !stage->texHandle)
+			{
+				stage->texHandle = stage->animFrames[0];
+			}
+			continue;
+		}
+
+		// blendfunc <shorthand | srcFactor dstFactor>
+		if (!DX12_Stricmp(tok, "blendfunc"))
+		{
+			char src[64];
+
+			p = SH_ReadToken(p, end, src, sizeof(src));
+
+			if (!DX12_Stricmp(src, "add"))
+			{
+				stage->srcBlend = D3D12_BLEND_ONE;
+				stage->dstBlend = D3D12_BLEND_ONE;
+			}
+			else if (!DX12_Stricmp(src, "filter"))
+			{
+				stage->srcBlend = D3D12_BLEND_DEST_COLOR;
+				stage->dstBlend = D3D12_BLEND_ZERO;
+			}
+			else if (!DX12_Stricmp(src, "blend"))
+			{
+				stage->srcBlend = D3D12_BLEND_SRC_ALPHA;
+				stage->dstBlend = D3D12_BLEND_INV_SRC_ALPHA;
+			}
+			else
+			{
+				char dst[64];
+
+				stage->srcBlend = SH_ParseBlendFactor(src);
+				p               = SH_ReadToken(p, end, dst, sizeof(dst));
+				stage->dstBlend = SH_ParseBlendFactor(dst);
+			}
+			continue;
+		}
+
+		// tcMod <scroll|rotate|stretch> [params…]
+		if (!DX12_Stricmp(tok, "tcMod"))
+		{
+			char type[64];
+
+			p = SH_ReadToken(p, end, type, sizeof(type));
+
+			if (stage->numTcMods < DX12_MAX_TCMODS)
+			{
+				dx12TcMod_t *tm = &stage->tcMods[stage->numTcMods];
+
+				if (!DX12_Stricmp(type, "scroll"))
+				{
+					tm->type      = DX12_TMOD_SCROLL;
+					tm->scroll[0] = SH_ParseFloat(&p, end);
+					tm->scroll[1] = SH_ParseFloat(&p, end);
+					stage->numTcMods++;
+				}
+				else if (!DX12_Stricmp(type, "rotate"))
+				{
+					tm->type        = DX12_TMOD_ROTATE;
+					tm->rotateSpeed = SH_ParseFloat(&p, end);
+					stage->numTcMods++;
+				}
+				else if (!DX12_Stricmp(type, "stretch"))
+				{
+					char wfunc[32];
+
+					tm->type = DX12_TMOD_STRETCH;
+					p        = SH_ReadToken(p, end, wfunc, sizeof(wfunc));
+
+					if (!DX12_Stricmp(wfunc, "square"))
+					{
+						tm->stretch.func = DX12_WAVE_SQUARE;
+					}
+					else if (!DX12_Stricmp(wfunc, "triangle"))
+					{
+						tm->stretch.func = DX12_WAVE_TRIANGLE;
+					}
+					else if (!DX12_Stricmp(wfunc, "sawtooth"))
+					{
+						tm->stretch.func = DX12_WAVE_SAWTOOTH;
+					}
+					else if (!DX12_Stricmp(wfunc, "inversesawtooth"))
+					{
+						tm->stretch.func = DX12_WAVE_INVERSE_SAWTOOTH;
+					}
+					else
+					{
+						tm->stretch.func = DX12_WAVE_SIN; // default: sin
+					}
+
+					tm->stretch.base      = SH_ParseFloat(&p, end);
+					tm->stretch.amplitude = SH_ParseFloat(&p, end);
+					tm->stretch.phase     = SH_ParseFloat(&p, end);
+					tm->stretch.frequency = SH_ParseFloat(&p, end);
+					stage->numTcMods++;
+				}
+				// Other tcMod types (scale, turb, etc.) are recognised but ignored
+			}
+			continue;
+		}
+
+		// All other stage directives are silently skipped
+	}
+
+	return p;
+}
+
+// ---------------------------------------------------------------------------
+// Full material parser
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Search a single shader-file buffer for a shader whose name equals
+ *        @p shaderName and build a full dx12Material_t from it.
+ *
+ * Parses outer-level directives (surfaceparm) and delegates each stage
+ * block to SH_ParseStage().
+ *
+ * @param[in]  buf         Raw text content of the shader file.
+ * @param[in]  bufLen      Number of bytes in @p buf.
+ * @param[in]  shaderName  Shader name to look for (case-insensitive).
+ * @param[out] out         Material struct to populate on success.
+ * @return     qtrue when the shader was found and @p out was filled.
+ */
+static qboolean SH_ParseMaterialInBuffer(const char *buf, int bufLen,
+                                          const char *shaderName,
+                                          dx12Material_t *out)
+{
+	const char *p   = buf;
+	const char *end = buf + bufLen;
+	char        tok[MAX_QPATH];
+
+	Com_Memset(out, 0, sizeof(*out));
+
+	while (p < end)
+	{
+		p = SH_ReadToken(p, end, tok, sizeof(tok));
+
+		if (!tok[0])
+		{
+			break;
+		}
+
+		// Skip stray braces at the top level (defensive)
+		if (tok[0] == '{' || tok[0] == '}')
+		{
+			continue;
+		}
+
+		// tok is a potential shader name; the next non-comment token must be '{'
+		{
+			const char *saved = p;
+			char        brace[4];
+
+			p = SH_ReadToken(p, end, brace, sizeof(brace));
+
+			if (brace[0] != '{')
+			{
+				p = saved;
+				continue;
+			}
+
+			if (DX12_Stricmp(tok, shaderName) != 0)
+			{
+				// Not the shader we want – skip to the matching '}'
+				int depth = 1;
+
+				while (p < end && depth > 0)
+				{
+					p = SH_ReadToken(p, end, tok, sizeof(tok));
+					if (tok[0] == '{')
+					{
+						depth++;
+					}
+					else if (tok[0] == '}')
+					{
+						depth--;
+					}
+				}
+				continue;
+			}
+
+			// We are inside the matching shader block.
+			Q_strncpyz(out->name, shaderName, sizeof(out->name));
+
+			while (p < end)
+			{
+				p = SH_ReadToken(p, end, tok, sizeof(tok));
+
+				if (!tok[0] || tok[0] == '}')
+				{
+					break; // end of shader block
+				}
+
+				if (tok[0] == '{')
+				{
+					// Stage block
+					if (out->numStages < DX12_MAX_MATERIAL_STAGES)
+					{
+						p = SH_ParseStage(p, end, &out->stages[out->numStages]);
+						if (out->stages[out->numStages].active)
+						{
+							out->numStages++;
+						}
+					}
+					else
+					{
+						// Excess stages – skip
+						int depth = 1;
+
+						while (p < end && depth > 0)
+						{
+							p = SH_ReadToken(p, end, tok, sizeof(tok));
+							if (tok[0] == '{')
+							{
+								depth++;
+							}
+							else if (tok[0] == '}')
+							{
+								depth--;
+							}
+						}
+					}
+					continue;
+				}
+
+				// surfaceparm <keyword>
+				if (!DX12_Stricmp(tok, "surfaceparm"))
+				{
+					char sparm[MAX_QPATH];
+
+					p = SH_ReadToken(p, end, sparm, sizeof(sparm));
+
+					if (!DX12_Stricmp(sparm, "sky"))
+					{
+						out->isSky = qtrue;
+					}
+					else if (!DX12_Stricmp(sparm, "fog"))
+					{
+						out->isFog = qtrue;
+					}
+					else if (!DX12_Stricmp(sparm, "trans")
+					         || !DX12_Stricmp(sparm, "translucent"))
+					{
+						out->isTranslucent = qtrue;
+					}
+					else if (!DX12_Stricmp(sparm, "nodraw"))
+					{
+						out->isNodraw = qtrue;
+					}
+					continue;
+				}
+
+				// All other outer-level directives (cull, sort, deformvertexes, etc.) are skipped
+			}
+
+			out->valid = qtrue;
+			return qtrue;
+		}
+	}
+
+	return qfalse;
+}
+
+/**
+ * @brief Scan all .shader files in @p dir for a definition of @p shaderName.
+ *
+ * @param[in]  dir         Shader directory to search (e.g. "materials").
+ * @param[in]  shaderName  Shader name to look for.
+ * @param[out] out         Material struct to populate on success.
+ * @return     qtrue when the shader was found and @p out was filled.
+ */
+static qboolean SH_ScanDirForMaterial(const char *dir, const char *shaderName,
+                                       dx12Material_t *out)
+{
+	char     **fileList;
+	int        numFiles = 0;
+	int        i;
+	qboolean   found    = qfalse;
+
+	fileList = dx12.ri.FS_ListFiles(dir, ".shader", &numFiles);
+	if (!fileList || numFiles <= 0)
+	{
+		if (fileList)
+		{
+			dx12.ri.FS_FreeFileList(fileList);
+		}
+		return qfalse;
+	}
+
+	for (i = 0; i < numFiles && !found; i++)
+	{
+		char  fullPath[MAX_QPATH];
+		void *buf  = NULL;
+		int   size = 0;
+
+		snprintf(fullPath, sizeof(fullPath), "%s/%s", dir, fileList[i]);
+		size = dx12.ri.FS_ReadFile(fullPath, &buf);
+		if (size <= 0 || !buf)
+		{
+			continue;
+		}
+
+		found = SH_ParseMaterialInBuffer((const char *)buf, size,
+		                                 shaderName, out);
+		dx12.ri.FS_FreeFile(buf);
+	}
+
+	dx12.ri.FS_FreeFileList(fileList);
+	return found;
+}
+
+/**
+ * @brief Attempt to parse a full material by scanning the shader-script
+ *        directories (materials/ first, then scripts/).
+ *
+ * @param[in]  shaderName  Shader name to look for.
+ * @param[out] out         Material struct to populate on success.
+ * @return     qtrue when the shader was found and @p out was filled.
+ */
+static qboolean DX12_FindMaterialScript(const char *shaderName, dx12Material_t *out)
+{
+	if (SH_ScanDirForMaterial("materials", shaderName, out))
+	{
+		return qtrue;
+	}
+	if (SH_ScanDirForMaterial("scripts", shaderName, out))
+	{
+		return qtrue;
+	}
+	return qfalse;
+}
+
+// ---------------------------------------------------------------------------
+// DX12_RegisterMaterial
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief DX12_RegisterMaterial
+ * @param[in] name  Shader or image-file name to register.
+ * @return          Material handle in [DX12_MATERIAL_HANDLE_BASE, …),
+ *                  or 0 on failure.
+ *
+ * Searches the material cache first (deduplication by name, case-insensitive).
+ * On a miss, tries to parse a full dx12Material_t from the shader-script
+ * directories.  If no script is found, falls back to a single-stage material
+ * built from a direct image load (matching the legacy DX12_RegisterTexture
+ * behaviour for plain image references).
+ */
+qhandle_t DX12_RegisterMaterial(const char *name)
+{
+	int            i;
+	int            slot;
+	dx12Material_t mat;
+
+	if (!name || !name[0])
+	{
+		return 0;
+	}
+
+	// Deduplicate: return existing handle if already cached
+	for (i = 0; i < dx12NumMaterials; i++)
+	{
+		if (dx12Materials[i].valid && !DX12_Stricmp(dx12Materials[i].name, name))
+		{
+			return (qhandle_t)(DX12_MATERIAL_HANDLE_BASE + i);
+		}
+	}
+
+	if (dx12NumMaterials >= DX12_MAX_MATERIALS)
+	{
+		dx12.ri.Printf(PRINT_WARNING, "DX12_RegisterMaterial: material cache full\n");
+		return 0;
+	}
+
+	if (dx12.frameOpen)
+	{
+		dx12.ri.Printf(PRINT_WARNING,
+		               "DX12_RegisterMaterial: '%s' registered mid-frame; not supported\n",
+		               name);
+		return 0;
+	}
+
+	Com_Memset(&mat, 0, sizeof(mat));
+
+	// Try to parse a full material from .shader script files
+	if (!DX12_FindMaterialScript(name, &mat))
+	{
+		// Fall back: treat the name as a plain image path and build a 1-stage material
+		qhandle_t texHandle = DX12_RegisterTexture(name);
+
+		if (!texHandle)
+		{
+			dx12.ri.Printf(PRINT_DEVELOPER,
+			               "DX12_RegisterMaterial: could not resolve '%s'\n", name);
+			return 0;
+		}
+
+		Q_strncpyz(mat.name, name, sizeof(mat.name));
+		mat.stages[0].active   = qtrue;
+		mat.stages[0].texHandle = texHandle;
+		mat.stages[0].srcBlend = D3D12_BLEND_ONE;
+		mat.stages[0].dstBlend = D3D12_BLEND_ZERO;
+		mat.numStages          = 1;
+		mat.valid              = qtrue;
+	}
+	else
+	{
+		dx12.ri.Printf(PRINT_DEVELOPER,
+		               "DX12_RegisterMaterial: parsed shader '%s' (%d stage(s))\n",
+		               name, mat.numStages);
+	}
+
+	slot              = dx12NumMaterials;
+	dx12Materials[slot] = mat;
+	dx12NumMaterials++;
+
+	return (qhandle_t)(DX12_MATERIAL_HANDLE_BASE + slot);
+}
+
+// ---------------------------------------------------------------------------
+// DX12_GetMaterial
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief DX12_GetMaterial
+ * @param[in] handle  Handle returned by DX12_RegisterMaterial().
+ * @return            Pointer to the cached dx12Material_t, or NULL if
+ *                    the handle is out of range or the slot is invalid.
+ */
+dx12Material_t *DX12_GetMaterial(qhandle_t handle)
+{
+	int idx = (int)handle - DX12_MATERIAL_HANDLE_BASE;
+
+	if (idx >= 0 && idx < dx12NumMaterials && dx12Materials[idx].valid)
+	{
+		return &dx12Materials[idx];
+	}
 	return NULL;
 }
 

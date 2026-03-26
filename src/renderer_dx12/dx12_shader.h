@@ -30,5 +30,8 @@ typedef struct
 extern dx12ShaderEntry_t dx12Shaders[DX12_MAX_TEXTURES];
 extern int               dx12NumShaders;
 
+extern dx12Material_t dx12Materials[DX12_MAX_MATERIALS];
+extern int            dx12NumMaterials;
+
 #endif // _WIN32
 #endif // DX12_SHADER_H
