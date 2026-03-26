@@ -2,8 +2,7 @@
  * @file dx12_image.cpp
  * @brief DX12-only image loader.
  *
- * Minimal TGA decoder (uncompressed type 2 and RLE type 10, 24-bit and
- * 32-bit) with no dependency on renderer_common, OpenGL, or any GL headers.
+ * Supports TGA (types 2 and 10), JPEG (via libjpeg), and PNG (via libpng).
  * Pixel data is loaded via dx12.ri.FS_ReadFile and decoded into a plain
  * malloc()-allocated RGBA buffer.
  */
@@ -15,8 +14,8 @@
 #include <stdlib.h>   // malloc / free
 #include <string.h>   // memcpy
 #include <setjmp.h>   // setjmp / longjmp  (JPEG error recovery)
-#include <jpeglib.h>  // libjpeg decode  (linked via renderer_libraries)
-#include <png.h>      // libpng decode   (linked via renderer_libraries)
+#include <jpeglib.h>  // libjpeg decode  (linked via renderer_libraries + direct JPEG link in CMake)
+#include <png.h>      // libpng decode   (linked via renderer_libraries + direct PNG link in CMake)
 
 // ---------------------------------------------------------------------------
 // TGA decoding
