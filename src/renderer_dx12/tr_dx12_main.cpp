@@ -170,14 +170,58 @@ static void RE_DX12_EndFrame(int *frontEndMsec, int *backEndMsec)
 	DX12_EndFrame();
 }
 
+// ---------------------------------------------------------------------------
+// Minimal model registry
+// ---------------------------------------------------------------------------
+
+/** Maximum number of simultaneously registered models (matches classic renderer). */
+#define DX12_MAX_MOD_KNOWN 2048
+
+static char dx12ModelNames[DX12_MAX_MOD_KNOWN][MAX_QPATH];
+static int  dx12NumModels = 0;
+
+/**
+ * @brief RE_DX12_RegisterModel
+ *
+ * Returns a stable, non-zero handle for the given model filename.
+ * The DX12 renderer does not yet render skeletal models, but a valid handle
+ * is required by the animation system (bg_animgroup.c / USE_MDXFILE) so that
+ * animation pools are correctly keyed and populated.
+ */
 static qhandle_t RE_DX12_RegisterModel(const char *name)
 {
-	(void)name; return 0;
+	int i;
+
+	if (!name || !name[0])
+	{
+		return 0;
+	}
+
+	// Return an existing handle if already registered
+	for (i = 0; i < dx12NumModels; i++)
+	{
+		if (!Q_stricmp(dx12ModelNames[i], name))
+		{
+			return (qhandle_t)(i + 1);
+		}
+	}
+
+	// Register a new slot
+	if (dx12NumModels >= DX12_MAX_MOD_KNOWN)
+	{
+		dx12.ri.Printf(PRINT_WARNING,
+		               "RE_DX12_RegisterModel: model table full, dropping '%s'\n",
+		               name);
+		return 0;
+	}
+
+	Q_strncpyz(dx12ModelNames[dx12NumModels], name, MAX_QPATH);
+	return (qhandle_t)(++dx12NumModels);
 }
 
 static qhandle_t RE_DX12_RegisterModelAllLODs(const char *name)
 {
-	(void)name; return 0;
+	return RE_DX12_RegisterModel(name);
 }
 
 static qhandle_t RE_DX12_RegisterSkin(const char *name)
