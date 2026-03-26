@@ -216,27 +216,6 @@ if(FEATURE_RENDERER_DX12)
         d3dcompiler
     )
 
-    # dx12_image.cpp directly includes <jpeglib.h> and <png.h>.
-    # renderer_libraries links the image libraries transitively, but on
-    # Windows with bundled libs the include paths are not always propagated
-    # through the INTERFACE chain.  Link the image libraries directly so that
-    # the compiler always has the header search paths it needs.
-    if(FEATURE_JPEG)
-        if(BUNDLED_JPEG)
-            target_link_libraries(renderer_dx12 PRIVATE bundled_jpeg_int)
-        else()
-            target_include_directories(renderer_dx12 PRIVATE ${JPEG_INCLUDE_DIR})
-        endif()
-    endif()
-
-    if(FEATURE_PNG)
-        if(BUNDLED_PNG)
-            target_link_libraries(renderer_dx12 PRIVATE bundled_png_int)
-        else()
-            target_include_directories(renderer_dx12 PRIVATE ${LIBPNG_INCLUDE_DIRS})
-        endif()
-    endif()
-
 	target_link_libraries(client_libraries INTERFACE renderer_dx12)
 
     configure_renderer(renderer_dx12 ${R_DX12_NAME})
