@@ -1547,12 +1547,16 @@ static const dx12BspNode_t *DX12_PointInLeaf(const vec3_t p)
  */
 static const byte *DX12_ClusterPVS(int cluster)
 {
-	if (!dx12World.vis || cluster < 0 || cluster >= dx12World.numClusters)
+	// externalVisData (from RE_DX12_SetWorldVisData) takes priority over BSP vis,
+	// mirroring GL's tr.externalVisData / s_worldData.vis semantics.
+	const byte *visData = dx12World.externalVisData ? dx12World.externalVisData : dx12World.vis;
+
+	if (!visData || cluster < 0 || cluster >= dx12World.numClusters)
 	{
 		return dx12World.novis;
 	}
 
-	return dx12World.vis + (size_t)cluster * (size_t)dx12World.clusterBytes;
+	return visData + (size_t)cluster * (size_t)dx12World.clusterBytes;
 }
 
 /**

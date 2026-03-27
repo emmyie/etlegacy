@@ -966,7 +966,10 @@ static qhandle_t RE_DX12_GetShaderFromModel(qhandle_t modelid, int surfnum, int 
 
 static void RE_DX12_SetWorldVisData(const byte *vis)
 {
-	(void)vis;
+	// Store the external PVS pointer.  DX12_ClusterPVS in dx12_world.cpp
+	// will prefer this over the BSP-loaded vis data when non-NULL, matching
+	// the GL renderer's tr.externalVisData / s_worldData.vis semantics.
+	dx12World.externalVisData = vis;
 }
 
 static void RE_DX12_ClearScene(void)
@@ -981,7 +984,14 @@ static void RE_DX12_AddRefEntityToScene(const refEntity_t *re)
 
 static int RE_DX12_LightForPoint(vec3_t point, vec3_t ambientLight, vec3_t directedLight, vec3_t lightDir)
 {
-	(void)point; (void)ambientLight; (void)directedLight; (void)lightDir; return 0;
+	// The DX12 world does not yet load a light grid, so we cannot sample it.
+	// Return qfalse to tell the caller no valid sample was found (identical to
+	// GL's R_LightForPoint when world->lightGridData == NULL).
+	(void)point;
+	VectorSet(ambientLight,  0.0f, 0.0f, 0.0f);
+	VectorSet(directedLight, 0.0f, 0.0f, 0.0f);
+	VectorSet(lightDir,      0.0f, 0.0f, 1.0f);
+	return qfalse;
 }
 
 static void RE_DX12_AddPolyToScene(qhandle_t hShader, int numVerts, const polyVert_t *verts)
@@ -1002,14 +1012,59 @@ static void RE_DX12_AddPolysToScene(qhandle_t hShader, int numVerts, const polyV
 static void RE_DX12_AddLightToScene(const vec3_t org, float radius, float intensity,
                                      float r, float g, float b, qhandle_t hShader, int flags)
 {
-	(void)org; (void)radius; (void)intensity;
-	(void)r; (void)g; (void)b; (void)hShader; (void)flags;
+	dx12DLight_t *dl;
+
+	(void)hShader; // No material lookup for dlights in the DX12 renderer yet
+
+	if (radius <= 0.0f || intensity <= 0.0f)
+	{
+		return;
+	}
+
+	if (dx12Scene.numDLights >= DX12_MAX_DLIGHTS)
+	{
+		dx12.ri.Printf(PRINT_DEVELOPER,
+		               "RE_DX12_AddLightToScene: dropping dlight, reached MAX_DLIGHTS (%d)\n",
+		               DX12_MAX_DLIGHTS);
+		return;
+	}
+
+	dl            = &dx12Scene.dlights[dx12Scene.numDLights++];
+	VectorCopy(org, dl->origin);
+	dl->color[0]  = r;
+	dl->color[1]  = g;
+	dl->color[2]  = b;
+	dl->radius    = radius;
+	dl->intensity = intensity;
+	dl->flags     = flags;
 }
 
 static void RE_DX12_AddCoronaToScene(const vec3_t org, float r, float g, float b,
                                       float scale, int id, qboolean visible)
 {
-	(void)org; (void)r; (void)g; (void)b; (void)scale; (void)id; (void)visible;
+	dx12Corona_t *cor;
+
+	if (!visible)
+	{
+		return;
+	}
+
+	if (dx12Scene.numCoronas >= DX12_MAX_CORONAS)
+	{
+		dx12.ri.Printf(PRINT_DEVELOPER,
+		               "RE_DX12_AddCoronaToScene: dropping corona, reached MAX_CORONAS (%d)\n",
+		               DX12_MAX_CORONAS);
+		return;
+	}
+
+	cor           = &dx12Scene.coronas[dx12Scene.numCoronas++];
+	VectorCopy(org, cor->origin);
+	cor->color[0] = r;
+	cor->color[1] = g;
+	cor->color[2] = b;
+	cor->scale    = scale;
+	cor->id       = id;
+	cor->visible  = visible;
 }
 
 static void RE_DX12_SetFog(int fogvar, int var1, int var2, float r, float g, float b, float density)

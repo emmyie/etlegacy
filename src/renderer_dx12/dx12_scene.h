@@ -49,6 +49,38 @@
 // Limits
 // ---------------------------------------------------------------------------
 
+/** Maximum DX12 dynamic lights per frame – matches GL renderer's MAX_DLIGHTS. */
+#define DX12_MAX_DLIGHTS MAX_DLIGHTS
+
+/** Maximum DX12 coronas per frame – matches GL renderer's MAX_CORONAS. */
+#define DX12_MAX_CORONAS MAX_CORONAS
+
+/**
+ * @struct dx12DLight_t
+ * @brief Per-frame dynamic light entry (mirrors GL dlight_t without GL internals).
+ */
+typedef struct
+{
+	vec3_t origin;     ///< World-space position
+	vec3_t color;      ///< Normalised RGB [0,1]
+	float  radius;     ///< Influence radius in world units
+	float  intensity;  ///< Light strength (1.0 = fullbright)
+	int    flags;      ///< REF_*_DLIGHT flags
+} dx12DLight_t;
+
+/**
+ * @struct dx12Corona_t
+ * @brief Per-frame corona / flare entry (mirrors GL corona_t).
+ */
+typedef struct
+{
+	vec3_t   origin;    ///< World-space position
+	float    color[3];  ///< Normalised RGB [0,1]
+	float    scale;     ///< Scale relative to r_flareSize
+	int      id;        ///< Unique id for fading continuity
+	qboolean visible;   ///< qtrue when the corona is currently visible
+} dx12Corona_t;
+
 /** Maximum ref-entities buffered between ClearScene and RenderScene. */
 #define DX12_MAX_SCENE_ENTITIES 1024
 
@@ -157,6 +189,14 @@ typedef struct
 	int                  numPolyBatches;                   ///< Active batch count
 	ID3D12Resource      *polyVertexBuffer;                 ///< GPU upload-heap VB (persistent)
 	UINT8               *polyVBMapped;                     ///< Persistently-mapped CPU pointer
+
+	// Per-frame dynamic lights
+	dx12DLight_t dlights[DX12_MAX_DLIGHTS]; ///< Dynamic light list
+	int          numDLights;                ///< Active dlight count
+
+	// Per-frame coronas / flares
+	dx12Corona_t coronas[DX12_MAX_CORONAS]; ///< Corona list
+	int          numCoronas;                ///< Active corona count
 
 	qboolean initialized; ///< qtrue after DX12_SceneInit()
 } dx12SceneState_t;

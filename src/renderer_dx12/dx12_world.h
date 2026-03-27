@@ -213,10 +213,11 @@ typedef struct
 	dplane_t      *bspPlanes;     ///< Plane array (malloc'd)
 	int            numBspPlanes;  ///< Plane count
 
-	byte *vis;           ///< Raw PVS data (malloc'd; NULL if no vis data)
-	byte *novis;         ///< All-0xFF row for "visible" fallback (malloc'd)
-	int   numClusters;   ///< Number of PVS clusters
-	int   clusterBytes;  ///< Bytes per cluster row in vis[]
+	byte        *vis;           ///< Raw PVS data (malloc'd; NULL if no vis data)
+	byte        *novis;         ///< All-0xFF row for "visible" fallback (malloc'd)
+	int          numClusters;   ///< Number of PVS clusters
+	int          clusterBytes;  ///< Bytes per cluster row in vis[]
+	const byte  *externalVisData; ///< Override from RE_DX12_SetWorldVisData (not malloc'd)
 
 	qboolean loaded; ///< qtrue after a successful DX12_LoadWorld() call
 } dx12World_t;

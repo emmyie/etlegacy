@@ -982,6 +982,8 @@ void DX12_ClearScene(void)
 	dx12Scene.numEntities    = 0;
 	dx12Scene.numPolyVerts   = 0;
 	dx12Scene.numPolyBatches = 0;
+	dx12Scene.numDLights     = 0;
+	dx12Scene.numCoronas     = 0;
 }
 
 /**
