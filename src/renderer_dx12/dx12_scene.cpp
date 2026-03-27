@@ -125,7 +125,9 @@ static const char g_worldShaderSource[] =
 	"{\n"
 	"    float4 diffuse  = g_diffuse.Sample(g_sampler, input.uv);\n"
 	"    float4 lightmap = g_lightmap.Sample(g_sampler, input.lm);\n"
-	"    return diffuse * lightmap * input.color;\n"
+	"    // 2x overbright to match GL1 renderer default (r_overBrightBits=1)\n"
+	"    float4 result   = diffuse * (lightmap * 2.0) * input.color;\n"
+	"    return float4(saturate(result.rgb), result.a);\n"
 	"}\n";
 
 // ---------------------------------------------------------------------------

@@ -46,6 +46,7 @@ int            dx12NumMaterials = 0;
 void DX12_InitTextures(void)
 {
 	byte white[4] = { 255, 255, 255, 255 };
+	byte black[4] = {   0,   0,   0, 255 };
 
 	Com_Memset(dx12Shaders, 0, sizeof(dx12Shaders));
 	dx12NumShaders = 0;
@@ -54,21 +55,43 @@ void DX12_InitTextures(void)
 	dx12NumMaterials = 0;
 
 	// Slot 0: 1×1 opaque-white fallback
-	dx12Texture_t fallback = DX12_CreateTextureFromRGBA(white, 1, 1, 0);
+	{
+		dx12Texture_t fallback = DX12_CreateTextureFromRGBA(white, 1, 1, 0);
 
-	if (fallback.resource)
-	{
-		Q_strncpyz(dx12Shaders[0].name, "__white__", sizeof(dx12Shaders[0].name));
-		dx12Shaders[0].width  = 1;
-		dx12Shaders[0].height = 1;
-		dx12Shaders[0].tex    = fallback;
-		dx12Shaders[0].valid  = qtrue;
-		dx12NumShaders        = 1;
+		if (fallback.resource)
+		{
+			Q_strncpyz(dx12Shaders[0].name, "__white__", sizeof(dx12Shaders[0].name));
+			dx12Shaders[0].width  = 1;
+			dx12Shaders[0].height = 1;
+			dx12Shaders[0].tex    = fallback;
+			dx12Shaders[0].valid  = qtrue;
+			dx12NumShaders        = 1;
+		}
+		else
+		{
+			dx12.ri.Printf(PRINT_WARNING, "DX12_InitTextures: white fallback texture failed\n");
+			dx12NumShaders = 1; // still reserve slot 0
+		}
 	}
-	else
+
+	// Slot 1: 1×1 opaque-black fallback (used by *black virtual textures)
 	{
-		dx12.ri.Printf(PRINT_WARNING, "DX12_InitTextures: white fallback texture failed\n");
-		dx12NumShaders = 1; // still reserve slot 0
+		dx12Texture_t fallback = DX12_CreateTextureFromRGBA(black, 1, 1, 1);
+
+		if (fallback.resource)
+		{
+			Q_strncpyz(dx12Shaders[1].name, "__black__", sizeof(dx12Shaders[1].name));
+			dx12Shaders[1].width  = 1;
+			dx12Shaders[1].height = 1;
+			dx12Shaders[1].tex    = fallback;
+			dx12Shaders[1].valid  = qtrue;
+			dx12NumShaders        = 2;
+		}
+		else
+		{
+			dx12.ri.Printf(PRINT_WARNING, "DX12_InitTextures: black fallback texture failed\n");
+			dx12NumShaders = 2; // still reserve slot 1
+		}
 	}
 }
 
@@ -492,6 +515,43 @@ qhandle_t DX12_RegisterTexture(const char *name)
 		dx12Shaders[slot].tex.resource  = NULL;
 		dx12Shaders[slot].tex.cpuHandle = dx12Shaders[0].tex.cpuHandle;
 		dx12Shaders[slot].tex.gpuHandle = dx12Shaders[0].tex.gpuHandle;
+		dx12NumShaders++;
+		return (qhandle_t)slot;
+	}
+
+	// Other virtual names that also map to the white fallback (slot 0):
+	// $whiteimage and $white are standard Q3 virtual names for a solid-white texture.
+	if (!DX12_Stricmp(name, "$whiteimage") ||
+	    !DX12_Stricmp(name, "$white"))
+	{
+		slot = dx12NumShaders;
+		Q_strncpyz(dx12Shaders[slot].name, name, sizeof(dx12Shaders[slot].name));
+		dx12Shaders[slot].width       = 1;
+		dx12Shaders[slot].height      = 1;
+		dx12Shaders[slot].valid       = qtrue;
+		dx12Shaders[slot].tex.resource  = NULL;
+		dx12Shaders[slot].tex.cpuHandle = dx12Shaders[0].tex.cpuHandle;
+		dx12Shaders[slot].tex.gpuHandle = dx12Shaders[0].tex.gpuHandle;
+		dx12NumShaders++;
+		return (qhandle_t)slot;
+	}
+
+	// *black maps to the opaque-black fallback at slot 1.
+	if (name[0] == '*' && !DX12_Stricmp(name + 1, "black"))
+	{
+		slot = dx12NumShaders;
+		Q_strncpyz(dx12Shaders[slot].name, name, sizeof(dx12Shaders[slot].name));
+		dx12Shaders[slot].width      = 1;
+		dx12Shaders[slot].height     = 1;
+		dx12Shaders[slot].valid      = qtrue;
+		// Alias to slot 1 (black fallback); resource left NULL to avoid double-release.
+		dx12Shaders[slot].tex.resource  = NULL;
+		dx12Shaders[slot].tex.cpuHandle = (dx12NumShaders > 1 && dx12Shaders[1].valid)
+		                                  ? dx12Shaders[1].tex.cpuHandle
+		                                  : dx12Shaders[0].tex.cpuHandle;
+		dx12Shaders[slot].tex.gpuHandle = (dx12NumShaders > 1 && dx12Shaders[1].valid)
+		                                  ? dx12Shaders[1].tex.gpuHandle
+		                                  : dx12Shaders[0].tex.gpuHandle;
 		dx12NumShaders++;
 		return (qhandle_t)slot;
 	}

@@ -35,11 +35,23 @@ void Info_SetValueForKey( char* s, const char* key, const char* value )
 
 void DX12_StripExtension( const char* in, char* out, int size )
 {
-	strncpy( out, in, size );
-	out[ size - 1 ] = '\0';
+	char* dot;
+	int   i;
 
-	char* dot = strrchr( out, '.' );
-	if ( dot ) *dot = '\0';
+	if ( !in || !out || size <= 0 )
+	{
+		if ( out && size > 0 ) { out[0] = '\0'; }
+		return;
+	}
+
+	for ( i = 0; i < size - 1 && in[i]; i++ )
+	{
+		out[i] = in[i];
+	}
+	out[i] = '\0';
+
+	dot = strrchr( out, '.' );
+	if ( dot ) { *dot = '\0'; }
 }
 
 int DX12_Stricmp( const char* s1, const char* s2 )

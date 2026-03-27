@@ -485,67 +485,260 @@ void DX12_LoadWorld(const char *name)
 	}
 
 	// ----------------------------------------------------------------
-	// 2.  Lightmap lump → upload 128×128 RGB textures
+	// 2.  Lightmap lump → upload 128×128 RGB textures (batched)
 	// ----------------------------------------------------------------
 	{
-		lump_t      *lump = &header->lumps[LUMP_LIGHTMAPS];
-		const byte  *src  = fileBase + lump->fileofs;
-		int          lmSize = LIGHTMAP_WIDTH * LIGHTMAP_HEIGHT * 3; // RGB on-disk
-		int          count;
+		const lump_t *lump   = &header->lumps[LUMP_LIGHTMAPS];
+		const byte   *src    = fileBase + lump->fileofs;
+		const int     lmSize = LIGHTMAP_WIDTH * LIGHTMAP_HEIGHT * 3; // RGB on-disk
+		int           count  = (lump->filelen > 0) ? (lump->filelen / lmSize) : 0;
+		int           lmIdx;
 
-		count                    = (lump->filelen > 0) ? (lump->filelen / lmSize) : 0;
-		dx12World.numLightmaps   = count < DX12_MAX_LIGHTMAPS ? count : DX12_MAX_LIGHTMAPS;
-
-		for (i = 0; i < dx12World.numLightmaps; i++)
+		if (count > DX12_MAX_LIGHTMAPS)
 		{
-			// Expand 3-channel (RGB) to 4-channel (RGBA) for the DX12 RGBA texture format
-			byte rgba[LIGHTMAP_WIDTH * LIGHTMAP_HEIGHT * 4];
-			int  px;
+			count = DX12_MAX_LIGHTMAPS;
+		}
+		dx12World.numLightmaps = count;
 
-			for (px = 0; px < LIGHTMAP_WIDTH * LIGHTMAP_HEIGHT; px++)
+		if (count > 0)
+		{
+			// ---- Allocate parallel arrays for batch upload ----
+			ID3D12Resource **texResources    = (ID3D12Resource **)dx12.ri.Malloc(count * (int)sizeof(ID3D12Resource *));
+			ID3D12Resource **uploadBuffers   = (ID3D12Resource **)dx12.ri.Malloc(count * (int)sizeof(ID3D12Resource *));
+			HRESULT          hr;
+
+			if (!texResources || !uploadBuffers)
 			{
-				rgba[px * 4 + 0] = src[i * lmSize + px * 3 + 0];
-				rgba[px * 4 + 1] = src[i * lmSize + px * 3 + 1];
-				rgba[px * 4 + 2] = src[i * lmSize + px * 3 + 2];
-				rgba[px * 4 + 3] = 255;
+				dx12.ri.Printf(PRINT_WARNING, "DX12_LoadWorld: out of memory for lightmap batch\n");
+				if (texResources)  { dx12.ri.Free(texResources); }
+				if (uploadBuffers) { dx12.ri.Free(uploadBuffers); }
+				goto lm_batch_done;
 			}
 
-			{
-				char        lmName[MAX_QPATH];
-				int         slot = dx12NumShaders;
-				dx12Texture_t tex;
+			Com_Memset(texResources,  0, count * sizeof(ID3D12Resource *));
+			Com_Memset(uploadBuffers, 0, count * sizeof(ID3D12Resource *));
 
-				// Guard against overflow – lightmap SRV slots live in the texture registry
-				if (slot >= DX12_MAX_TEXTURES)
+			// ---- Create all texture and upload-heap resources ----
+			{
+				D3D12_HEAP_PROPERTIES defaultHeap = {};
+				D3D12_HEAP_PROPERTIES uploadHeap  = {};
+				D3D12_RESOURCE_DESC   texDesc     = {};
+				D3D12_RESOURCE_DESC   upDesc      = {};
+
+				defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+				uploadHeap.Type  = D3D12_HEAP_TYPE_UPLOAD;
+
+				texDesc.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+				texDesc.Width            = LIGHTMAP_WIDTH;
+				texDesc.Height           = LIGHTMAP_HEIGHT;
+				texDesc.DepthOrArraySize = 1;
+				texDesc.MipLevels        = 1;
+				texDesc.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
+				texDesc.SampleDesc.Count = 1;
+				texDesc.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+				D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+				UINT64 uploadSize;
+				UINT numRows;
+				UINT64 rowSizeBytes;
+				dx12.device->GetCopyableFootprints(&texDesc, 0, 1, 0, &footprint, &numRows, &rowSizeBytes, &uploadSize);
+
+				upDesc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+				upDesc.Width            = uploadSize;
+				upDesc.Height           = 1;
+				upDesc.DepthOrArraySize = 1;
+				upDesc.MipLevels        = 1;
+				upDesc.Format           = DXGI_FORMAT_UNKNOWN;
+				upDesc.SampleDesc.Count = 1;
+				upDesc.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+				for (lmIdx = 0; lmIdx < count; lmIdx++)
 				{
-					dx12.ri.Printf(PRINT_WARNING,
-					               "DX12_LoadWorld: texture registry full, skipping lightmap %d\n", i);
-					dx12World.lightmapHandles[i] = 0;
-					continue;
+					int slot = dx12NumShaders + lmIdx;
+
+					if (slot >= DX12_MAX_TEXTURES)
+					{
+						dx12.ri.Printf(PRINT_WARNING, "DX12_LoadWorld: texture registry full at lightmap %d\n", lmIdx);
+						count = lmIdx; // trim batch to what fits
+						dx12World.numLightmaps = count;
+						break;
+					}
+
+					hr = dx12.device->CreateCommittedResource(
+						&defaultHeap, D3D12_HEAP_FLAG_NONE, &texDesc,
+						D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+						IID_PPV_ARGS(&texResources[lmIdx]));
+					if (FAILED(hr))
+					{
+						dx12.ri.Printf(PRINT_WARNING, "DX12_LoadWorld: lightmap[%d] texture alloc failed (0x%08lx)\n", lmIdx, hr);
+						texResources[lmIdx] = NULL;
+						continue;
+					}
+
+					hr = dx12.device->CreateCommittedResource(
+						&uploadHeap, D3D12_HEAP_FLAG_NONE, &upDesc,
+						D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+						IID_PPV_ARGS(&uploadBuffers[lmIdx]));
+					if (FAILED(hr))
+					{
+						dx12.ri.Printf(PRINT_WARNING, "DX12_LoadWorld: lightmap[%d] upload alloc failed (0x%08lx)\n", lmIdx, hr);
+						uploadBuffers[lmIdx] = NULL;
+						texResources[lmIdx]->Release();
+						texResources[lmIdx] = NULL;
+						continue;
+					}
+
+					// Fill upload buffer with RGBA data expanded from RGB
+					{
+						D3D12_RANGE readRange = { 0, 0 };
+						UINT8 *mapped = NULL;
+						int px;
+
+						uploadBuffers[lmIdx]->Map(0, &readRange, (void **)&mapped);
+						if (mapped)
+						{
+							const byte *rgbRow = src + (UINT64)lmIdx * lmSize;
+							for (UINT row = 0; row < (UINT)numRows; row++)
+							{
+								UINT8 *dstRow = mapped + footprint.Offset + (UINT64)row * footprint.Footprint.RowPitch;
+								for (px = 0; px < LIGHTMAP_WIDTH; px++)
+								{
+									int off = (int)row * LIGHTMAP_WIDTH + px;
+									dstRow[px * 4 + 0] = rgbRow[off * 3 + 0];
+									dstRow[px * 4 + 1] = rgbRow[off * 3 + 1];
+									dstRow[px * 4 + 2] = rgbRow[off * 3 + 2];
+									dstRow[px * 4 + 3] = 255;
+								}
+							}
+							uploadBuffers[lmIdx]->Unmap(0, NULL);
+						}
+					}
+				}
+			}
+
+			// ---- Record all copy+barrier commands in ONE upload list ----
+			hr = dx12.uploadCmdAllocator->Reset();
+			if (SUCCEEDED(hr))
+			{
+				hr = dx12.uploadCmdList->Reset(dx12.uploadCmdAllocator, NULL);
+			}
+
+			if (SUCCEEDED(hr))
+			{
+				D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+				UINT64 uploadSize;
+				UINT numRows;
+				UINT64 rowSizeBytes;
+				D3D12_RESOURCE_DESC texDesc2 = {};
+				texDesc2.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+				texDesc2.Width            = LIGHTMAP_WIDTH;
+				texDesc2.Height           = LIGHTMAP_HEIGHT;
+				texDesc2.DepthOrArraySize = 1;
+				texDesc2.MipLevels        = 1;
+				texDesc2.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
+				texDesc2.SampleDesc.Count = 1;
+				texDesc2.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+				dx12.device->GetCopyableFootprints(&texDesc2, 0, 1, 0, &footprint, &numRows, &rowSizeBytes, &uploadSize);
+
+				for (lmIdx = 0; lmIdx < count; lmIdx++)
+				{
+					if (!texResources[lmIdx] || !uploadBuffers[lmIdx])
+					{
+						continue;
+					}
+
+					D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
+					srcLoc.pResource       = uploadBuffers[lmIdx];
+					srcLoc.Type            = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+					srcLoc.PlacedFootprint = footprint;
+
+					D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
+					dstLoc.pResource        = texResources[lmIdx];
+					dstLoc.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+					dstLoc.SubresourceIndex = 0;
+
+					dx12.uploadCmdList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, NULL);
+
+					D3D12_RESOURCE_BARRIER barrier = {};
+					barrier.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+					barrier.Flags                  = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+					barrier.Transition.pResource   = texResources[lmIdx];
+					barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+					barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+					barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+					dx12.uploadCmdList->ResourceBarrier(1, &barrier);
 				}
 
-				snprintf(lmName, sizeof(lmName), "*lightmap%d", i);
-				tex = DX12_CreateTextureFromRGBA(rgba, LIGHTMAP_WIDTH, LIGHTMAP_HEIGHT, slot);
+				dx12.uploadCmdList->Close();
+				ID3D12CommandList *lists[] = { dx12.uploadCmdList };
+				dx12.commandQueue->ExecuteCommandLists(1, lists);
+				DX12_WaitForUpload(dx12.commandQueue);
+			}
+			else
+			{
+				dx12.ri.Printf(PRINT_WARNING, "DX12_LoadWorld: upload command list reset failed (0x%08lx)\n", hr);
+			}
 
-				if (tex.resource)
+			// ---- Create SRVs and register in the texture table ----
+			// Slots are assigned sequentially starting from the pre-batch value of
+			// dx12NumShaders.  The allocation phase already verified that
+			// (dx12NumShaders + count - 1) < DX12_MAX_TEXTURES, so we can safely
+			// increment dx12NumShaders once per lightmap here.
+			{
+				D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+				srvDesc.Format                    = DXGI_FORMAT_R8G8B8A8_UNORM;
+				srvDesc.ViewDimension             = D3D12_SRV_DIMENSION_TEXTURE2D;
+				srvDesc.Shader4ComponentMapping   = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+				srvDesc.Texture2D.MipLevels       = 1;
+				srvDesc.Texture2D.MostDetailedMip = 0;
+
+				for (lmIdx = 0; lmIdx < count; lmIdx++)
 				{
+					if (!texResources[lmIdx])
+					{
+						dx12World.lightmapHandles[lmIdx] = 0;
+						continue;
+					}
+
+					int slot = dx12NumShaders;
+					char lmName[MAX_QPATH];
+
+					snprintf(lmName, sizeof(lmName), "*lightmap%d", lmIdx);
+
+					dx12Texture_t lmTex;
+					Com_Memset(&lmTex, 0, sizeof(lmTex));
+					lmTex.resource  = texResources[lmIdx];
+					lmTex.cpuHandle.ptr = dx12.srvHeap->GetCPUDescriptorHandleForHeapStart().ptr
+					                      + (SIZE_T)slot * dx12.srvDescriptorSize;
+					lmTex.gpuHandle.ptr = dx12.srvHeap->GetGPUDescriptorHandleForHeapStart().ptr
+					                      + (UINT64)slot * dx12.srvDescriptorSize;
+					dx12.device->CreateShaderResourceView(lmTex.resource, &srvDesc, lmTex.cpuHandle);
+
 					Q_strncpyz(dx12Shaders[slot].name, lmName, sizeof(dx12Shaders[slot].name));
 					dx12Shaders[slot].width  = LIGHTMAP_WIDTH;
 					dx12Shaders[slot].height = LIGHTMAP_HEIGHT;
-					dx12Shaders[slot].tex    = tex;
+					dx12Shaders[slot].tex    = lmTex;
 					dx12Shaders[slot].valid  = qtrue;
 					dx12NumShaders++;
-					dx12World.lightmapHandles[i] = (qhandle_t)slot;
-				}
-				else
-				{
-					dx12World.lightmapHandles[i] = 0;
+					dx12World.lightmapHandles[lmIdx] = (qhandle_t)slot;
 				}
 			}
+
+			// ---- Release upload buffers (no longer needed after GPU wait) ----
+			for (lmIdx = 0; lmIdx < count; lmIdx++)
+			{
+				if (uploadBuffers[lmIdx])
+				{
+					uploadBuffers[lmIdx]->Release();
+				}
+			}
+
+			dx12.ri.Free(uploadBuffers);
+			dx12.ri.Free(texResources);
 		}
 
-		dx12.ri.Printf(PRINT_DEVELOPER, "DX12_LoadWorld: uploaded %d lightmaps\n",
-		               dx12World.numLightmaps);
+		lm_batch_done:
+		dx12.ri.Printf(PRINT_DEVELOPER, "DX12_LoadWorld: uploaded %d lightmaps\n", dx12World.numLightmaps);
 	}
 
 	// ----------------------------------------------------------------

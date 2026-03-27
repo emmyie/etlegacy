@@ -69,11 +69,9 @@ static void DX12_WaitForGpu(void)
  */
 static void DX12_MoveToNextFrame( void )
 {
-	static UINT64 fenceValue = 0;
 	HRESULT hr;
+	const UINT64 signalValue = ++dx12.nextFenceValue;
 
-	// Signal and bump the global fence value
-	const UINT64 signalValue = ++fenceValue;
 	hr = dx12.commandQueue->Signal( dx12.fence, signalValue );
 	if ( FAILED( hr ) )
 	{
@@ -81,10 +79,16 @@ static void DX12_MoveToNextFrame( void )
 		return;
 	}
 
-	// Wait until the GPU has completed this value
-	if ( dx12.fence->GetCompletedValue( ) < signalValue )
+	// Save the fence value for this frame slot so BeginFrame can wait on it
+	dx12.fenceValues[dx12.frameIndex] = signalValue;
+
+	// Advance to the next back-buffer
+	dx12.frameIndex = dx12.swapChain->GetCurrentBackBufferIndex( );
+
+	// Wait only if the GPU has not yet finished with the new frame's allocator
+	if ( dx12.fence->GetCompletedValue( ) < dx12.fenceValues[dx12.frameIndex] )
 	{
-		hr = dx12.fence->SetEventOnCompletion( signalValue, dx12.fenceEvent );
+		hr = dx12.fence->SetEventOnCompletion( dx12.fenceValues[dx12.frameIndex], dx12.fenceEvent );
 		if ( FAILED( hr ) )
 		{
 			dx12.ri.Printf( PRINT_WARNING, "R_DX12: MoveToNextFrame SetEventOnCompletion failed (0x%08lx)\n", hr );
@@ -92,9 +96,6 @@ static void DX12_MoveToNextFrame( void )
 		}
 		WaitForSingleObjectEx( dx12.fenceEvent, INFINITE, FALSE );
 	}
-
-	// Now advance to the next backbuffer
-	dx12.frameIndex = dx12.swapChain->GetCurrentBackBufferIndex( );
 }
 
 void DX12_WaitForUpload( ID3D12CommandQueue* queue )
@@ -387,16 +388,22 @@ void DX12_BeginFrame(void)
 
 	// Reset the 2D vertex ring-buffer and batch state for this frame
 	dx12.quadVBOffset = 0;
-	dx12.batch2DCount = 0;
-	dx12.batch2DStart = 0;
-	Com_Memset(&dx12.batch2DTexHandle, 0, sizeof(dx12.batch2DTexHandle));
-	dx12.batch2DTopology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 
 	// Reset scissor to full-screen (use the physical swap-chain rect set at init,
 	// not dx12.vidWidth/vidHeight which may have been overwritten with the game's
 	// virtual resolution by RE_DX12_BeginRegistration).
 	dx12.currentScissor = dx12.scissorRect;
-	dx12.batch2DScissor = dx12.currentScissor;
+
+	// Reset the 2D batch state for the new frame; slot 0 of the SRV heap is
+	// always the white fallback texture, so it is safe to use as the default.
+	dx12.batch2DCount     = 0;
+	dx12.batch2DStart     = 0;
+	dx12.batch2DScissor   = dx12.currentScissor;
+	dx12.batch2DTopology  = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+	if (dx12.srvHeap)
+	{
+		dx12.batch2DTexHandle = dx12.srvHeap->GetGPUDescriptorHandleForHeapStart();
+	}
 
 	dx12.frameOpen = qtrue;
 }
@@ -960,6 +967,7 @@ qboolean R_DX12_Init(void)
 		psoDesc.PrimitiveTopologyType              = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
 		psoDesc.NumRenderTargets                   = 1;
 		psoDesc.RTVFormats[0]                      = DXGI_FORMAT_R8G8B8A8_UNORM;
+		psoDesc.DSVFormat                          = DXGI_FORMAT_D32_FLOAT;
 		psoDesc.SampleDesc.Count                   = 1;
 
 		hr = dx12.device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&dx12.pipelineState));
@@ -1043,7 +1051,9 @@ qboolean R_DX12_Init(void)
 		dx12.ri.Error(ERR_FATAL, "R_DX12_Init: CreateFence failed (0x%08lx)\n", hr);
 		return qfalse;
 	}
-	dx12.fenceValues[dx12.frameIndex] = 1;
+	dx12.nextFenceValue = 0;
+	dx12.fenceValues[0] = 0;
+	dx12.fenceValues[1] = 0;
 
 	dx12.fenceEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
 	if (!dx12.fenceEvent)
@@ -1134,7 +1144,15 @@ void DX12_EndFrame(void)
 	dx12.commandQueue->ExecuteCommandLists(1, ppCommandLists);
 
 	hr = dx12.swapChain->Present(0, 0);
-	if (FAILED(hr))
+	if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET)
+	{
+		// Device was lost – log the reason and mark renderer as uninitialized
+		HRESULT reason = dx12.device ? dx12.device->GetDeviceRemovedReason() : hr;
+		dx12.ri.Printf(PRINT_WARNING,
+		               "R_DX12: device removed during Present (reason 0x%08lx)\n", reason);
+		dx12.initialized = qfalse;
+	}
+	else if (FAILED(hr))
 	{
 		dx12.ri.Printf(PRINT_WARNING, "R_DX12: Present failed (0x%08lx)\n", hr);
 	}

@@ -198,6 +198,7 @@ typedef struct
 	ID3D12Fence *fence;
 	UINT64       fenceValues[DX12_FRAME_COUNT];
 	HANDLE       fenceEvent;
+	UINT64       nextFenceValue;                                            ///< Monotonically increasing fence counter
 
 	// Root signature + PSO
 	ID3D12RootSignature  *rootSignature;
