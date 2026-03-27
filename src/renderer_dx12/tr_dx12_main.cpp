@@ -1234,12 +1234,30 @@ static void RE_DX12_AddLightToScene(const vec3_t org, float radius, float intens
                                      float r, float g, float b, qhandle_t hShader, int flags)
 {
 	dx12DLight_t *dl;
+	cvar_t       *r_dynamicLight;
 
 	(void)hShader; // No material lookup for dlights in the DX12 renderer yet
+
+	// Mirror GL's tr.registered guard – skip if the renderer is not initialised
+	if (!dx12.initialized)
+	{
+		return;
+	}
 
 	if (radius <= 0.0f || intensity <= 0.0f)
 	{
 		return;
+	}
+
+	// Honor r_dynamiclight cvar: non-forced dlights are dropped when it is 0,
+	// exactly as GL's RE_AddLightToScene does.
+	if (!(flags & REF_FORCE_DLIGHT))
+	{
+		r_dynamicLight = dx12.ri.Cvar_Get("r_dynamiclight", "1", CVAR_ARCHIVE);
+		if (r_dynamicLight && r_dynamicLight->integer == 0)
+		{
+			return;
+		}
 	}
 
 	if (dx12Scene.numDLights >= DX12_MAX_DLIGHTS)
@@ -1250,14 +1268,17 @@ static void RE_DX12_AddLightToScene(const vec3_t org, float radius, float intens
 		return;
 	}
 
-	dl            = &dx12Scene.dlights[dx12Scene.numDLights++];
+	dl = &dx12Scene.dlights[dx12Scene.numDLights++];
 	VectorCopy(org, dl->origin);
-	dl->color[0]  = r;
-	dl->color[1]  = g;
-	dl->color[2]  = b;
-	dl->radius    = radius;
-	dl->intensity = intensity;
-	dl->flags     = flags;
+	VectorCopy(org, dl->transformed);
+	dl->radius             = radius;
+	dl->radiusInverseCubed = 1.0f / radius;
+	dl->radiusInverseCubed = dl->radiusInverseCubed * dl->radiusInverseCubed * dl->radiusInverseCubed;
+	dl->intensity          = intensity;
+	dl->color[0]           = r;
+	dl->color[1]           = g;
+	dl->color[2]           = b;
+	dl->flags              = flags;
 }
 
 static void RE_DX12_AddCoronaToScene(const vec3_t org, float r, float g, float b,

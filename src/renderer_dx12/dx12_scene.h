@@ -61,11 +61,13 @@
  */
 typedef struct
 {
-	vec3_t origin;     ///< World-space position
-	vec3_t color;      ///< Normalised RGB [0,1]
-	float  radius;     ///< Influence radius in world units
-	float  intensity;  ///< Light strength (1.0 = fullbright)
-	int    flags;      ///< REF_*_DLIGHT flags
+	vec3_t origin;               ///< World-space position
+	vec3_t transformed;          ///< Origin in local (entity) coordinate system
+	vec3_t color;                ///< Normalised RGB [0,1]
+	float  radius;               ///< Influence radius in world units
+	float  radiusInverseCubed;   ///< 1/(radius^3) – attenuation optimisation, matches GL dlight_t
+	float  intensity;            ///< Light strength (1.0 = fullbright)
+	int    flags;                ///< REF_*_DLIGHT flags
 } dx12DLight_t;
 
 /**
