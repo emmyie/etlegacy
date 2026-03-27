@@ -1314,13 +1314,401 @@ static void RE_DX12_SetFog(int fogvar, int var1, int var2, float r, float g, flo
 	(void)fogvar; (void)var1; (void)var2; (void)r; (void)g; (void)b; (void)density;
 }
 
+// ---------------------------------------------------------------------------
+// RE_DX12_MarkFragments helpers – ported from renderer/tr_marks.c
+// ---------------------------------------------------------------------------
+
+#define DX12_MAX_VERTS_ON_POLY  64
+#define DX12_SIDE_FRONT  0
+#define DX12_SIDE_BACK   1
+#define DX12_SIDE_ON     2
+
+/**
+ * @brief DX12_ChopPolyBehindPlane
+ * @details Port of R_ChopPolyBehindPlane from tr_marks.c.
+ *   Clips the polygon defined by inPoints against the plane (normal, dist),
+ *   writing surviving vertices to outPoints.
+ */
+static void DX12_ChopPolyBehindPlane(int numInPoints, vec3_t inPoints[DX12_MAX_VERTS_ON_POLY],
+                                      int *numOutPoints, vec3_t outPoints[DX12_MAX_VERTS_ON_POLY],
+                                      vec3_t normal, float dist, float epsilon)
+{
+	float dists[DX12_MAX_VERTS_ON_POLY + 4];
+	int   sides[DX12_MAX_VERTS_ON_POLY + 4];
+	int   counts[3];
+	float dot;
+	int   i, j;
+	float *p1, *p2, *clip;
+	float d;
+
+	if (numInPoints >= DX12_MAX_VERTS_ON_POLY - 2)
+	{
+		*numOutPoints = 0;
+		return;
+	}
+
+	counts[0] = counts[1] = counts[2] = 0;
+
+	for (i = 0; i < numInPoints; i++)
+	{
+		dot      = DotProduct(inPoints[i], normal);
+		dot     -= dist;
+		dists[i] = dot;
+		if (dot > epsilon)
+		{
+			sides[i] = DX12_SIDE_FRONT;
+		}
+		else if (dot < -epsilon)
+		{
+			sides[i] = DX12_SIDE_BACK;
+		}
+		else
+		{
+			sides[i] = DX12_SIDE_ON;
+		}
+		counts[sides[i]]++;
+	}
+	sides[i] = sides[0];
+	dists[i] = dists[0];
+
+	*numOutPoints = 0;
+
+	if (!counts[0])
+	{
+		return;
+	}
+	if (!counts[1])
+	{
+		*numOutPoints = numInPoints;
+		Com_Memcpy(outPoints, inPoints, numInPoints * sizeof(vec3_t));
+		return;
+	}
+
+	for (i = 0; i < numInPoints; i++)
+	{
+		p1   = inPoints[i];
+		clip = outPoints[*numOutPoints];
+
+		if (sides[i] == DX12_SIDE_ON)
+		{
+			VectorCopy(p1, clip);
+			(*numOutPoints)++;
+			continue;
+		}
+
+		if (sides[i] == DX12_SIDE_FRONT)
+		{
+			VectorCopy(p1, clip);
+			(*numOutPoints)++;
+			clip = outPoints[*numOutPoints];
+		}
+
+		if (sides[i + 1] == DX12_SIDE_ON || sides[i + 1] == sides[i])
+		{
+			continue;
+		}
+
+		p2 = inPoints[(i + 1) % numInPoints];
+		d  = dists[i] - dists[i + 1];
+		dot = (d == 0.0f) ? 0.0f : dists[i] / d;
+
+		for (j = 0; j < 3; j++)
+		{
+			clip[j] = p1[j] + dot * (p2[j] - p1[j]);
+		}
+		(*numOutPoints)++;
+	}
+}
+
+/**
+ * @brief DX12_AddMarkFragments
+ * @details Port of R_AddMarkFragments from tr_marks.c.
+ *   Clips a triangle against all numPlanes planes and, if any polygon remains,
+ *   appends it to fragmentBuffer.
+ */
+static void DX12_AddMarkFragments(int numClipPoints, vec3_t clipPoints[2][DX12_MAX_VERTS_ON_POLY],
+                                   int numPlanes, vec3_t *normals, float *dists,
+                                   int maxPoints, vec3_t pointBuffer,
+                                   int maxFragments, markFragment_t *fragmentBuffer,
+                                   int *returnedPoints, int *returnedFragments)
+{
+	int            pingPong = 0, i;
+	markFragment_t *mf;
+
+	for (i = 0; i < numPlanes; i++)
+	{
+		DX12_ChopPolyBehindPlane(numClipPoints, clipPoints[pingPong],
+		                         &numClipPoints, clipPoints[!pingPong],
+		                         normals[i], dists[i], 0.5f);
+		pingPong ^= 1;
+		if (numClipPoints == 0)
+		{
+			break;
+		}
+	}
+
+	if (numClipPoints == 0)
+	{
+		return;
+	}
+
+	if (numClipPoints + (*returnedPoints) > maxPoints)
+	{
+		return; // not enough space for this polygon
+	}
+
+	mf             = fragmentBuffer + (*returnedFragments);
+	mf->firstPoint = (*returnedPoints);
+	mf->numPoints  = numClipPoints;
+
+	for (i = 0; i < numClipPoints; i++)
+	{
+		VectorCopy(clipPoints[pingPong][i], (float *)pointBuffer + 5 * (*returnedPoints + i));
+	}
+
+	(*returnedPoints) += numClipPoints;
+	(*returnedFragments)++;
+}
+
 static int RE_DX12_MarkFragments(int numPoints, const vec3_t *points, const vec3_t projection,
                                   int maxPoints, vec3_t pointBuffer, int maxFragments,
                                   markFragment_t *fragmentBuffer)
 {
-	(void)numPoints; (void)points; (void)projection;
-	(void)maxPoints; (void)pointBuffer; (void)maxFragments; (void)fragmentBuffer;
-	return 0;
+	int      i, j, k;
+	int      numPlanes;
+	vec3_t   mins, maxs;
+	int      returnedFragments;
+	int      returnedPoints;
+	vec3_t   normals[DX12_MAX_VERTS_ON_POLY + 2];
+	float    dists[DX12_MAX_VERTS_ON_POLY + 2];
+	vec3_t   clipPoints[2][DX12_MAX_VERTS_ON_POLY];
+	vec3_t   projectionDir;
+	vec3_t   v1, v2;
+	float    radius;
+	vec3_t   center;
+	int      numberPoints = 4;  // caller always passes 4 corner points
+	qboolean oldMapping   = qfalse;
+
+	if (!dx12.initialized || !dx12World.loaded ||
+	    !dx12World.cpuVerts || !dx12World.cpuIndexes || dx12World.numModels < 1)
+	{
+		return 0;
+	}
+
+	// Negative maxFragments signals the new-mapping (per-surface ST) path
+	if (maxFragments < 0)
+	{
+		maxFragments = -maxFragments;
+		oldMapping   = qtrue;
+	}
+
+	// Compute mark centre
+	VectorClear(center);
+	for (i = 0; i < numberPoints; i++)
+	{
+		VectorAdd(points[i], center, center);
+	}
+	VectorScale(center, 1.0f / (float)numberPoints, center);
+
+	radius = VectorNormalize2(projection, projectionDir) / 2.0f;
+
+	// AABB enclosing the projection volume (matches GL R_MarkFragments)
+	ClearBounds(mins, maxs);
+	for (i = 0; i < numberPoints; i++)
+	{
+		vec3_t temp;
+
+		AddPointToBounds(points[i], mins, maxs);
+		VectorMA(points[i], 1 * (1 + (int)oldMapping * radius * 4), projection, temp);
+		AddPointToBounds(temp, mins, maxs);
+		VectorMA(points[i], -20.0f * (1.0f + (float)oldMapping * (radius / 20.0f) * 4.0f), projectionDir, temp);
+		AddPointToBounds(temp, mins, maxs);
+	}
+
+	// Build bounding planes: 4 side planes + near + far
+	for (i = 0; i < numberPoints; i++)
+	{
+		VectorSubtract(points[(i + 1) % numberPoints], points[i], v1);
+		VectorAdd(points[i], projection, v2);
+		VectorSubtract(points[i], v2, v2);
+		CrossProduct(v1, v2, normals[i]);
+		VectorNormalize(normals[i]);
+		dists[i] = DotProduct(normals[i], points[i]);
+	}
+	VectorCopy(projectionDir, normals[numberPoints]);
+	dists[numberPoints] = DotProduct(normals[numberPoints], points[0]) - radius * (1 + (int)oldMapping * 10);
+	VectorCopy(projectionDir, normals[numberPoints + 1]);
+	VectorInverse(normals[numberPoints + 1]);
+	dists[numberPoints + 1] = DotProduct(normals[numberPoints + 1], points[0]) - radius * (1 + (int)oldMapping * 10);
+	numPlanes               = numberPoints + 2;
+
+	returnedPoints    = 0;
+	returnedFragments = 0;
+
+	// Iterate world model[0] draw surfaces (all types are triangle lists in DX12)
+	{
+		const dx12WorldModel_t *wm = &dx12World.models[0];
+
+		for (i = 0; i < wm->numSurfaces; i++)
+		{
+			const dx12DrawSurf_t *ds = &dx12World.drawSurfs[wm->firstSurface + i];
+
+			// Skip non-triangle surfaces (sky, flares) and empty surfaces
+			if (ds->isSky || ds->surfaceType == MST_FLARE || ds->numIndexes < 3)
+			{
+				continue;
+			}
+
+			if (!oldMapping && ds->surfaceType == MST_PLANAR)
+			{
+				// New-mapping path: per-surface axis-based texture coordinate
+				// generation, matching GL's SF_FACE non-oldMapping branch.
+				vec3_t axis[3];
+				vec3_t originalPoints[4];
+				vec3_t newCenter;
+				vec3_t lnormals[DX12_MAX_VERTS_ON_POLY + 2];
+				float  ldists[DX12_MAX_VERTS_ON_POLY + 2];
+				vec3_t lmins, lmaxs;
+				vec3_t surfnormal;
+				float  texCoordScale;
+				float  epsilon = 0.5f;
+				float  dot;
+				int    lnumPlanes;
+
+				// Derive surface normal from the first triangle
+				{
+					const dx12WorldVertex_t *va = &dx12World.cpuVerts[dx12World.cpuIndexes[ds->firstIndex]];
+					const dx12WorldVertex_t *vb = &dx12World.cpuVerts[dx12World.cpuIndexes[ds->firstIndex + 1]];
+					const dx12WorldVertex_t *vc = &dx12World.cpuVerts[dx12World.cpuIndexes[ds->firstIndex + 2]];
+					vec3_t ea, eb;
+
+					VectorSubtract(vb->xyz, va->xyz, ea);
+					VectorSubtract(vc->xyz, va->xyz, eb);
+					CrossProduct(ea, eb, surfnormal);
+					if (VectorNormalize(surfnormal) == 0.0f)
+					{
+						continue;
+					}
+				}
+
+				{
+					float planeDist = DotProduct(surfnormal,
+					                             dx12World.cpuVerts[dx12World.cpuIndexes[ds->firstIndex]].xyz);
+
+					dot = DotProduct(center, surfnormal) - planeDist;
+					if (dot < -epsilon && DotProduct(surfnormal, projectionDir) >= 0.01f)
+					{
+						continue;
+					}
+					if (Q_fabs(dot) > radius)
+					{
+						continue;
+					}
+
+					// Project mark centre onto the surface plane
+					VectorMA(center, -dot, surfnormal, newCenter);
+				}
+
+				// Build local texture axis (matching GL SF_FACE path)
+				VectorNormalize2(surfnormal, axis[0]);
+				PerpendicularVector(axis[1], axis[0]);
+				RotatePointAroundVector(axis[2], axis[0], axis[1], (float)numPoints);
+				CrossProduct(axis[0], axis[2], axis[1]);
+
+				texCoordScale = 0.5f * 1.0f / radius;
+
+				// 4 corners of the oriented decal quad
+				for (j = 0; j < 3; j++)
+				{
+					originalPoints[0][j] = newCenter[j] - radius * axis[1][j] - radius * axis[2][j];
+					originalPoints[1][j] = newCenter[j] + radius * axis[1][j] - radius * axis[2][j];
+					originalPoints[2][j] = newCenter[j] + radius * axis[1][j] + radius * axis[2][j];
+					originalPoints[3][j] = newCenter[j] - radius * axis[1][j] + radius * axis[2][j];
+				}
+
+				ClearBounds(lmins, lmaxs);
+				for (j = 0; j < 4; j++)
+				{
+					AddPointToBounds(originalPoints[j], lmins, lmaxs);
+					VectorSubtract(originalPoints[(j + 1) % numberPoints], originalPoints[j], v1);
+					VectorSubtract(originalPoints[j], surfnormal, v2);
+					VectorSubtract(originalPoints[j], v2, v2);
+					CrossProduct(v1, v2, lnormals[j]);
+					VectorNormalize(lnormals[j]);
+					ldists[j] = DotProduct(lnormals[j], originalPoints[j]);
+				}
+				lnumPlanes = numberPoints;
+
+				for (k = 0; k < ds->numIndexes; k += 3)
+				{
+					int oldNumPoints = returnedPoints;
+
+					for (j = 0; j < 3; j++)
+					{
+						const dx12WorldVertex_t *vtx =
+						    &dx12World.cpuVerts[dx12World.cpuIndexes[ds->firstIndex + k + j]];
+						VectorCopy(vtx->xyz, clipPoints[0][j]);
+					}
+
+					DX12_AddMarkFragments(3, clipPoints,
+					                      lnumPlanes, lnormals, ldists,
+					                      maxPoints, pointBuffer,
+					                      maxFragments, fragmentBuffer,
+					                      &returnedPoints, &returnedFragments);
+
+					if (oldNumPoints != returnedPoints)
+					{
+						vec3_t delta;
+
+						// Flag this fragment as having pre-computed ST coordinates
+						fragmentBuffer[returnedFragments - 1].numPoints *= -1;
+
+						for (j = 0; j < (returnedPoints - oldNumPoints); j++)
+						{
+							VectorSubtract((float *)pointBuffer + 5 * (oldNumPoints + j),
+							               newCenter, delta);
+							*((float *)pointBuffer + 5 * (oldNumPoints + j) + 3) =
+							    0.5f + DotProduct(delta, axis[1]) * texCoordScale;
+							*((float *)pointBuffer + 5 * (oldNumPoints + j) + 4) =
+							    0.5f + DotProduct(delta, axis[2]) * texCoordScale;
+						}
+					}
+
+					if (returnedFragments == maxFragments)
+					{
+						return returnedFragments;
+					}
+				}
+			}
+			else
+			{
+				// Old-mapping path, or non-planar triangle soup: clip each triangle
+				// directly against the original projection planes.
+				for (k = 0; k < ds->numIndexes; k += 3)
+				{
+					for (j = 0; j < 3; j++)
+					{
+						const dx12WorldVertex_t *vtx =
+						    &dx12World.cpuVerts[dx12World.cpuIndexes[ds->firstIndex + k + j]];
+						VectorCopy(vtx->xyz, clipPoints[0][j]);
+					}
+
+					DX12_AddMarkFragments(3, clipPoints,
+					                      numPlanes, normals, dists,
+					                      maxPoints, pointBuffer,
+					                      maxFragments, fragmentBuffer,
+					                      &returnedPoints, &returnedFragments);
+
+					if (returnedFragments == maxFragments)
+					{
+						return returnedFragments;
+					}
+				}
+			}
+		}
+	}
+
+	return returnedFragments;
 }
 
 static void RE_DX12_ProjectDecal(qhandle_t hShader, int numPoints, vec3_t *points,

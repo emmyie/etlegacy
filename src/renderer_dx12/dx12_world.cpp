@@ -405,6 +405,18 @@ void DX12_ShutdownWorld(void)
 		dx12World.lightGridData = NULL;
 	}
 
+	if (dx12World.cpuVerts)
+	{
+		free(dx12World.cpuVerts);
+		dx12World.cpuVerts = NULL;
+	}
+
+	if (dx12World.cpuIndexes)
+	{
+		free(dx12World.cpuIndexes);
+		dx12World.cpuIndexes = NULL;
+	}
+
 	Com_Memset(&dx12World, 0, sizeof(dx12World));
 }
 
@@ -1450,8 +1462,12 @@ patch_overflow:
 			}
 		}
 
-		free(stagingVerts);
-		free(stagingIndexes);
+		// Keep CPU-side copies so RE_DX12_MarkFragments can clip decals against
+		// world triangles.  Ownership transfers to dx12World; freed by DX12_ShutdownWorld.
+		dx12World.cpuVerts      = stagingVerts;
+		dx12World.numCpuVerts   = vtxWrite;
+		dx12World.cpuIndexes    = stagingIndexes;
+		dx12World.numCpuIndexes = idxWrite;
 
 		// ----------------------------------------------------------------
 		// 8.  Submodel lump → dx12WorldModel_t

@@ -232,6 +232,13 @@ typedef struct
 	vec3_t  lightGridInverseSize;   ///< 1/lightGridSize, pre-computed
 	int     lightGridBounds[3];     ///< Cell count along each axis
 
+	// CPU-side copies of the world vertex / index arrays retained for
+	// MarkFragments decal clipping.  Kept alive for the lifetime of the map.
+	dx12WorldVertex_t *cpuVerts;    ///< malloc'd; vertex positions + normals
+	int               *cpuIndexes;  ///< malloc'd; absolute vertex indices
+	int                numCpuVerts; ///< Number of valid entries in cpuVerts
+	int                numCpuIndexes; ///< Number of valid entries in cpuIndexes
+
 	qboolean loaded; ///< qtrue after a successful DX12_LoadWorld() call
 } dx12World_t;
 
