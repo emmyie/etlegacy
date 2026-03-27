@@ -1390,10 +1390,33 @@ void DX12_RenderScene(const refdef_t *fd)
 	//     Switch to the translucent PSO (alpha-blend, no depth-write).
 	//     The draw list is already sorted by the loader, so iterating
 	//     in reverse gives correct painter's-algorithm blending.
+	//
+	//     Entities (section 6) and polys (section 7a) may have rebound
+	//     their own vertex/index buffers, so we must explicitly rebind
+	//     the world VB/IB here before issuing any world draw calls.
 	// ----------------------------------------------------------------
-	if (dx12World.loaded && dx12World.vertexBuffer && dx12World.indexBuffer)
+	if (dx12World.loaded && dx12World.vertexBuffer && dx12World.indexBuffer
+	    && dx12World.numVertices > 0 && dx12World.numIndexes > 0)
 	{
 		int i;
+
+		// Rebind world VB/IB – entity and poly draws above may have changed
+		// the active input assembler buffers.
+		{
+			D3D12_VERTEX_BUFFER_VIEW tvbv = {};
+			D3D12_INDEX_BUFFER_VIEW  tibv = {};
+
+			tvbv.BufferLocation = dx12World.vertexBuffer->GetGPUVirtualAddress();
+			tvbv.SizeInBytes    = dx12World.numVertices * (UINT)sizeof(dx12WorldVertex_t);
+			tvbv.StrideInBytes  = (UINT)sizeof(dx12WorldVertex_t);
+
+			tibv.BufferLocation = dx12World.indexBuffer->GetGPUVirtualAddress();
+			tibv.SizeInBytes    = dx12World.numIndexes * (UINT)sizeof(int);
+			tibv.Format         = DXGI_FORMAT_R32_UINT;
+
+			dx12.commandList->IASetVertexBuffers(0, 1, &tvbv);
+			dx12.commandList->IASetIndexBuffer(&tibv);
+		}
 
 		// Switch to translucent PSO if available
 		if (dx12Scene.pso3DTranslucent)
