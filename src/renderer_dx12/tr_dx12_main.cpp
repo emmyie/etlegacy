@@ -805,12 +805,61 @@ static qhandle_t RE_DX12_RegisterSkin(const char *name)
 
 static qhandle_t RE_DX12_RegisterShader(const char *name)
 {
-	return DX12_RegisterMaterial(name);
+	const char *resolvedName;
+	qhandle_t   h;
+
+	if (!name || !name[0])
+	{
+		return 0;
+	}
+
+	// Apply remap table (set by RE_DX12_RemapShader / BSP loading).
+	resolvedName = DX12_GetRemappedShader(name);
+	if (!resolvedName)
+	{
+		resolvedName = name;
+	}
+
+	h = DX12_RegisterMaterial(resolvedName);
+	if (!h)
+	{
+		// Fallback to "noshader" sentinel, mirroring the GL renderer.
+		h = DX12_RegisterMaterial("noshader");
+	}
+	return h;
 }
 
 static qhandle_t RE_DX12_RegisterShaderNoMip(const char *name)
 {
-	return DX12_RegisterMaterial(name);
+	const char    *resolvedName;
+	qhandle_t      h;
+	dx12Material_t *mat;
+
+	if (!name || !name[0])
+	{
+		return 0;
+	}
+
+	// Apply remap table.
+	resolvedName = DX12_GetRemappedShader(name);
+	if (!resolvedName)
+	{
+		resolvedName = name;
+	}
+
+	h = DX12_RegisterMaterial(resolvedName);
+	if (!h)
+	{
+		h = DX12_RegisterMaterial("noshader");
+	}
+
+	// Mark the material so the upload path can skip mipmap generation.
+	mat = DX12_GetMaterial(h);
+	if (mat)
+	{
+		mat->noMip = qtrue;
+	}
+	return h;
 }
 
 // ---------------------------------------------------------------------------

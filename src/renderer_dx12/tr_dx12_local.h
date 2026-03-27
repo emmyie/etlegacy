@@ -152,6 +152,7 @@ typedef struct
 	qboolean            isFog;         ///< surfaceparm fog
 	qboolean            isTranslucent; ///< surfaceparm trans
 	qboolean            isNodraw;      ///< surfaceparm nodraw
+	qboolean            noMip;         ///< qtrue when mipmaps should be suppressed (RegisterShaderNoMip)
 	qboolean            valid;         ///< qtrue once successfully built
 } dx12Material_t;
 
