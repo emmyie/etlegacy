@@ -334,6 +334,47 @@ static void SCN_DrawSurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDRESS 
 		return;
 	}
 
+	// Guard against out-of-range draw calls that would trigger D3D12 debug
+	// warnings COMMAND_LIST_DRAW_INDEX_BUFFER_TOO_SMALL /
+	// COMMAND_LIST_DRAW_VERTEX_BUFFER_TOO_SMALL.
+	// Both checks are unsigned so a negative firstIndex / firstVertex would
+	// wrap to a huge value and be caught correctly.
+	// A rate-limited developer warning (≤5 per map load) is printed so bugs
+	// in the world builder are visible without flooding the console.
+	if (dx12World.numIndexes > 0
+	    && ((UINT)ds->firstIndex >= dx12World.numIndexes
+	        || (UINT)ds->firstIndex + (UINT)ds->numIndexes > dx12World.numIndexes))
+	{
+		static int ibWarnCount = 0;
+
+		if (ibWarnCount < 5)
+		{
+			ibWarnCount++;
+			dx12.ri.Printf(PRINT_DEVELOPER,
+			               "SCN_DrawSurface: IB overrun – firstIdx %d numIdx %d totalIdx %u (skipped)\n",
+			               ds->firstIndex, ds->numIndexes, dx12World.numIndexes);
+		}
+
+		return;
+	}
+
+	if (dx12World.numVertices > 0
+	    && ((UINT)ds->firstVertex >= dx12World.numVertices
+	        || (UINT)ds->firstVertex + (UINT)ds->numVertices > dx12World.numVertices))
+	{
+		static int vbWarnCount = 0;
+
+		if (vbWarnCount < 5)
+		{
+			vbWarnCount++;
+			dx12.ri.Printf(PRINT_DEVELOPER,
+			               "SCN_DrawSurface: VB overrun – firstVtx %d numVtx %d totalVtx %u (skipped)\n",
+			               ds->firstVertex, ds->numVertices, dx12World.numVertices);
+		}
+
+		return;
+	}
+
 	// --- Bind constant buffer (root CBV at slot 0) ---
 	dx12.commandList->SetGraphicsRootConstantBufferView(0, cbGpuVA);
 

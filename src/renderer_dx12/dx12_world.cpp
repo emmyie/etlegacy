@@ -1088,13 +1088,37 @@ void DX12_LoadWorld(const char *name)
 			bspModelCount = (int)(modelLump->filelen / sizeof(dmodel_t));
 		}
 
-		// Estimate worst-case staging sizes.
-		// Patches can expand: a (w×h) grid produces
-		//   (w-1)/2 * (h-1)/2 * PATCH_LOD² * 6 indices and
-		//   (w-1)/2 * (h-1)/2 * (PATCH_LOD+1)² verts.
-		// We over-estimate to keep the code simple.
-		int maxStagingVerts   = bspVertCount + bspSurfCount * (PATCH_LOD + 1) * (PATCH_LOD + 1);
-		int maxStagingIndexes = bspIndexCount + bspSurfCount * PATCH_LOD * PATCH_LOD * 6;
+		// Pre-scan patch surfaces to compute exact tessellation sizes.
+		// The previous rough estimate (bspSurfCount * (PATCH_LOD+1)²) only
+		// allocated 25 extra vertices per surface regardless of patch size.
+		// A (pw × ph) control-point grid expands to
+		//   numPW = (pw-1)/2, numPH = (ph-1)/2 sub-patches,
+		//   each producing (PATCH_LOD+1)² verts and PATCH_LOD²×6 indices.
+		// For a common 9×9 patch that is 4×4 = 16 sub-patches → 400 verts,
+		// not 25.  The undercount caused goto patch_overflow for most maps.
+		int patchExtraVerts   = 0;
+		int patchExtraIndexes = 0;
+		{
+			int si;
+			int steps = PATCH_LOD;
+
+			for (si = 0; si < bspSurfCount; si++)
+			{
+				if (LittleLong(bspSurfaces[si].surfaceType) == MST_PATCH)
+				{
+					int pw    = LittleLong(bspSurfaces[si].patchWidth);
+					int ph    = LittleLong(bspSurfaces[si].patchHeight);
+					int numPW = (pw > 1) ? ((pw - 1) / 2) : 1;
+					int numPH = (ph > 1) ? ((ph - 1) / 2) : 1;
+
+					patchExtraVerts   += numPW * numPH * (steps + 1) * (steps + 1);
+					patchExtraIndexes += numPW * numPH * steps * steps * 6;
+				}
+			}
+		}
+
+		int maxStagingVerts   = bspVertCount + patchExtraVerts;
+		int maxStagingIndexes = bspIndexCount + patchExtraIndexes;
 
 		dx12WorldVertex_t *stagingVerts   = (dx12WorldVertex_t *)malloc(
 			(size_t)maxStagingVerts * sizeof(dx12WorldVertex_t));
