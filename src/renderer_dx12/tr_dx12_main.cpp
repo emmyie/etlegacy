@@ -2286,6 +2286,52 @@ static qboolean RE_DX12_inPVS(const vec3_t p1, const vec3_t p2)
 
 static void RE_DX12_purgeCache(void)
 {
+	int i;
+
+	if (!dx12.initialized)
+	{
+		return;
+	}
+
+	// ---- 1. Wait for the GPU to finish all outstanding work ----------------
+	// This is required before releasing any D3D12 GPU-backed resources
+	// (textures, model vertex/index buffers) to avoid device removal.
+	DX12_FlushGpu();
+
+	// ---- 2. Purge dynamic shader scripts (CPU-only) ------------------------
+	DX12_PurgeDynamicShaders();
+
+	// ---- 3. Release all texture GPU resources and clear material table -----
+	// Clear materials first (they hold only CPU texture-handle indices).
+	Com_Memset(dx12Materials, 0, sizeof(dx12Materials));
+	dx12NumMaterials = 0;
+
+	// Release D3D12 texture resources, then wipe the registry.
+	// Slots 0 and 1 are the white/black fallback textures; release them too
+	// since DX12_InitTextures() will re-create them below.
+	for (i = 0; i < dx12NumShaders; i++)
+	{
+		if (dx12Shaders[i].valid && dx12Shaders[i].tex.resource)
+		{
+			dx12Shaders[i].tex.resource->Release();
+			dx12Shaders[i].tex.resource = NULL;
+		}
+		dx12Shaders[i].valid = qfalse;
+	}
+	dx12NumShaders = 0;
+
+	// Rebuild the two mandatory fallback entries (white / black).
+	DX12_InitTextures();
+
+	// ---- 4. Release model GPU resources and reset lookup tables ------------
+	DX12_ShutdownModels();
+
+	Com_Memset(dx12ModelNames, 0, sizeof(dx12ModelNames));
+	dx12NumModels = 0;
+
+	// ---- 5. Clear the skin table (CPU-only) --------------------------------
+	Com_Memset(dx12Skins, 0, sizeof(dx12Skins));
+	dx12NumSkins = 0;
 }
 
 static qboolean RE_DX12_LoadDynamicShader(const char *shadername, const char *shadertext)

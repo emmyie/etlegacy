@@ -78,6 +78,22 @@ static void DX12_WaitForGpu(void)
 }
 
 /**
+ * @brief DX12_FlushGpu
+ *
+ * Public thin wrapper around DX12_WaitForGpu so that callers outside this
+ * translation unit (e.g. RE_DX12_purgeCache in tr_dx12_main.cpp) can flush
+ * the GPU pipeline without needing access to the static helper.
+ */
+void DX12_FlushGpu(void)
+{
+	if (!dx12.initialized)
+	{
+		return;
+	}
+	DX12_WaitForGpu();
+}
+
+/**
  * @brief Advance to the next frame, waiting for the GPU if necessary
  */
 static void DX12_MoveToNextFrame( void )

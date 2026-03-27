@@ -294,6 +294,9 @@ void DX12_Flush2DBatch(void);
 qhandle_t       DX12_RegisterMaterial(const char *name);
 dx12Material_t *DX12_GetMaterial(qhandle_t handle);
 
+// Function declarations – GPU synchronisation (tr_dx12_backend.cpp)
+void DX12_FlushGpu(void);
+
 // Function declarations – world geometry (dx12_world.cpp)
 void DX12_LoadWorld(const char *name);
 void DX12_ShutdownWorld(void);
