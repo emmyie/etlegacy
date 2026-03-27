@@ -1309,9 +1309,99 @@ static void RE_DX12_AddCoronaToScene(const vec3_t org, float r, float g, float b
 	cor->visible  = visible;
 }
 
+// ---------------------------------------------------------------------------
+// RE_DX12_SetFog – fog parameter table mirroring GL glfogsettings[]
+// ---------------------------------------------------------------------------
+
+// GL fog-mode / hint constants used only for the glfog_t.mode / .hint fields.
+// Defined here to avoid pulling in OpenGL headers in the DX12 translation unit.
+#ifndef GL_LINEAR
+#define GL_LINEAR    0x2601
+#endif
+#ifndef GL_EXP
+#define GL_EXP       0x0800
+#endif
+#ifndef GL_DONT_CARE
+#define GL_DONT_CARE 0x1100
+#endif
+
+/// Per-fog-slot settings table, matching GL's glfogsettings[NUM_FOGS].
+static glfog_t     dx12FogSettings[NUM_FOGS];
+/// Currently active fog slot (matches GL's glfogNum).
+static glfogType_t dx12FogNum = FOG_NONE;
+
+/**
+ * @brief RE_DX12_SetFog
+ * @details Direct port of R_SetFog (renderer/tr_main.c).
+ *
+ * Two modes:
+ *  - fogvar != FOG_CMD_SWITCHFOG: set parameters for fog slot @c fogvar.
+ *      var1/var2 = near/far (0,0 clears the slot).
+ *      density >= 1  → GL_LINEAR mode (drawsky=false, clearscreen=true).
+ *      density <  1  → GL_EXP   mode (drawsky=true,  clearscreen=false).
+ *  - fogvar == FOG_CMD_SWITCHFOG: activate fog slot @c var1 over @c var2 ms.
+ */
 static void RE_DX12_SetFog(int fogvar, int var1, int var2, float r, float g, float b, float density)
 {
-	(void)fogvar; (void)var1; (void)var2; (void)r; (void)g; (void)b; (void)density;
+	if (fogvar != FOG_CMD_SWITCHFOG)
+	{
+		if (var1 == 0 && var2 == 0)
+		{
+			dx12FogSettings[fogvar].registered = qfalse;
+			return;
+		}
+
+		// identityLight is 1/(1<<overbrightBits).  DX12 has no overbright so use 1.0.
+		dx12FogSettings[fogvar].color[0] = r;
+		dx12FogSettings[fogvar].color[1] = g;
+		dx12FogSettings[fogvar].color[2] = b;
+		dx12FogSettings[fogvar].color[3] = 1.0f;
+		dx12FogSettings[fogvar].start    = (float)var1;
+		dx12FogSettings[fogvar].end      = (float)var2;
+
+		if (density >= 1.0f)
+		{
+			dx12FogSettings[fogvar].mode        = GL_LINEAR;
+			dx12FogSettings[fogvar].drawsky     = qfalse;
+			dx12FogSettings[fogvar].clearscreen = qtrue;
+			dx12FogSettings[fogvar].density     = 1.0f;
+		}
+		else
+		{
+			dx12FogSettings[fogvar].mode        = GL_EXP;
+			dx12FogSettings[fogvar].drawsky     = qtrue;
+			dx12FogSettings[fogvar].clearscreen = qfalse;
+			dx12FogSettings[fogvar].density     = density;
+		}
+
+		dx12FogSettings[fogvar].hint       = GL_DONT_CARE;
+		dx12FogSettings[fogvar].registered = qtrue;
+		return;
+	}
+
+	// FOG_CMD_SWITCHFOG: var1 = target fog slot, var2 = transition ms
+	if (dx12FogSettings[var1].registered != qtrue)
+	{
+		return;
+	}
+
+	dx12FogNum = (glfogType_t)var1;
+
+	// Copy current → LAST, target → TARGET (for transition lerp)
+	if (dx12FogSettings[FOG_CURRENT].registered)
+	{
+		Com_Memcpy(&dx12FogSettings[FOG_LAST], &dx12FogSettings[FOG_CURRENT], sizeof(glfog_t));
+	}
+	else
+	{
+		Com_Memcpy(&dx12FogSettings[FOG_LAST], &dx12FogSettings[FOG_MAP], sizeof(glfog_t));
+	}
+
+	Com_Memcpy(&dx12FogSettings[FOG_TARGET], &dx12FogSettings[dx12FogNum], sizeof(glfog_t));
+
+	// Store transition window (use ri.Milliseconds as the renderer's time source)
+	dx12FogSettings[FOG_TARGET].startTime  = dx12.ri.Milliseconds();
+	dx12FogSettings[FOG_TARGET].finishTime = dx12.ri.Milliseconds() + var2;
 }
 
 // ---------------------------------------------------------------------------
