@@ -686,9 +686,124 @@ static qhandle_t RE_DX12_RegisterModel(const char *name)
 	return (qhandle_t)(slot + 1);
 }
 
+/**
+ * @brief RE_DX12_RegisterModelAllLODs
+ *
+ * Loads the base model and all available LOD variants (_1.md3 .. _3.md3),
+ * mirroring the GL renderer's RE_RegisterModel LOD-loading loop.  Each LOD
+ * variant is registered as an independent model slot so its GPU buffers are
+ * uploaded independently; the per-LOD slot indices are then stored in the
+ * base model's dx12ModelEntry_t.lodSlots[] array for draw-time LOD selection.
+ *
+ * Missing LOD slots are filled by duplicating from the nearest available
+ * level, matching the GL renderer's "duplicate into higher lod spots" fixup.
+ *
+ * Skeletal formats (.mds / .mdx / .mdm) have no per-LOD variants; this
+ * function delegates to RE_DX12_RegisterModel for those extensions.
+ *
+ * @param name  Game-path of the base model file.
+ * @return      Handle for the base model slot, or 0 on failure.
+ */
 static qhandle_t RE_DX12_RegisterModelAllLODs(const char *name)
 {
-	return RE_DX12_RegisterModel(name);
+	int       lod;
+	int       baseSlot;
+	int       numDistinct;
+	qhandle_t lodHandle;
+	char      lodName[MAX_QPATH];
+	char      suffix[32];
+	char     *dot;
+	int       workSlots[MD3_MAX_LODS];
+
+	if (!name || !name[0])
+	{
+		return 0;
+	}
+
+	// Skeletal formats (.mds / .mdx / .mdm) carry their own multi-frame data
+	// and have no per-LOD file variants – fall back to the single-model path.
+	{
+		const char *ext = strrchr(name, '.');
+
+		if (ext && (!Q_stricmp(ext, ".mds") || !Q_stricmp(ext, ".mdx") || !Q_stricmp(ext, ".mdm")))
+		{
+			return RE_DX12_RegisterModel(name);
+		}
+	}
+
+	// Initialise all working LOD slots to "not found".
+	for (lod = 0; lod < MD3_MAX_LODS; lod++)
+	{
+		workSlots[lod] = -1;
+	}
+
+	// Iterate from the lowest-quality LOD (highest index) down to LOD 0,
+	// matching the GL RE_RegisterModel loop direction.
+	// LOD 0 = base file (name unchanged); LOD N > 0 = name_N.md3 variant.
+	for (lod = MD3_MAX_LODS - 1; lod >= 0; lod--)
+	{
+		Q_strncpyz(lodName, name, sizeof(lodName));
+
+		if (lod != 0)
+		{
+			// Strip extension then append _N.md3 suffix.
+			dot = strrchr(lodName, '.');
+			if (dot)
+			{
+				*dot = '\0';
+			}
+			Com_sprintf(suffix, sizeof(suffix), "_%d.md3", lod);
+			Q_strcat(lodName, sizeof(lodName), suffix);
+		}
+
+		lodHandle = RE_DX12_RegisterModel(lodName);
+		if (lodHandle)
+		{
+			workSlots[lod] = (int)(lodHandle - 1);
+		}
+	}
+
+	// LOD 0 (the base model) is mandatory.
+	if (workSlots[0] < 0)
+	{
+		return 0;
+	}
+
+	baseSlot = workSlots[0];
+
+	// Fill missing higher-LOD slots from the next better-quality (lower-index)
+	// one, then fill any remaining gaps from the next lower-quality level.
+	// This mirrors GL's "duplicate into higher lod spots that weren't loaded".
+	for (lod = 1; lod < MD3_MAX_LODS; lod++)
+	{
+		if (workSlots[lod] < 0)
+		{
+			workSlots[lod] = workSlots[lod - 1];
+		}
+	}
+	for (lod = MD3_MAX_LODS - 2; lod >= 0; lod--)
+	{
+		if (workSlots[lod] < 0)
+		{
+			workSlots[lod] = workSlots[lod + 1];
+		}
+	}
+
+	// Count how many slots are genuinely distinct (different GPU data).
+	numDistinct = 1;
+	for (lod = 1; lod < MD3_MAX_LODS; lod++)
+	{
+		if (workSlots[lod] != workSlots[lod - 1])
+		{
+			numDistinct++;
+		}
+	}
+
+	// Store the LOD map and count in the base slot for draw-time use.
+	Com_Memcpy(dx12ModelData[baseSlot].lodSlots, workSlots, MD3_MAX_LODS * sizeof(int));
+	dx12ModelData[baseSlot].numLods = numDistinct;
+
+	return (qhandle_t)(baseSlot + 1);
 }
 
 static qhandle_t RE_DX12_RegisterSkin(const char *name)

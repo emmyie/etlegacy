@@ -117,6 +117,13 @@ typedef struct
 	// Freed by DX12_ShutdownModels.
 	void *rawData;
 	int   rawDataSize;
+
+	// LOD slot map (MD3 only; populated by RE_DX12_RegisterModelAllLODs).
+	// lodSlots[i] is the dx12ModelData[] index (handle - 1) for LOD level i.
+	// After RegisterModelAllLODs all MD3_MAX_LODS entries are valid (≥ 0).
+	// Plain RE_DX12_RegisterModel leaves numLods == 0 and lodSlots zeroed.
+	int numLods;                    ///< Distinct LODs registered (0 unless RegisterModelAllLODs was used)
+	int lodSlots[MD3_MAX_LODS];     ///< Per-LOD data-slot index; –1 when not yet set
 } dx12ModelEntry_t;
 
 /** Parallel to dx12ModelNames[] in tr_dx12_main.cpp. */
