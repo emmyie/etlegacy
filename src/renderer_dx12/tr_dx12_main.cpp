@@ -21,6 +21,63 @@
 dx12Globals_t dx12;
 
 // ---------------------------------------------------------------------------
+// Scratch texture pool – used by RE_DX12_UploadCinematic / DrawStretchRaw
+// ---------------------------------------------------------------------------
+
+/** Maximum cinematic client slots, mirroring the GL renderer's scratchImage[]. */
+#define DX12_MAX_SCRATCH_IMAGES 8
+
+/**
+ * @brief SRV heap slots reserved for scratch textures.
+ *
+ * These occupy the last DX12_MAX_SCRATCH_IMAGES entries of the SRV heap
+ * (indices DX12_MAX_TEXTURES-8 … DX12_MAX_TEXTURES-1).  Regular texture
+ * registration stops well before hitting this range in practice.
+ */
+#define DX12_SCRATCH_SRV_BASE (DX12_MAX_TEXTURES - DX12_MAX_SCRATCH_IMAGES)
+
+/**
+ * @struct dx12ScratchTex_t
+ * @brief One per-client scratch texture slot for cinematic / video frames.
+ */
+typedef struct
+{
+	ID3D12Resource              *resource;  ///< GPU texture resource (or NULL)
+	D3D12_CPU_DESCRIPTOR_HANDLE  cpuHandle; ///< SRV CPU handle in the SRV heap
+	D3D12_GPU_DESCRIPTOR_HANDLE  gpuHandle; ///< SRV GPU handle for binding
+	int                          width;     ///< Current texture width in pixels
+	int                          height;    ///< Current texture height in pixels
+	qboolean                     valid;     ///< qtrue once successfully created
+} dx12ScratchTex_t;
+
+static dx12ScratchTex_t dx12ScratchTex[DX12_MAX_SCRATCH_IMAGES];
+
+// ---------------------------------------------------------------------------
+// Scratch texture cleanup (called from R_DX12_Shutdown in tr_dx12_backend.cpp)
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief DX12_ShutdownScratchTextures
+ *
+ * Releases all GPU resources held by the cinematic scratch texture pool.
+ * Must be called before the D3D12 device is destroyed.
+ */
+void DX12_ShutdownScratchTextures(void)
+{
+	int i;
+
+	for (i = 0; i < DX12_MAX_SCRATCH_IMAGES; i++)
+	{
+		if (dx12ScratchTex[i].resource)
+		{
+			dx12ScratchTex[i].resource->Release();
+			dx12ScratchTex[i].resource = NULL;
+		}
+		dx12ScratchTex[i].valid = qfalse;
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Stub implementations required by refexport_t
 // ---------------------------------------------------------------------------
 
@@ -133,18 +190,132 @@ static void RE_DX12_Add2dPolys(polyVert_t *polys, int numverts, qhandle_t hShade
 	DX12_Add2dPolys(polys, numverts, hShader);
 }
 
-static void RE_DX12_DrawStretchRaw(int x, int y, int w, int h, int cols, int rows,
-                                    const byte *data, int client, qboolean dirty)
-{
-	(void)x; (void)y; (void)w; (void)h;
-	(void)cols; (void)rows; (void)data; (void)client; (void)dirty;
-}
-
 static void RE_DX12_UploadCinematic(int w, int h, int cols, int rows,
                                      const byte *data, int client, qboolean dirty)
 {
-	(void)w; (void)h; (void)cols; (void)rows;
-	(void)data; (void)client; (void)dirty;
+	dx12ScratchTex_t *scratch;
+	int               srvSlot;
+	dx12Texture_t     tex;
+
+	(void)w; (void)h; // w/h are display dimensions, not texture size; use cols/rows
+
+	if (!dx12.initialized || !dx12.device)
+	{
+		return;
+	}
+
+	if (client < 0 || client >= DX12_MAX_SCRATCH_IMAGES)
+	{
+		return;
+	}
+
+	if (!data || cols <= 0 || rows <= 0)
+	{
+		return;
+	}
+
+	scratch = &dx12ScratchTex[client];
+	srvSlot = DX12_SCRATCH_SRV_BASE + client;
+
+	// Nothing to do if the texture is up-to-date
+	if (scratch->valid && !dirty &&
+	    scratch->width == cols && scratch->height == rows)
+	{
+		return;
+	}
+
+	// Release the old GPU resource before (re-)creating the texture
+	if (scratch->resource)
+	{
+		scratch->resource->Release();
+		scratch->resource = NULL;
+		scratch->valid    = qfalse;
+	}
+
+	// Create (or recreate) the scratch texture via the shared upload helper
+	tex = DX12_CreateTextureFromRGBA(data, cols, rows, srvSlot);
+
+	if (tex.resource)
+	{
+		scratch->resource  = tex.resource;
+		scratch->cpuHandle = tex.cpuHandle;
+		scratch->gpuHandle = tex.gpuHandle;
+		scratch->width     = cols;
+		scratch->height    = rows;
+		scratch->valid     = qtrue;
+	}
+	else
+	{
+		dx12.ri.Printf(PRINT_DEVELOPER,
+		               "RE_DX12_UploadCinematic: upload failed for client %d (%dx%d)\n",
+		               client, cols, rows);
+	}
+}
+
+static void RE_DX12_DrawStretchRaw(int x, int y, int w, int h, int cols, int rows,
+                                    const byte *data, int client, qboolean dirty)
+{
+	dx12ScratchTex_t *scratch;
+	float             nx1, ny1, nx2, ny2;
+	float             r, g, b, a;
+	dx12QuadVertex_t  corners[4];
+
+	RE_DX12_UploadCinematic(w, h, cols, rows, data, client, dirty);
+
+	if (!dx12.frameOpen)
+	{
+		return;
+	}
+
+	if (client < 0 || client >= DX12_MAX_SCRATCH_IMAGES)
+	{
+		return;
+	}
+
+	scratch = &dx12ScratchTex[client];
+	if (!scratch->valid)
+	{
+		return;
+	}
+
+	// NDC conversion (matches dx12_poly.cpp's NDC_X / NDC_Y macros)
+	nx1 = ((float)x / (float)dx12.vidWidth) * 2.0f - 1.0f;
+	ny1 = 1.0f - ((float)y / (float)dx12.vidHeight) * 2.0f;
+	nx2 = ((float)(x + w) / (float)dx12.vidWidth) * 2.0f - 1.0f;
+	ny2 = 1.0f - ((float)(y + h) / (float)dx12.vidHeight) * 2.0f;
+
+	r = dx12.color2D[0];
+	g = dx12.color2D[1];
+	b = dx12.color2D[2];
+	a = dx12.color2D[3];
+
+	// TL (top-left)
+	corners[0].pos[0] = nx1; corners[0].pos[1] = ny1;
+	corners[0].uv[0]  = 0.0f; corners[0].uv[1] = 0.0f;
+	corners[0].color[0] = r; corners[0].color[1] = g;
+	corners[0].color[2] = b; corners[0].color[3] = a;
+
+	// TR (top-right)
+	corners[1].pos[0] = nx2; corners[1].pos[1] = ny1;
+	corners[1].uv[0]  = 1.0f; corners[1].uv[1] = 0.0f;
+	corners[1].color[0] = r; corners[1].color[1] = g;
+	corners[1].color[2] = b; corners[1].color[3] = a;
+
+	// BL (bottom-left)
+	corners[2].pos[0] = nx1; corners[2].pos[1] = ny2;
+	corners[2].uv[0]  = 0.0f; corners[2].uv[1] = 1.0f;
+	corners[2].color[0] = r; corners[2].color[1] = g;
+	corners[2].color[2] = b; corners[2].color[3] = a;
+
+	// BR (bottom-right)
+	corners[3].pos[0] = nx2; corners[3].pos[1] = ny2;
+	corners[3].uv[0]  = 1.0f; corners[3].uv[1] = 1.0f;
+	corners[3].color[0] = r; corners[3].color[1] = g;
+	corners[3].color[2] = b; corners[3].color[3] = a;
+
+	DX12_Begin2DBatch(scratch->gpuHandle, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	DX12_AddQuadToBatch(corners);
+	DX12_Flush2DBatch();
 }
 
 static void RE_DX12_BeginFrame(void)
@@ -507,7 +678,62 @@ static qboolean RE_DX12_GetEntityToken(char *buffer, size_t size)
 
 static void RE_DX12_AddPolyBufferToScene(polyBuffer_t *pPolyBuffer)
 {
-	(void)pPolyBuffer;
+	int          i;
+	polyVert_t   tri[3];
+
+	if (!pPolyBuffer || pPolyBuffer->numIndicies < 3)
+	{
+		return;
+	}
+
+	// Decompose indexed triangles into individual 3-vertex polygon calls.
+	// DX12_AddScenePoly accepts any convex polygon; feeding 3 verts gives a
+	// single triangle, which is the primitive unit of a polyBuffer's index list.
+	for (i = 0; i + 2 < pPolyBuffer->numIndicies; i += 3)
+	{
+		unsigned int i0 = pPolyBuffer->indicies[i];
+		unsigned int i1 = pPolyBuffer->indicies[i + 1];
+		unsigned int i2 = pPolyBuffer->indicies[i + 2];
+
+		if (i0 >= (unsigned)pPolyBuffer->numVerts ||
+		    i1 >= (unsigned)pPolyBuffer->numVerts ||
+		    i2 >= (unsigned)pPolyBuffer->numVerts)
+		{
+			continue;
+		}
+
+		tri[0].xyz[0]       = pPolyBuffer->xyz[i0][0];
+		tri[0].xyz[1]       = pPolyBuffer->xyz[i0][1];
+		tri[0].xyz[2]       = pPolyBuffer->xyz[i0][2];
+		tri[0].st[0]        = pPolyBuffer->st[i0][0];
+		tri[0].st[1]        = pPolyBuffer->st[i0][1];
+		tri[0].modulate[0]  = pPolyBuffer->color[i0][0];
+		tri[0].modulate[1]  = pPolyBuffer->color[i0][1];
+		tri[0].modulate[2]  = pPolyBuffer->color[i0][2];
+		tri[0].modulate[3]  = pPolyBuffer->color[i0][3];
+
+		tri[1].xyz[0]       = pPolyBuffer->xyz[i1][0];
+		tri[1].xyz[1]       = pPolyBuffer->xyz[i1][1];
+		tri[1].xyz[2]       = pPolyBuffer->xyz[i1][2];
+		tri[1].st[0]        = pPolyBuffer->st[i1][0];
+		tri[1].st[1]        = pPolyBuffer->st[i1][1];
+		tri[1].modulate[0]  = pPolyBuffer->color[i1][0];
+		tri[1].modulate[1]  = pPolyBuffer->color[i1][1];
+		tri[1].modulate[2]  = pPolyBuffer->color[i1][2];
+		tri[1].modulate[3]  = pPolyBuffer->color[i1][3];
+
+		tri[2].xyz[0]       = pPolyBuffer->xyz[i2][0];
+		tri[2].xyz[1]       = pPolyBuffer->xyz[i2][1];
+		tri[2].xyz[2]       = pPolyBuffer->xyz[i2][2];
+		tri[2].st[0]        = pPolyBuffer->st[i2][0];
+		tri[2].st[1]        = pPolyBuffer->st[i2][1];
+		tri[2].modulate[0]  = pPolyBuffer->color[i2][0];
+		tri[2].modulate[1]  = pPolyBuffer->color[i2][1];
+		tri[2].modulate[2]  = pPolyBuffer->color[i2][2];
+		tri[2].modulate[3]  = pPolyBuffer->color[i2][3];
+
+		DX12_AddScenePoly(pPolyBuffer->shader, 3, tri);
+	}
 }
 
 static void RE_DX12_SetGlobalFog(qboolean restore, int duration, float r, float g, float b, float depthForOpaque)
@@ -517,7 +743,7 @@ static void RE_DX12_SetGlobalFog(qboolean restore, int duration, float r, float 
 
 static qboolean RE_DX12_inPVS(const vec3_t p1, const vec3_t p2)
 {
-	(void)p1; (void)p2; return qfalse;
+	return DX12_inPVS(p1, p2);
 }
 
 static void RE_DX12_purgeCache(void)
@@ -536,11 +762,30 @@ static void RE_DX12_RenderToTexture(int textureid, int x, int y, int w, int h)
 
 static int RE_DX12_GetTextureId(const char *imagename)
 {
-	(void)imagename; return -1;
+	int i;
+
+	if (!imagename || !imagename[0])
+	{
+		return -1;
+	}
+
+	for (i = 0; i < dx12NumShaders; i++)
+	{
+		if (dx12Shaders[i].valid && !Q_stricmp(dx12Shaders[i].name, imagename))
+		{
+			return i;
+		}
+	}
+
+	return -1;
 }
 
 static void RE_DX12_Finish(void)
 {
+	if (dx12.initialized && dx12.commandQueue)
+	{
+		DX12_WaitForUpload(dx12.commandQueue);
+	}
 }
 
 static void RE_DX12_TakeVideoFrame(int h, int w, byte *captureBuffer, byte *encodeBuffer, qboolean motionJpeg)

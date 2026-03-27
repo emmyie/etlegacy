@@ -1239,6 +1239,9 @@ void R_DX12_Shutdown(qboolean destroyWindow)
 	DX12_ShutdownModels();
 	DX12_ShutdownWorld();
 
+	// Release cinematic scratch textures
+	DX12_ShutdownScratchTextures();
+
 	// Release all D3D12 texture resources
 	DX12_ShutdownTextures();
 

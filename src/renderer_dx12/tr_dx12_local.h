@@ -304,6 +304,9 @@ void     DX12_ClearScene(void);
 void     DX12_AddEntityToScene(const refEntity_t *re);
 void     DX12_RenderScene(const refdef_t *fd);
 
+// Function declarations – scratch textures for cinematics (tr_dx12_main.cpp)
+void DX12_ShutdownScratchTextures(void);
+
 
 void DX12_StripExtension( const char* in, char* out, int size );
 int DX12_Stricmp( const char* s1, const char* s2 );
