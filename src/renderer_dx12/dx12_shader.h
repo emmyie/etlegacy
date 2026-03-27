@@ -83,5 +83,20 @@ const char *DX12_GetRemappedShader(const char *name);
  */
 qboolean DX12_RegisterMaterialFromText(const char *name, const char *shadertext);
 
+/**
+ * @brief Copy a sub-region of the current back-buffer render target into a
+ *        DX12 texture slot, (re-)allocating the texture resource if its
+ *        dimensions do not match (w × h).  Mirrors glCopyTexImage2D.
+ *
+ * @param[in,out] entry   Texture registry entry to update.
+ * @param[in]     srvSlot SRV heap slot index for this entry.
+ * @param[in]     x       Left edge of source rectangle (back-buffer coords).
+ * @param[in]     y       Top  edge of source rectangle (back-buffer coords).
+ * @param[in]     w       Width  of the copy region in pixels.
+ * @param[in]     h       Height of the copy region in pixels.
+ */
+void DX12_CopyRenderTargetToTexture(dx12ShaderEntry_t *entry, int srvSlot,
+                                    int x, int y, int w, int h);
+
 #endif // _WIN32
 #endif // DX12_SHADER_H

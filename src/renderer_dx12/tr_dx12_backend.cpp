@@ -93,6 +93,194 @@ void DX12_FlushGpu(void)
 	DX12_WaitForGpu();
 }
 
+// ---------------------------------------------------------------------------
+// DX12_CopyRenderTargetToTexture
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief DX12_CopyRenderTargetToTexture
+ *
+ * Mirrors GL's glCopyTexImage2D: copies the rectangular region
+ * (x, y, x+w, y+h) of the current back-buffer into the DX12 texture
+ * identified by @p entry.  If the texture resource does not yet exist
+ * or its dimensions differ from (w × h) it is (re-)created first.
+ *
+ * Caller must ensure dx12.frameOpen is qtrue (i.e. DX12_BeginFrame has been
+ * called and DX12_EndFrame has not yet been called).
+ *
+ * @param[in,out] entry   Pointer into dx12Shaders[].  entry->tex.resource may
+ *                        be replaced if the dimensions do not match.
+ * @param[in]     srvSlot SRV heap slot for this texture (= index in dx12Shaders[]).
+ * @param[in]     x       Left pixel of the source rectangle in back-buffer coords.
+ * @param[in]     y       Top  pixel of the source rectangle in back-buffer coords.
+ * @param[in]     w       Width  of the rectangle in pixels.
+ * @param[in]     h       Height of the rectangle in pixels.
+ */
+void DX12_CopyRenderTargetToTexture(dx12ShaderEntry_t *entry, int srvSlot,
+                                    int x, int y, int w, int h)
+{
+	D3D12_RESOURCE_BARRIER barriers[2];
+	D3D12_TEXTURE_COPY_LOCATION srcLoc;
+	D3D12_TEXTURE_COPY_LOCATION dstLoc;
+	D3D12_BOX                   srcBox;
+	D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle;
+	D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle;
+	D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc;
+	D3D12_HEAP_PROPERTIES       defaultHeap;
+	D3D12_RESOURCE_DESC         texDesc;
+	HRESULT                     hr;
+	qboolean                    hasDsv;
+
+	if (!dx12.initialized || !dx12.frameOpen)
+	{
+		return;
+	}
+
+	if (w <= 0 || h <= 0)
+	{
+		return;
+	}
+
+	// Flush any pending 2D draw batch so its commands are recorded before the
+	// resource-barrier that transitions the render target away from RTV state.
+	DX12_Flush2D();
+
+	// ---- 1. (Re-)create the texture resource if dimensions changed ----------
+	if (!entry->tex.resource || entry->width != w || entry->height != h)
+	{
+		if (entry->tex.resource)
+		{
+			entry->tex.resource->Release();
+			entry->tex.resource = NULL;
+		}
+
+		Com_Memset(&defaultHeap, 0, sizeof(defaultHeap));
+		defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+		Com_Memset(&texDesc, 0, sizeof(texDesc));
+		texDesc.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+		texDesc.Width            = (UINT)w;
+		texDesc.Height           = (UINT)h;
+		texDesc.DepthOrArraySize = 1;
+		texDesc.MipLevels        = 1;
+		texDesc.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
+		texDesc.SampleDesc.Count = 1;
+		texDesc.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+		texDesc.Flags            = D3D12_RESOURCE_FLAG_NONE;
+
+		// Start in COPY_DEST – we are about to copy into it immediately.
+		hr = dx12.device->CreateCommittedResource(
+			&defaultHeap,
+			D3D12_HEAP_FLAG_NONE,
+			&texDesc,
+			D3D12_RESOURCE_STATE_COPY_DEST,
+			NULL,
+			IID_PPV_ARGS(&entry->tex.resource));
+
+		if (FAILED(hr))
+		{
+			dx12.ri.Printf(PRINT_WARNING,
+			               "DX12_CopyRenderTargetToTexture: CreateCommittedResource failed (0x%08lx)\n",
+			               hr);
+			return;
+		}
+
+		entry->width  = w;
+		entry->height = h;
+
+		// Re-create SRV at the same heap slot.
+		Com_Memset(&srvDesc, 0, sizeof(srvDesc));
+		srvDesc.Format                        = DXGI_FORMAT_R8G8B8A8_UNORM;
+		srvDesc.ViewDimension                 = D3D12_SRV_DIMENSION_TEXTURE2D;
+		srvDesc.Shader4ComponentMapping       = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		srvDesc.Texture2D.MipLevels           = 1;
+		srvDesc.Texture2D.MostDetailedMip     = 0;
+		srvDesc.Texture2D.ResourceMinLODClamp = 0.0f;
+
+		entry->tex.cpuHandle.ptr = dx12.srvHeap->GetCPUDescriptorHandleForHeapStart().ptr
+		                           + (SIZE_T)srvSlot * dx12.srvDescriptorSize;
+		entry->tex.gpuHandle.ptr = dx12.srvHeap->GetGPUDescriptorHandleForHeapStart().ptr
+		                           + (UINT64)srvSlot * dx12.srvDescriptorSize;
+		dx12.device->CreateShaderResourceView(entry->tex.resource, &srvDesc,
+		                                      entry->tex.cpuHandle);
+
+		// Texture is already in COPY_DEST – skip the transition barrier below.
+		goto do_copy;
+	}
+
+	// ---- 2. Transition existing texture: PIXEL_SHADER_RESOURCE → COPY_DEST -
+	Com_Memset(&barriers[0], 0, sizeof(barriers[0]));
+	barriers[0].Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	barriers[0].Transition.pResource   = entry->tex.resource;
+	barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+	barriers[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+	barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	dx12.commandList->ResourceBarrier(1, &barriers[0]);
+
+do_copy:
+	// ---- 3. Transition render target: RENDER_TARGET → COPY_SOURCE ----------
+	Com_Memset(&barriers[0], 0, sizeof(barriers[0]));
+	barriers[0].Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	barriers[0].Transition.pResource   = dx12.renderTargets[dx12.frameIndex];
+	barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	barriers[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	dx12.commandList->ResourceBarrier(1, &barriers[0]);
+
+	// ---- 4. Copy the back-buffer sub-region into the texture ----------------
+	Com_Memset(&srcLoc, 0, sizeof(srcLoc));
+	srcLoc.pResource        = dx12.renderTargets[dx12.frameIndex];
+	srcLoc.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	srcLoc.SubresourceIndex = 0;
+
+	Com_Memset(&dstLoc, 0, sizeof(dstLoc));
+	dstLoc.pResource        = entry->tex.resource;
+	dstLoc.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	dstLoc.SubresourceIndex = 0;
+
+	srcBox.left   = (UINT)x;
+	srcBox.top    = (UINT)y;
+	srcBox.front  = 0;
+	srcBox.right  = (UINT)(x + w);
+	srcBox.bottom = (UINT)(y + h);
+	srcBox.back   = 1;
+
+	dx12.commandList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, &srcBox);
+
+	// ---- 5. Transition both resources back to their rendering states --------
+	Com_Memset(&barriers[0], 0, sizeof(barriers[0]));
+	barriers[0].Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	barriers[0].Transition.pResource   = dx12.renderTargets[dx12.frameIndex];
+	barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	barriers[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+	Com_Memset(&barriers[1], 0, sizeof(barriers[1]));
+	barriers[1].Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	barriers[1].Transition.pResource   = entry->tex.resource;
+	barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+	barriers[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+	barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+	dx12.commandList->ResourceBarrier(2, barriers);
+
+	// ---- 6. Re-bind the render target so subsequent 2D drawing continues ----
+	rtvHandle.ptr = dx12.rtvHeap->GetCPUDescriptorHandleForHeapStart().ptr
+	                + dx12.frameIndex * dx12.rtvDescriptorSize;
+
+	hasDsv = (dx12.dsvHeap && dx12.depthStencil[dx12.frameIndex]) ? qtrue : qfalse;
+	if (hasDsv)
+	{
+		dsvHandle.ptr = dx12.dsvHeap->GetCPUDescriptorHandleForHeapStart().ptr
+		                + dx12.frameIndex * dx12.dsvDescriptorSize;
+		dx12.commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, &dsvHandle);
+	}
+	else
+	{
+		dx12.commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, NULL);
+	}
+}
+
 /**
  * @brief Advance to the next frame, waiting for the GPU if necessary
  */

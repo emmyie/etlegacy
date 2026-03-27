@@ -2416,12 +2416,35 @@ static qboolean RE_DX12_LoadDynamicShader(const char *shadername, const char *sh
 
 static void RE_DX12_RenderToTexture(int textureid, int x, int y, int w, int h)
 {
-	// Full render-to-texture requires a DX12 render target bound to the texture
-	// slot and a separate draw pass – not yet implemented.
-	dx12.ri.Printf(PRINT_DEVELOPER,
-	               "RE_DX12_RenderToTexture: not yet implemented (textureid=%d)\n",
-	               textureid);
-	(void)x; (void)y; (void)w; (void)h;
+	if (!dx12.initialized)
+	{
+		return;
+	}
+
+	if (textureid < 0 || textureid >= dx12NumShaders)
+	{
+		dx12.ri.Printf(PRINT_WARNING,
+		               "RE_DX12_RenderToTexture: textureid %d out of range (numShaders=%d)\n",
+		               textureid, dx12NumShaders);
+		return;
+	}
+
+	if (!dx12Shaders[textureid].valid)
+	{
+		dx12.ri.Printf(PRINT_DEVELOPER,
+		               "RE_DX12_RenderToTexture: textureid %d is not a valid slot\n",
+		               textureid);
+		return;
+	}
+
+	if (!dx12.frameOpen)
+	{
+		dx12.ri.Printf(PRINT_DEVELOPER,
+		               "RE_DX12_RenderToTexture: called outside of a frame\n");
+		return;
+	}
+
+	DX12_CopyRenderTargetToTexture(&dx12Shaders[textureid], textureid, x, y, w, h);
 }
 
 static int RE_DX12_GetTextureId(const char *imagename)
