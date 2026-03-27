@@ -269,6 +269,7 @@ void          DX12_EndFrame(void);
 void          DX12_BeginFrame(void);
 dx12Texture_t DX12_CreateTextureFromRGBA(const byte *data, int width, int height, int srvSlot);
 void          DX12_WaitForUpload(ID3D12CommandQueue *queue);
+qboolean      DX12_ReadbackRenderTarget(byte *rgbOut, int width, int height);
 
 // Function declarations – texture registry (dx12_shader.cpp)
 void      DX12_InitTextures(void);

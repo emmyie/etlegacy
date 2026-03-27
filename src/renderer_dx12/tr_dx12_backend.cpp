@@ -281,6 +281,250 @@ do_copy:
 	}
 }
 
+// ---------------------------------------------------------------------------
+// DX12_ReadbackRenderTarget
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief DX12_ReadbackRenderTarget
+ *
+ * Reads the current back-buffer into @p rgbOut as packed RGB bytes with
+ * 4-byte row padding, matching what glReadPixels(GL_RGB, GL_UNSIGNED_BYTE)
+ * with the default GL_PACK_ALIGNMENT of 4 would produce.  This is what the
+ * engine's AVI capture code expects in its captureBuffer.
+ *
+ * The function:
+ *   1. Flushes any pending 2D draw batch.
+ *   2. Allocates a GPU readback (UPLOAD heap) buffer sized by the D3D12
+ *      copyable footprint of the back-buffer.
+ *   3. Transitions the back-buffer: RENDER_TARGET → COPY_SOURCE.
+ *   4. CopyTextureRegion → readback buffer.
+ *   5. Transitions back-buffer: COPY_SOURCE → RENDER_TARGET and re-binds RTV.
+ *   6. Closes + executes the command list, then waits for the GPU.
+ *   7. Maps the readback buffer, converts RGBA rows to RGB rows (padded to
+ *      4 bytes) into @p rgbOut, then unmaps and releases the readback buffer.
+ *   8. Re-opens the command list (resets allocator + list, restores root sig,
+ *      PSO, viewport, scissor, heap, and RTV bindings) so the caller can
+ *      continue recording draw commands for the rest of the frame.
+ *
+ * @param[out] rgbOut   Caller-supplied buffer; must be at least
+ *                      PAD(width*3, 4) * height bytes.
+ * @param[in]  width    Frame width in pixels.
+ * @param[in]  height   Frame height in pixels.
+ * @return qtrue on success, qfalse on any D3D12 or guard failure.
+ */
+qboolean DX12_ReadbackRenderTarget(byte *rgbOut, int width, int height)
+{
+	D3D12_HEAP_PROPERTIES              readbackHeap;
+	D3D12_RESOURCE_DESC                bufDesc;
+	D3D12_RESOURCE_DESC                rtDesc;
+	D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+	UINT                               numRows;
+	UINT64                             rowSizeBytes;
+	UINT64                             totalBytes;
+	ID3D12Resource                    *readbackBuf;
+	D3D12_RESOURCE_BARRIER             barriers[2];
+	D3D12_TEXTURE_COPY_LOCATION        srcLoc;
+	D3D12_TEXTURE_COPY_LOCATION        dstLoc;
+	D3D12_CPU_DESCRIPTOR_HANDLE        rtvHandle;
+	ID3D12DescriptorHeap              *heaps[1];
+	HRESULT                            hr;
+	UINT64                             readbackRowPitch;
+	int                                row;
+	int                                linelen;
+	int                                padwidth;
+	void                              *mapped;
+	const byte                        *src;
+	byte                              *dst;
+	int                                col;
+	qboolean                           success;
+
+	success = qtrue;
+
+	if (!dx12.initialized || !dx12.frameOpen)
+	{
+		return qfalse;
+	}
+
+	if (!rgbOut || width <= 0 || height <= 0)
+	{
+		return qfalse;
+	}
+
+	// --- 1. Flush 2D batch ------------------------------------------------
+	DX12_Flush2D();
+
+	// --- 2. Allocate readback buffer ----------------------------------------
+	// Determine the D3D12 copyable footprint for the back-buffer's subresource
+	// so we get the correct (256-byte-aligned) row pitch.
+	rtDesc = dx12.renderTargets[dx12.frameIndex]->GetDesc();
+	dx12.device->GetCopyableFootprints(&rtDesc, 0, 1, 0,
+	                                   &footprint, &numRows, &rowSizeBytes, &totalBytes);
+	readbackRowPitch = footprint.Footprint.RowPitch;   // already 256-aligned
+
+	Com_Memset(&readbackHeap, 0, sizeof(readbackHeap));
+	readbackHeap.Type = D3D12_HEAP_TYPE_READBACK;
+
+	Com_Memset(&bufDesc, 0, sizeof(bufDesc));
+	bufDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	bufDesc.Width     = totalBytes;
+	bufDesc.Height    = 1;
+	bufDesc.DepthOrArraySize = 1;
+	bufDesc.MipLevels        = 1;
+	bufDesc.Format           = DXGI_FORMAT_UNKNOWN;
+	bufDesc.SampleDesc.Count = 1;
+	bufDesc.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+	bufDesc.Flags            = D3D12_RESOURCE_FLAG_NONE;
+
+	readbackBuf = NULL;
+	hr = dx12.device->CreateCommittedResource(
+		&readbackHeap,
+		D3D12_HEAP_FLAG_NONE,
+		&bufDesc,
+		D3D12_RESOURCE_STATE_COPY_DEST,
+		NULL,
+		IID_PPV_ARGS(&readbackBuf));
+	if (FAILED(hr))
+	{
+		dx12.ri.Printf(PRINT_WARNING,
+		               "DX12_ReadbackRenderTarget: CreateCommittedResource failed (0x%08lx)\n", hr);
+		return qfalse;
+	}
+
+	// --- 3. Transition back-buffer: RENDER_TARGET → COPY_SOURCE -------------
+	Com_Memset(&barriers[0], 0, sizeof(barriers[0]));
+	barriers[0].Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	barriers[0].Transition.pResource   = dx12.renderTargets[dx12.frameIndex];
+	barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	barriers[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	dx12.commandList->ResourceBarrier(1, &barriers[0]);
+
+	// --- 4. Copy texture → readback buffer -----------------------------------
+	Com_Memset(&srcLoc, 0, sizeof(srcLoc));
+	srcLoc.pResource        = dx12.renderTargets[dx12.frameIndex];
+	srcLoc.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	srcLoc.SubresourceIndex = 0;
+
+	Com_Memset(&dstLoc, 0, sizeof(dstLoc));
+	dstLoc.pResource                          = readbackBuf;
+	dstLoc.Type                               = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+	dstLoc.PlacedFootprint                    = footprint;
+
+	dx12.commandList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, NULL);
+
+	// --- 5. Transition back-buffer: COPY_SOURCE → RENDER_TARGET + rebind ----
+	Com_Memset(&barriers[0], 0, sizeof(barriers[0]));
+	barriers[0].Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	barriers[0].Transition.pResource   = dx12.renderTargets[dx12.frameIndex];
+	barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	barriers[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	dx12.commandList->ResourceBarrier(1, &barriers[0]);
+
+	rtvHandle.ptr = dx12.rtvHeap->GetCPUDescriptorHandleForHeapStart().ptr
+	                + dx12.frameIndex * dx12.rtvDescriptorSize;
+	if (dx12.dsvHeap && dx12.depthStencil[dx12.frameIndex])
+	{
+		D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle;
+
+		dsvHandle.ptr = dx12.dsvHeap->GetCPUDescriptorHandleForHeapStart().ptr
+		                + dx12.frameIndex * dx12.dsvDescriptorSize;
+		dx12.commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, &dsvHandle);
+	}
+	else
+	{
+		dx12.commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, NULL);
+	}
+
+	// --- 6. Execute and wait for GPU -----------------------------------------
+	dx12.commandList->Close();
+	{
+		ID3D12CommandList *lists[] = { dx12.commandList };
+
+		dx12.commandQueue->ExecuteCommandLists(1, lists);
+	}
+	DX12_WaitForUpload(dx12.commandQueue);
+
+	// --- 7. Map, convert RGBA → RGB (padwidth = PAD(width*3, 4)), unmap ------
+	mapped = NULL;
+	{
+		D3D12_RANGE readRange = { 0, (SIZE_T)totalBytes };
+
+		hr = readbackBuf->Map(0, &readRange, &mapped);
+	}
+	if (FAILED(hr) || !mapped)
+	{
+		dx12.ri.Printf(PRINT_WARNING,
+		               "DX12_ReadbackRenderTarget: Map failed (0x%08lx)\n", hr);
+		readbackBuf->Release();
+		readbackBuf = NULL;
+		success = qfalse;
+		// Still need to re-open the command list before returning.
+		goto reopen;
+	}
+
+	linelen  = width * 3;
+	padwidth = (linelen + 3) & ~3;   // PAD(linelen, 4)
+
+	for (row = 0; row < height; row++)
+	{
+		src = (const byte *)mapped + (UINT64)row * readbackRowPitch;
+		dst = rgbOut + (UINT64)row * padwidth;
+		for (col = 0; col < width; col++)
+		{
+			dst[col * 3 + 0] = src[col * 4 + 0];   // R
+			dst[col * 3 + 1] = src[col * 4 + 1];   // G
+			dst[col * 3 + 2] = src[col * 4 + 2];   // B
+			// alpha channel discarded
+		}
+		// zero-pad the row tail (0..3 bytes) so callers don't read garbage
+		if (padwidth > linelen)
+		{
+			Com_Memset(dst + linelen, 0, (size_t)(padwidth - linelen));
+		}
+	}
+
+	{
+		D3D12_RANGE writeRange = { 0, 0 };   // we did not write
+
+		readbackBuf->Unmap(0, &writeRange);
+	}
+	readbackBuf->Release();
+	readbackBuf = NULL;
+
+	// --- 8. Re-open command list (reset allocator + list, restore state) -----
+reopen:
+	{
+		D3D12_CPU_DESCRIPTOR_HANDLE reopenDsv;
+
+		dx12.commandAllocators[dx12.frameIndex]->Reset();
+		dx12.commandList->Reset(dx12.commandAllocators[dx12.frameIndex], dx12.pipelineState);
+
+		// Back-buffer is already in RENDER_TARGET state – no barrier needed.
+		dx12.commandList->SetGraphicsRootSignature(dx12.rootSignature);
+		dx12.commandList->SetPipelineState(dx12.pipelineState);
+		dx12.commandList->RSSetViewports(1, &dx12.viewport);
+		dx12.commandList->RSSetScissorRects(1, &dx12.currentScissor);
+
+		heaps[0] = dx12.srvHeap;
+		dx12.commandList->SetDescriptorHeaps(1, heaps);
+
+		if (dx12.dsvHeap && dx12.depthStencil[dx12.frameIndex])
+		{
+			reopenDsv.ptr = dx12.dsvHeap->GetCPUDescriptorHandleForHeapStart().ptr
+			                + dx12.frameIndex * dx12.dsvDescriptorSize;
+			dx12.commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, &reopenDsv);
+		}
+		else
+		{
+			dx12.commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, NULL);
+		}
+	}
+
+	return success;
+}
+
 /**
  * @brief Advance to the next frame, waiting for the GPU if necessary
  */
