@@ -44,6 +44,8 @@
  *      and flare surfaces.
  *   7. Sorts the draw-surface list for efficient rendering.
  *   8. Parses LUMP_MODELS into dx12WorldModel_t submodel descriptors.
+ *   9. Loads LUMP_LIGHTGRID into dx12World.lightGridData with the same
+ *      colour shift applied by the GL renderer.
  *
  * @note Patch (MST_PATCH) surfaces are tessellated into triangle lists
  *       using simple uniform tessellation at a fixed LOD level.
@@ -397,6 +399,12 @@ void DX12_ShutdownWorld(void)
 		dx12World.novis = NULL;
 	}
 
+	if (dx12World.lightGridData)
+	{
+		free(dx12World.lightGridData);
+		dx12World.lightGridData = NULL;
+	}
+
 	Com_Memset(&dx12World, 0, sizeof(dx12World));
 }
 
@@ -482,6 +490,52 @@ void DX12_LoadWorld(const char *name)
 			dx12World.entityString[0] = '\0';
 		}
 
+		dx12World.entityParsePoint = dx12World.entityString;
+	}
+
+	// Parse the worldspawn entity for "gridsize" so lightgrid geometry is
+	// correct before we load the LUMP_LIGHTGRID data below.
+	// Default to the same values as the GL renderer (64 × 64 × 128 units).
+	{
+		char *p = dx12World.entityString;
+		char *token;
+		char  keyname[MAX_TOKEN_CHARS];
+		char  value[MAX_TOKEN_CHARS];
+
+		dx12World.lightGridSize[0] = 64.0f;
+		dx12World.lightGridSize[1] = 64.0f;
+		dx12World.lightGridSize[2] = 128.0f;
+
+		token = COM_ParseExt(&p, qtrue);
+		if (*token == '{')
+		{
+			while (1)
+			{
+				token = COM_ParseExt(&p, qtrue);
+				if (!*token || *token == '}')
+				{
+					break;
+				}
+				Q_strncpyz(keyname, token, sizeof(keyname));
+
+				token = COM_ParseExt(&p, qtrue);
+				if (!*token || *token == '}')
+				{
+					break;
+				}
+				Q_strncpyz(value, token, sizeof(value));
+
+				if (!Q_stricmp(keyname, "gridsize"))
+				{
+					Q_sscanf(value, "%f %f %f",
+					         &dx12World.lightGridSize[0],
+					         &dx12World.lightGridSize[1],
+					         &dx12World.lightGridSize[2]);
+				}
+			}
+		}
+
+		// Reset the parse point so GetEntityToken works from the beginning
 		dx12World.entityParsePoint = dx12World.entityString;
 	}
 
@@ -1479,6 +1533,106 @@ patch_overflow:
 				}
 
 				free(surfMap);
+			}
+		}
+	}
+
+	// ----------------------------------------------------------------
+	// 9.  Light grid (LUMP_LIGHTGRID) → dx12World.lightGridData
+	// ----------------------------------------------------------------
+	{
+		lump_t *lump = &header->lumps[LUMP_LIGHTGRID];
+
+		if (lump->filelen > 0 && dx12World.numModels > 0)
+		{
+			float *wMins = dx12World.models[0].mins;
+			float *wMaxs = dx12World.models[0].maxs;
+			vec3_t maxs;
+			int    numGridPoints;
+			int    i;
+
+			dx12World.lightGridInverseSize[0] = 1.0f / dx12World.lightGridSize[0];
+			dx12World.lightGridInverseSize[1] = 1.0f / dx12World.lightGridSize[1];
+			dx12World.lightGridInverseSize[2] = 1.0f / dx12World.lightGridSize[2];
+
+			for (i = 0; i < 3; i++)
+			{
+				dx12World.lightGridOrigin[i] = dx12World.lightGridSize[i]
+				                               * ceilf(wMins[i] / dx12World.lightGridSize[i]);
+				maxs[i]                      = dx12World.lightGridSize[i]
+				                               * floorf(wMaxs[i] / dx12World.lightGridSize[i]);
+				dx12World.lightGridBounds[i] = (int)((maxs[i] - dx12World.lightGridOrigin[i])
+				                                     / dx12World.lightGridSize[i]) + 1;
+			}
+
+			numGridPoints = dx12World.lightGridBounds[0]
+			                * dx12World.lightGridBounds[1]
+			                * dx12World.lightGridBounds[2];
+
+			if (lump->filelen != numGridPoints * 8)
+			{
+				dx12.ri.Printf(PRINT_WARNING,
+				               "DX12_LoadWorld: light grid mismatch – expected %d bytes, got %d\n",
+				               numGridPoints * 8, lump->filelen);
+			}
+			else
+			{
+				cvar_t *r_mapOB;
+				int     shift;
+				int     j;
+
+				dx12World.lightGridData = (byte *)malloc((size_t)(numGridPoints * 8));
+
+				if (dx12World.lightGridData)
+				{
+					Com_Memcpy(dx12World.lightGridData, fileBase + lump->fileofs,
+					           (size_t)(numGridPoints * 8));
+
+					// Apply the same overbright colour shift as R_LoadLightGrid in the
+					// GL renderer.  The DX12 renderer has no hardware gamma support so
+					// overbrightBits is 0, matching the software-gamma path in GL.
+					r_mapOB = dx12.ri.Cvar_Get("r_mapOverBrightBits", "2",
+					                            CVAR_ARCHIVE_ND | CVAR_LATCH);
+					shift   = r_mapOB ? r_mapOB->integer : 2;
+
+					for (j = 0; j < numGridPoints; j++)
+					{
+						byte *cell = &dx12World.lightGridData[j * 8];
+						int   k;
+
+						// Ambient RGB (bytes 0–2) and directed RGB (bytes 3–5)
+						for (k = 0; k < 2; k++)
+						{
+							byte *rgb = cell + k * 3;
+							int   r, g, b;
+
+							if (shift >= 0)
+							{
+								r = rgb[0] << shift;
+								g = rgb[1] << shift;
+								b = rgb[2] << shift;
+								if ((r | g | b) > 255)
+								{
+									int mx = r > g ? r : g;
+
+									mx   = mx > b ? mx : b;
+									r    = r * 255 / mx;
+									g    = g * 255 / mx;
+									b    = b * 255 / mx;
+								}
+							}
+							else
+							{
+								r = rgb[0] >> (-shift);
+								g = rgb[1] >> (-shift);
+								b = rgb[2] >> (-shift);
+							}
+							rgb[0] = (byte)r;
+							rgb[1] = (byte)g;
+							rgb[2] = (byte)b;
+						}
+					}
+				}
 			}
 		}
 	}

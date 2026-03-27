@@ -224,6 +224,14 @@ typedef struct
 	float    globalFogDepth;    ///< Depth at which fog is fully opaque (0 = no override)
 	qboolean globalFogActive;   ///< qtrue when a global fog override is in effect
 
+	// Light grid (LUMP_LIGHTGRID).  NULL when the lump is absent or mismatched.
+	// Each cell is 8 bytes: [0..2] ambient RGB, [3..5] directed RGB, [6] lng, [7] lat.
+	byte   *lightGridData;          ///< malloc'd array; freed by DX12_ShutdownWorld
+	vec3_t  lightGridOrigin;        ///< World-space origin of the grid
+	vec3_t  lightGridSize;          ///< Cell spacing (default {64, 64, 128})
+	vec3_t  lightGridInverseSize;   ///< 1/lightGridSize, pre-computed
+	int     lightGridBounds[3];     ///< Cell count along each axis
+
 	qboolean loaded; ///< qtrue after a successful DX12_LoadWorld() call
 } dx12World_t;
 
