@@ -43,8 +43,7 @@
  * GPU data for a given handle.
  */
 
-#ifndef DX12_MODEL_H
-#define DX12_MODEL_H
+#pragma once
 
 #ifdef _WIN32
 
@@ -181,4 +180,3 @@ int DX12_LerpTag(orientation_t *tag, const refEntity_t *refent,
                  const char *tagName, int startIndex);
 
 #endif // _WIN32
-#endif // DX12_MODEL_H
