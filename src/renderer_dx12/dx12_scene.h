@@ -81,6 +81,31 @@ typedef struct
 	qboolean visible;   ///< qtrue when the corona is currently visible
 } dx12Corona_t;
 
+// ---------------------------------------------------------------------------
+// Decal (ProjectDecal / ClearDecals)
+// ---------------------------------------------------------------------------
+
+/** Maximum vertices stored per decal polygon (capped to fit memory budget). */
+#define DX12_MAX_DECAL_VERTS 8
+
+/** Maximum persistent decals queued for rendering before an explicit ClearDecals. */
+#define DX12_MAX_DECALS 128
+
+/**
+ * @struct dx12Decal_t
+ * @brief One world-space decal entry (simplified first-pass: stores the source
+ *        polygon as-is; full BSP-clip projection is a TODO).
+ */
+typedef struct
+{
+	qhandle_t  hShader;                       ///< Material handle
+	polyVert_t verts[DX12_MAX_DECAL_VERTS];   ///< World-space polygon vertices
+	int        numVerts;                       ///< Actual vertex count (≤ DX12_MAX_DECAL_VERTS)
+	float      color[4];                       ///< Tint RGBA [0,1]
+	int        lifeTime;                       ///< Lifetime hint in ms (0 = infinite)
+	int        fadeTime;                       ///< Fade duration in ms
+} dx12Decal_t;
+
 /** Maximum ref-entities buffered between ClearScene and RenderScene. */
 #define DX12_MAX_SCENE_ENTITIES 1024
 
@@ -198,6 +223,10 @@ typedef struct
 	dx12Corona_t coronas[DX12_MAX_CORONAS]; ///< Corona list
 	int          numCoronas;                ///< Active corona count
 
+	// Persistent decal list – cleared only by DX12_ClearDecals(), NOT by DX12_ClearScene()
+	dx12Decal_t decals[DX12_MAX_DECALS]; ///< Decal polygon list
+	int         numDecals;               ///< Active decal count
+
 	qboolean initialized; ///< qtrue after DX12_SceneInit()
 } dx12SceneState_t;
 
@@ -241,6 +270,28 @@ void DX12_ClearScene(void);
  * @param verts     Polygon vertices in world space (polyVert_t format).
  */
 void DX12_AddScenePoly(qhandle_t hShader, int numVerts, const polyVert_t *verts);
+
+/**
+ * @brief DX12_AddDecalToScene – store a world-space decal polygon for persistent rendering.
+ *
+ * Decals are NOT cleared by DX12_ClearScene().  Call DX12_ClearDecals() explicitly
+ * (e.g. on map load) to remove all active decals.
+ *
+ * @param hShader   Material handle for the decal.
+ * @param numVerts  Source polygon vertex count (clamped to DX12_MAX_DECAL_VERTS).
+ * @param points    World-space polygon corners (vec3_t*).
+ * @param color     Decal tint colour (RGBA, [0,1]).
+ * @param lifeTime  Life hint in ms (0 = infinite).
+ * @param fadeTime  Fade duration in ms.
+ */
+void DX12_AddDecalToScene(qhandle_t hShader, int numVerts, vec3_t *points,
+                          const float *color, int lifeTime, int fadeTime);
+
+/**
+ * @brief DX12_ClearDecals – remove all persistent decals.
+ * Called by RE_DX12_ClearDecals; safe to call at any time.
+ */
+void DX12_ClearDecals(void);
 
 /**
  * @brief DX12_RenderScene – render a full 3D scene.

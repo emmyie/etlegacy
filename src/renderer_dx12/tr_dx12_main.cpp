@@ -22,6 +22,40 @@
 dx12Globals_t dx12;
 
 // ---------------------------------------------------------------------------
+// Dynamic shader list  (populated by RE_DX12_LoadDynamicShader)
+// ---------------------------------------------------------------------------
+
+/**
+ * @struct dx12DynShader_t
+ * @brief Linked-list node for a runtime-loaded shader text block.
+ *        Mirrors GL's dynamicshader_t.
+ */
+typedef struct dx12DynShader_s
+{
+	char                   name[MAX_QPATH]; ///< Shader name (cache key)
+	char                  *shadertext;      ///< Heap-allocated shader text
+	struct dx12DynShader_s *next;
+} dx12DynShader_t;
+
+/** Head of the dynamic shader list.  NULL when the list is empty. */
+static dx12DynShader_t *s_dynShaderHead = NULL;
+
+/** Purge all entries from the dynamic shader list and free their memory. */
+static void DX12_PurgeDynamicShaders(void)
+{
+	dx12DynShader_t *cur = s_dynShaderHead;
+
+	while (cur)
+	{
+		dx12DynShader_t *next = cur->next;
+		dx12.ri.Free(cur->shadertext);
+		dx12.ri.Free(cur);
+		cur = next;
+	}
+	s_dynShaderHead = NULL;
+}
+
+// ---------------------------------------------------------------------------
 // Scratch texture pool – used by RE_DX12_UploadCinematic / DrawStretchRaw
 // ---------------------------------------------------------------------------
 
@@ -1084,12 +1118,18 @@ static int RE_DX12_MarkFragments(int numPoints, const vec3_t *points, const vec3
 static void RE_DX12_ProjectDecal(qhandle_t hShader, int numPoints, vec3_t *points,
                                   vec4_t projection, vec4_t color, int lifeTime, int fadeTime)
 {
-	(void)hShader; (void)numPoints; (void)points;
-	(void)projection; (void)color; (void)lifeTime; (void)fadeTime;
+	// Simplified first-pass: store the source polygon directly.  Full BSP-clip
+	// projection geometry is a TODO (the GL implementation clips world triangles
+	// against the projection volume; here we just feed the footprint polygon).
+	(void)projection;
+	DX12_AddDecalToScene(hShader, numPoints, points,
+	                     color ? (const float *)color : NULL,
+	                     lifeTime, fadeTime);
 }
 
 static void RE_DX12_ClearDecals(void)
 {
+	DX12_ClearDecals();
 }
 
 static int RE_DX12_LerpTag(orientation_t *tag, const refEntity_t *refent,
@@ -1116,18 +1156,51 @@ static void RE_DX12_ModelBounds(qhandle_t model, vec3_t mins, vec3_t maxs)
 
 static void RE_DX12_RemapShader(const char *oldShader, const char *newShader, const char *offsetTime)
 {
-	(void)oldShader; (void)newShader; (void)offsetTime;
+	float timeOffset = offsetTime ? (float)atof(offsetTime) : 0.0f;
+
+	DX12_AddShaderRemap(oldShader, newShader, timeOffset);
 }
 
 static void RE_DX12_DrawDebugPolygon(int color, int numpoints, float *points)
 {
-	(void)color; (void)numpoints; (void)points;
+	polyVert_t verts[64];
+	int        i;
+	byte       r, g, b;
+
+	if (!points || numpoints < 3 || numpoints > 64)
+	{
+		return;
+	}
+
+	// Decode packed 3-bit colour (bit 0=R, bit 1=G, bit 2=B) matching GL renderer.
+	r = (color & 1)       ? 255 : 0;
+	g = ((color >> 1) & 1) ? 255 : 0;
+	b = ((color >> 2) & 1) ? 255 : 0;
+
+	for (i = 0; i < numpoints; i++)
+	{
+		verts[i].xyz[0]      = points[i * 3 + 0];
+		verts[i].xyz[1]      = points[i * 3 + 1];
+		verts[i].xyz[2]      = points[i * 3 + 2];
+		verts[i].st[0]       = 0.0f;
+		verts[i].st[1]       = 0.0f;
+		verts[i].modulate[0] = r;
+		verts[i].modulate[1] = g;
+		verts[i].modulate[2] = b;
+		verts[i].modulate[3] = 255;
+	}
+
+	// Route through the poly system using the __white__ texture (handle 0).
+	DX12_AddScenePoly(0, numpoints, verts);
 }
 
 static void RE_DX12_DrawDebugText(const vec3_t org, float r, float g, float b,
                                    const char *text, qboolean neverOcclude)
 {
-	(void)org; (void)r; (void)g; (void)b; (void)text; (void)neverOcclude;
+	// Mirrors the GL renderer which is also unimplemented (prints a TODO).
+	(void)org; (void)r; (void)g; (void)b; (void)neverOcclude;
+	dx12.ri.Printf(PRINT_DEVELOPER, "TODO: RE_DX12_DrawDebugText – text: %s\n",
+	               text ? text : "(null)");
 }
 
 static qboolean RE_DX12_GetEntityToken(char *buffer, size_t size)
@@ -1207,7 +1280,28 @@ static void RE_DX12_AddPolyBufferToScene(polyBuffer_t *pPolyBuffer)
 
 static void RE_DX12_SetGlobalFog(qboolean restore, int duration, float r, float g, float b, float depthForOpaque)
 {
-	(void)restore; (void)duration; (void)r; (void)g; (void)b; (void)depthForOpaque;
+	// Store fog parameters in dx12World for consumption by shaders.
+	// The `restore` flag would restore the original BSP fog; full transition
+	// interpolation over `duration` is a TODO (mirrors GL's tcScale etc.).
+	(void)duration;
+
+	if (restore)
+	{
+		// Reset to no override; shaders revert to BSP-defined fog.
+		dx12World.globalFogActive  = qfalse;
+		dx12World.globalFogDepth   = 0.0f;
+		dx12World.globalFogColor[0] = 0.0f;
+		dx12World.globalFogColor[1] = 0.0f;
+		dx12World.globalFogColor[2] = 0.0f;
+	}
+	else
+	{
+		dx12World.globalFogColor[0] = r;
+		dx12World.globalFogColor[1] = g;
+		dx12World.globalFogColor[2] = b;
+		dx12World.globalFogDepth    = depthForOpaque < 1.0f ? 1.0f : depthForOpaque;
+		dx12World.globalFogActive   = qtrue;
+	}
 }
 
 static qboolean RE_DX12_inPVS(const vec3_t p1, const vec3_t p2)
@@ -1221,12 +1315,92 @@ static void RE_DX12_purgeCache(void)
 
 static qboolean RE_DX12_LoadDynamicShader(const char *shadername, const char *shadertext)
 {
-	(void)shadername; (void)shadertext; return qfalse;
+	dx12DynShader_t *cur, *prev, *node;
+	size_t           textLen;
+
+	// NULL name + NULL text → purge all dynamic shaders (mirrors GL RE_LoadDynamicShader)
+	if (!shadername && !shadertext)
+	{
+		DX12_PurgeDynamicShaders();
+		return qtrue;
+	}
+
+	if (shadername && strlen(shadername) >= MAX_QPATH)
+	{
+		dx12.ri.Printf(PRINT_WARNING,
+		               "RE_DX12_LoadDynamicShader: shadername '%s' exceeds MAX_QPATH\n",
+		               shadername);
+		return qfalse;
+	}
+
+	// NULL text with valid name → remove this specific dynamic shader
+	if (shadername && !shadertext)
+	{
+		prev = NULL;
+		cur  = s_dynShaderHead;
+		while (cur)
+		{
+			if (!Q_stricmp(cur->name, shadername))
+			{
+				if (prev)
+				{
+					prev->next = cur->next;
+				}
+				else
+				{
+					s_dynShaderHead = cur->next;
+				}
+				dx12.ri.Free(cur->shadertext);
+				dx12.ri.Free(cur);
+				return qtrue;
+			}
+			prev = cur;
+			cur  = cur->next;
+		}
+		return qtrue; // not found; not an error
+	}
+
+	if (!shadername || !shadertext || !shadertext[0])
+	{
+		dx12.ri.Printf(PRINT_WARNING,
+		               "RE_DX12_LoadDynamicShader: missing shadername or shadertext\n");
+		return qfalse;
+	}
+
+	// Reject duplicate names
+	for (cur = s_dynShaderHead; cur; cur = cur->next)
+	{
+		if (!Q_stricmp(cur->name, shadername))
+		{
+			dx12.ri.Printf(PRINT_WARNING,
+			               "RE_DX12_LoadDynamicShader: shader '%s' already exists\n",
+			               shadername);
+			return qfalse;
+		}
+	}
+
+	// Allocate and store the new dynamic shader node.
+	node = (dx12DynShader_t *)dx12.ri.Z_Malloc(sizeof(*node));
+	Q_strncpyz(node->name, shadername, sizeof(node->name));
+
+	textLen         = strlen(shadertext);
+	node->shadertext = (char *)dx12.ri.Z_Malloc((int)textLen + 1);
+	Q_strncpyz(node->shadertext, shadertext, (int)textLen + 1);
+	node->next = s_dynShaderHead;
+	s_dynShaderHead = node;
+
+	// Eagerly register the material so callers can immediately use it.
+	return DX12_RegisterMaterialFromText(shadername, shadertext);
 }
 
 static void RE_DX12_RenderToTexture(int textureid, int x, int y, int w, int h)
 {
-	(void)textureid; (void)x; (void)y; (void)w; (void)h;
+	// Full render-to-texture requires a DX12 render target bound to the texture
+	// slot and a separate draw pass – not yet implemented.
+	dx12.ri.Printf(PRINT_DEVELOPER,
+	               "RE_DX12_RenderToTexture: not yet implemented (textureid=%d)\n",
+	               textureid);
+	(void)x; (void)y; (void)w; (void)h;
 }
 
 static int RE_DX12_GetTextureId(const char *imagename)

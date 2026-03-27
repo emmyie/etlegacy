@@ -1448,4 +1448,77 @@ void DX12_RenderScene(const refdef_t *fd)
 	dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 }
 
+// ---------------------------------------------------------------------------
+// DX12_AddDecalToScene / DX12_ClearDecals
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief DX12_AddDecalToScene – store a world-space decal for persistent rendering.
+ *
+ * Simplified first-pass: stores the source polygon vertices directly without
+ * projecting them onto BSP geometry.  The decal is submitted as a poly batch
+ * during each DX12_RenderScene call until DX12_ClearDecals() is called.
+ */
+void DX12_AddDecalToScene(qhandle_t hShader, int numVerts, vec3_t *points,
+                          const float *color, int lifeTime, int fadeTime)
+{
+	dx12Decal_t *dec;
+	int          i;
+	int          clampedVerts;
+
+	if (!points || numVerts < 3)
+	{
+		return;
+	}
+
+	if (dx12Scene.numDecals >= DX12_MAX_DECALS)
+	{
+		dx12.ri.Printf(PRINT_DEVELOPER,
+		               "DX12_AddDecalToScene: dropping decal, reached MAX_DECALS (%d)\n",
+		               DX12_MAX_DECALS);
+		return;
+	}
+
+	clampedVerts = numVerts < DX12_MAX_DECAL_VERTS ? numVerts : DX12_MAX_DECAL_VERTS;
+
+	dec           = &dx12Scene.decals[dx12Scene.numDecals++];
+	dec->hShader  = hShader;
+	dec->numVerts = clampedVerts;
+	dec->lifeTime = lifeTime;
+	dec->fadeTime = fadeTime;
+
+	if (color)
+	{
+		dec->color[0] = color[0];
+		dec->color[1] = color[1];
+		dec->color[2] = color[2];
+		dec->color[3] = color[3];
+	}
+	else
+	{
+		dec->color[0] = dec->color[1] = dec->color[2] = dec->color[3] = 1.0f;
+	}
+
+	for (i = 0; i < clampedVerts; i++)
+	{
+		dec->verts[i].xyz[0] = points[i][0];
+		dec->verts[i].xyz[1] = points[i][1];
+		dec->verts[i].xyz[2] = points[i][2];
+		dec->verts[i].st[0]  = (float)i / (float)(clampedVerts - 1);
+		dec->verts[i].st[1]  = 0.5f;
+		dec->verts[i].modulate[0] = (byte)(dec->color[0] * 255.0f);
+		dec->verts[i].modulate[1] = (byte)(dec->color[1] * 255.0f);
+		dec->verts[i].modulate[2] = (byte)(dec->color[2] * 255.0f);
+		dec->verts[i].modulate[3] = (byte)(dec->color[3] * 255.0f);
+	}
+}
+
+/**
+ * @brief DX12_ClearDecals – remove all persistent decals (called by RE_DX12_ClearDecals).
+ */
+void DX12_ClearDecals(void)
+{
+	dx12Scene.numDecals = 0;
+}
+
 #endif // _WIN32

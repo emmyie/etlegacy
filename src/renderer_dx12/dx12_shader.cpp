@@ -34,6 +34,85 @@ dx12Material_t dx12Materials[DX12_MAX_MATERIALS];
 int            dx12NumMaterials = 0;
 
 // ---------------------------------------------------------------------------
+// Shader remap table
+// ---------------------------------------------------------------------------
+
+dx12ShaderRemap_t dx12ShaderRemaps[DX12_MAX_SHADER_REMAPS];
+int               dx12NumShaderRemaps = 0;
+
+/**
+ * @brief Add or update a shader remap entry.
+ */
+void DX12_AddShaderRemap(const char *oldName, const char *newName, float timeOffset)
+{
+	int i;
+	char strippedOld[MAX_QPATH];
+	char strippedNew[MAX_QPATH];
+
+	if (!oldName || !oldName[0] || !newName || !newName[0])
+	{
+		return;
+	}
+
+	COM_StripExtension(oldName, strippedOld, sizeof(strippedOld));
+	COM_StripExtension(newName, strippedNew, sizeof(strippedNew));
+
+	// Update existing entry if old name matches
+	for (i = 0; i < dx12NumShaderRemaps; i++)
+	{
+		if (dx12ShaderRemaps[i].active &&
+		    !DX12_Stricmp(dx12ShaderRemaps[i].oldName, strippedOld))
+		{
+			Q_strncpyz(dx12ShaderRemaps[i].newName, strippedNew,
+			           sizeof(dx12ShaderRemaps[i].newName));
+			dx12ShaderRemaps[i].timeOffset = timeOffset;
+			return;
+		}
+	}
+
+	if (dx12NumShaderRemaps >= DX12_MAX_SHADER_REMAPS)
+	{
+		dx12.ri.Printf(PRINT_WARNING, "DX12_AddShaderRemap: remap table full\n");
+		return;
+	}
+
+	Q_strncpyz(dx12ShaderRemaps[dx12NumShaderRemaps].oldName, strippedOld,
+	           sizeof(dx12ShaderRemaps[0].oldName));
+	Q_strncpyz(dx12ShaderRemaps[dx12NumShaderRemaps].newName, strippedNew,
+	           sizeof(dx12ShaderRemaps[0].newName));
+	dx12ShaderRemaps[dx12NumShaderRemaps].timeOffset = timeOffset;
+	dx12ShaderRemaps[dx12NumShaderRemaps].active     = qtrue;
+	dx12NumShaderRemaps++;
+}
+
+/**
+ * @brief Look up the remap table for @p name.
+ * @return The remapped name, or NULL if no remap found.
+ */
+const char *DX12_GetRemappedShader(const char *name)
+{
+	int  i;
+	char stripped[MAX_QPATH];
+
+	if (!name || !name[0])
+	{
+		return NULL;
+	}
+
+	COM_StripExtension(name, stripped, sizeof(stripped));
+
+	for (i = 0; i < dx12NumShaderRemaps; i++)
+	{
+		if (dx12ShaderRemaps[i].active &&
+		    !DX12_Stricmp(dx12ShaderRemaps[i].oldName, stripped))
+		{
+			return dx12ShaderRemaps[i].newName;
+		}
+	}
+	return NULL;
+}
+
+// ---------------------------------------------------------------------------
 // One-time "missing asset" warning deduplication.
 // Prevents thousands of repeated "could not load" / "could not resolve"
 // messages when the same texture or material name fails on every frame that
@@ -1180,16 +1259,24 @@ qhandle_t DX12_RegisterMaterial(const char *name)
 	int            i;
 	int            slot;
 	dx12Material_t mat;
+	const char    *resolvedName;
 
 	if (!name || !name[0])
 	{
 		return 0;
 	}
 
+	// Apply shader remap table (mirrors GL's r_remappedShader path).
+	resolvedName = DX12_GetRemappedShader(name);
+	if (!resolvedName)
+	{
+		resolvedName = name;
+	}
+
 	// Deduplicate: return existing handle if already cached
 	for (i = 0; i < dx12NumMaterials; i++)
 	{
-		if (dx12Materials[i].valid && !DX12_Stricmp(dx12Materials[i].name, name))
+		if (dx12Materials[i].valid && !DX12_Stricmp(dx12Materials[i].name, resolvedName))
 		{
 			return (qhandle_t)(DX12_MATERIAL_HANDLE_BASE + i);
 		}
@@ -1204,22 +1291,22 @@ qhandle_t DX12_RegisterMaterial(const char *name)
 	Com_Memset(&mat, 0, sizeof(mat));
 
 	// Try to parse a full material from .shader script files
-	if (!DX12_FindMaterialScript(name, &mat))
+	if (!DX12_FindMaterialScript(resolvedName, &mat))
 	{
 		// Fall back: treat the name as a plain image path and build a 1-stage material
-		qhandle_t texHandle = DX12_RegisterTexture(name);
+		qhandle_t texHandle = DX12_RegisterTexture(resolvedName);
 
 		if (!texHandle)
 		{
-			if (SHD_WarnOnce(name))
+			if (SHD_WarnOnce(resolvedName))
 			{
 				dx12.ri.Printf(PRINT_DEVELOPER,
-				               "DX12_RegisterMaterial: could not resolve '%s'\n", name);
+				               "DX12_RegisterMaterial: could not resolve '%s'\n", resolvedName);
 			}
 			return 0;
 		}
 
-		Q_strncpyz(mat.name, name, sizeof(mat.name));
+		Q_strncpyz(mat.name, resolvedName, sizeof(mat.name));
 		mat.stages[0].active   = qtrue;
 		mat.stages[0].texHandle = texHandle;
 		mat.stages[0].srcBlend = D3D12_BLEND_ONE;
@@ -1231,7 +1318,7 @@ qhandle_t DX12_RegisterMaterial(const char *name)
 	{
 		dx12.ri.Printf(PRINT_DEVELOPER,
 		               "DX12_RegisterMaterial: parsed shader '%s' (%d stage(s))\n",
-		               name, mat.numStages);
+		               resolvedName, mat.numStages);
 	}
 
 	slot              = dx12NumMaterials;
@@ -1239,6 +1326,66 @@ qhandle_t DX12_RegisterMaterial(const char *name)
 	dx12NumMaterials++;
 
 	return (qhandle_t)(DX12_MATERIAL_HANDLE_BASE + slot);
+}
+
+// ---------------------------------------------------------------------------
+// DX12_RegisterMaterialFromText
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Parse a shader block from an in-memory text buffer and register it
+ *        as a DX12 material.  Used by RE_DX12_LoadDynamicShader.
+ *
+ * @param[in] name        Shader name (cache key).
+ * @param[in] shadertext  Full shader script text.
+ * @return qtrue on success, qfalse on parse failure or cache overflow.
+ */
+qboolean DX12_RegisterMaterialFromText(const char *name, const char *shadertext)
+{
+	dx12Material_t mat;
+	int            slot;
+
+	if (!name || !name[0] || !shadertext || !shadertext[0])
+	{
+		return qfalse;
+	}
+
+	if (dx12NumMaterials >= DX12_MAX_MATERIALS)
+	{
+		dx12.ri.Printf(PRINT_WARNING, "DX12_RegisterMaterialFromText: material cache full\n");
+		return qfalse;
+	}
+
+	Com_Memset(&mat, 0, sizeof(mat));
+
+	if (!SH_ParseMaterialInBuffer(shadertext, (int)strlen(shadertext), name, &mat))
+	{
+		dx12.ri.Printf(PRINT_DEVELOPER,
+		               "DX12_RegisterMaterialFromText: failed to parse shader '%s'\n", name);
+		return qfalse;
+	}
+
+	// Deduplicate: update existing entry if already cached
+	{
+		int i;
+		for (i = 0; i < dx12NumMaterials; i++)
+		{
+			if (dx12Materials[i].valid && !DX12_Stricmp(dx12Materials[i].name, name))
+			{
+				dx12Materials[i] = mat;
+				return qtrue;
+			}
+		}
+	}
+
+	slot                = dx12NumMaterials;
+	dx12Materials[slot] = mat;
+	dx12NumMaterials++;
+
+	dx12.ri.Printf(PRINT_DEVELOPER,
+	               "DX12_RegisterMaterialFromText: registered '%s' (%d stage(s))\n",
+	               name, mat.numStages);
+	return qtrue;
 }
 
 // ---------------------------------------------------------------------------
