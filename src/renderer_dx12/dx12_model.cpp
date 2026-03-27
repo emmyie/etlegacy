@@ -517,12 +517,19 @@ void DX12_DrawEntity(const dx12SceneEntity_t *ent, D3D12_GPU_VIRTUAL_ADDRESS cbG
 			srvDiffuse = dx12.srvHeap->GetGPUDescriptorHandleForHeapStart();
 		}
 
-		// Diffuse at t0 (root param 1) and lightmap at t1 (root param 2)
-		// Models have no lightmap; reuse diffuse for both slots so the shader
-		// produces diffuse * diffuse * color = diffuse * color (assuming neutral
-		// white is in slot 1 or the shader handles it).
-		dx12.commandList->SetGraphicsRootDescriptorTable(1, srvDiffuse);
-		dx12.commandList->SetGraphicsRootDescriptorTable(2, srvDiffuse);
+		// Diffuse at t0 (root param 1).
+		// Models have no lightmap; bind the white texture (slot 0) at t1
+		// (root param 2) so the shader computes: diffuse * white * 2 * color
+		// = diffuse * 2 * color, matching the standard world overbright factor.
+		{
+			D3D12_GPU_DESCRIPTOR_HANDLE srvWhite;
+
+			// Slot 0 of the SRV heap is always the 1×1 white fallback
+			srvWhite.ptr = dx12.srvHeap->GetGPUDescriptorHandleForHeapStart().ptr;
+
+			dx12.commandList->SetGraphicsRootDescriptorTable(1, srvDiffuse);
+			dx12.commandList->SetGraphicsRootDescriptorTable(2, srvWhite);
+		}
 
 		// Vertex buffer
 		vbv.BufferLocation = ms->vertexBuffer->GetGPUVirtualAddress();

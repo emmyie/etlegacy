@@ -301,7 +301,9 @@ static UINT Align256(UINT size)
 /**
  * @brief Write dx12SceneConstants_t into the constant buffer at the given slot.
  *
- * @param[in] slot  Frame slot index (0 … DX12_FRAME_COUNT-1).
+ * @param[in] slot  Absolute slot index into the CB allocation.  For frame f:
+ *                    world slot = f * DX12_MAX_CB_SLOTS_PER_FRAME + 0
+ *                    entity[i] = f * DX12_MAX_CB_SLOTS_PER_FRAME + 1 + i
  * @param[in] cb    Constant data to write.
  */
 static void SCN_UpdateCB(UINT slot, const dx12SceneConstants_t *cb)
@@ -633,14 +635,138 @@ qboolean DX12_SceneInit(void)
 	}
 
 	// ----------------------------------------------------------------
-	// Per-frame constant buffer (DX12_FRAME_COUNT slots, 256-byte aligned)
+	// Translucent 3D PSO – identical to pso3D except:
+	//   • alpha blending enabled (SRC_ALPHA / INV_SRC_ALPHA)
+	//   • depth writes disabled so translucent surfaces don't occlude
+	//     geometry behind them
+	// ----------------------------------------------------------------
+	{
+		ID3D12PipelineState *opaqueTemp = dx12Scene.pso3D;
+
+		// Retrieve the opaque PSO description by recompiling; D3D12 does not
+		// expose GetDesc() for PSOs, so we build the translucent PSO
+		// by repeating the shader compilation and altering the blend/DS state.
+		ID3DBlob *vs       = NULL;
+		ID3DBlob *ps       = NULL;
+		ID3DBlob *errBlob  = NULL;
+		UINT      flags    = 0;
+
+		(void)opaqueTemp; // used only as reminder
+
+#ifdef _DEBUG
+		flags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+#endif
+
+		SIZE_T srcLen2 = strlen(g_worldShaderSource);
+
+		hr = D3DCompile(g_worldShaderSource, srcLen2, "dx12_world_shader_translucent", NULL, NULL,
+		                "VSMain", "vs_5_0", flags, 0, &vs, &errBlob);
+		if (SUCCEEDED(hr))
+		{
+			if (errBlob) { errBlob->Release(); errBlob = NULL; }
+			hr = D3DCompile(g_worldShaderSource, srcLen2, "dx12_world_shader_translucent", NULL, NULL,
+			                "PSMain", "ps_5_0", flags, 0, &ps, &errBlob);
+		}
+
+		if (FAILED(hr) || !vs || !ps)
+		{
+			if (errBlob) { errBlob->Release(); }
+			if (vs) { vs->Release(); }
+			if (ps) { ps->Release(); }
+			// Non-fatal: fall back to the opaque PSO for translucent surfaces
+			dx12Scene.pso3DTranslucent = NULL;
+			dx12.ri.Printf(PRINT_DEVELOPER, "DX12_SceneInit: translucent PSO shader compile failed, "
+			               "translucent surfaces will render opaque\n");
+		}
+		else
+		{
+			if (errBlob) { errBlob->Release(); errBlob = NULL; }
+
+			// Reuse the same input layout as the opaque PSO
+			D3D12_INPUT_ELEMENT_DESC elems2[] =
+			{
+				{ "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT,    0,  0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+				{ "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,       0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+				{ "TEXCOORD", 1, DXGI_FORMAT_R32G32_FLOAT,       0, 20, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+				{ "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT,    0, 28, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+				{ "COLOR",    0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 40, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+			};
+
+			D3D12_GRAPHICS_PIPELINE_STATE_DESC psoT = {};
+			psoT.InputLayout.pInputElementDescs = elems2;
+			psoT.InputLayout.NumElements        = 5;
+			psoT.pRootSignature                 = dx12Scene.rootSignature3D;
+			psoT.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+			psoT.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+
+			psoT.RasterizerState.FillMode              = D3D12_FILL_MODE_SOLID;
+			psoT.RasterizerState.CullMode              = D3D12_CULL_MODE_NONE; // no back-face cull for translucent
+			psoT.RasterizerState.FrontCounterClockwise = TRUE;
+			psoT.RasterizerState.DepthBias             = D3D12_DEFAULT_DEPTH_BIAS;
+			psoT.RasterizerState.DepthBiasClamp        = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
+			psoT.RasterizerState.SlopeScaledDepthBias  = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
+			psoT.RasterizerState.DepthClipEnable       = TRUE;
+
+			// Alpha blending: SRC_ALPHA * src + (1 – SRC_ALPHA) * dst
+			psoT.BlendState.AlphaToCoverageEnable  = FALSE;
+			psoT.BlendState.IndependentBlendEnable = FALSE;
+			{
+				D3D12_RENDER_TARGET_BLEND_DESC &rt = psoT.BlendState.RenderTarget[0];
+				rt.BlendEnable           = TRUE;
+				rt.LogicOpEnable         = FALSE;
+				rt.SrcBlend              = D3D12_BLEND_SRC_ALPHA;
+				rt.DestBlend             = D3D12_BLEND_INV_SRC_ALPHA;
+				rt.BlendOp               = D3D12_BLEND_OP_ADD;
+				rt.SrcBlendAlpha         = D3D12_BLEND_ONE;
+				rt.DestBlendAlpha        = D3D12_BLEND_INV_SRC_ALPHA;
+				rt.BlendOpAlpha          = D3D12_BLEND_OP_ADD;
+				rt.LogicOp               = D3D12_LOGIC_OP_NOOP;
+				rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+			}
+
+			// Read depth but don't write (translucent surfaces shouldn't occlude)
+			psoT.DepthStencilState.DepthEnable    = TRUE;
+			psoT.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+			psoT.DepthStencilState.DepthFunc      = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+			psoT.DepthStencilState.StencilEnable  = FALSE;
+
+			psoT.SampleMask              = UINT_MAX;
+			psoT.PrimitiveTopologyType   = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+			psoT.NumRenderTargets        = 1;
+			psoT.RTVFormats[0]           = DXGI_FORMAT_R8G8B8A8_UNORM;
+			psoT.DSVFormat               = DXGI_FORMAT_D32_FLOAT;
+			psoT.SampleDesc.Count        = 1;
+
+			hr = dx12.device->CreateGraphicsPipelineState(&psoT, IID_PPV_ARGS(&dx12Scene.pso3DTranslucent));
+			vs->Release();
+			ps->Release();
+
+			if (FAILED(hr))
+			{
+				dx12.ri.Printf(PRINT_WARNING,
+				               "DX12_SceneInit: CreateGraphicsPipelineState (translucent) failed (0x%08lx)\n", hr);
+				dx12Scene.pso3DTranslucent = NULL;
+				// Non-fatal: translucent surfaces will use the opaque PSO
+			}
+		}
+	}
+
+	// ----------------------------------------------------------------
+	// Per-frame constant buffer
+	// Each frame reserves DX12_MAX_CB_SLOTS_PER_FRAME slots:
+	//   slot 0        – world / identity model matrix
+	//   slots 1..N    – per-entity model matrices
+	// This ensures every entity draw command references its own memory
+	// location, so the GPU sees the correct matrix for each draw.
 	// ----------------------------------------------------------------
 	{
 		D3D12_HEAP_PROPERTIES heapProps = {};
 		D3D12_RESOURCE_DESC   resDesc   = {};
 
 		dx12Scene.cbSlotSize = Align256((UINT)sizeof(dx12SceneConstants_t));
-		cbTotalSize          = dx12Scene.cbSlotSize * DX12_FRAME_COUNT;
+		cbTotalSize          = dx12Scene.cbSlotSize
+		                       * DX12_FRAME_COUNT
+		                       * DX12_MAX_CB_SLOTS_PER_FRAME;
 
 		heapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
 
@@ -768,6 +894,12 @@ void DX12_SceneShutdown(void)
 	{
 		dx12Scene.pso3D->Release();
 		dx12Scene.pso3D = NULL;
+	}
+
+	if (dx12Scene.pso3DTranslucent)
+	{
+		dx12Scene.pso3DTranslucent->Release();
+		dx12Scene.pso3DTranslucent = NULL;
 	}
 
 	if (dx12Scene.rootSignature3D)
@@ -926,13 +1058,18 @@ void DX12_AddScenePoly(qhandle_t hShader, int numVerts, const polyVert_t *verts)
  * @param[in] fd  Frame parameters: view origin/axis, FOV, and entity list.
  *
  * Render order: sky → opaque world → fog-tagged → entities → translucent.
+ *
+ * Each entity gets its own constant-buffer slot so that all recorded draw
+ * commands reference a unique memory location.  Without per-entity slots the
+ * GPU would see only the last value written to the shared slot because the
+ * entire command list executes AFTER all CPU-side CB writes are done.
  */
 void DX12_RenderScene(const refdef_t *fd)
 {
 	dx12SceneConstants_t cb;
 	float view[4][4], proj[4][4], viewProj[4][4];
-	D3D12_GPU_VIRTUAL_ADDRESS cbGpuVA;
-	UINT  cbSlot;
+	D3D12_GPU_VIRTUAL_ADDRESS cbBaseGpuVA; // GPU VA of slot 0 in this frame
+	UINT  cbBaseSlot;                      // Index of the world CB slot
 
 	if (!dx12Scene.initialized || !dx12.frameOpen)
 	{
@@ -952,11 +1089,13 @@ void DX12_RenderScene(const refdef_t *fd)
 	Mat4Mul(viewProj, view, proj);
 
 	// ----------------------------------------------------------------
-	// 2.  Update per-frame constant buffer
+	// 2.  Update the world/identity constant-buffer slot
+	//     cbBaseSlot == slot for world geometry (identity model matrix)
+	//     cbBaseSlot + 1 + i == dedicated slot for entity[i]
 	// ----------------------------------------------------------------
-	cbSlot = dx12.frameIndex;
-	cbGpuVA = dx12Scene.constantBuffer->GetGPUVirtualAddress()
-	          + (D3D12_GPU_VIRTUAL_ADDRESS)cbSlot * dx12Scene.cbSlotSize;
+	cbBaseSlot  = (UINT)dx12.frameIndex * (UINT)DX12_MAX_CB_SLOTS_PER_FRAME;
+	cbBaseGpuVA = dx12Scene.constantBuffer->GetGPUVirtualAddress()
+	              + (D3D12_GPU_VIRTUAL_ADDRESS)cbBaseSlot * dx12Scene.cbSlotSize;
 
 	// Identity model matrix for world geometry
 	Mat4Identity(cb.modelMatrix);
@@ -979,7 +1118,7 @@ void DX12_RenderScene(const refdef_t *fd)
 	cb.cameraPos[2] = fd->vieworg[2];
 	cb.cameraPos[3] = 1.0f;
 
-	SCN_UpdateCB(cbSlot, &cb);
+	SCN_UpdateCB(cbBaseSlot, &cb);
 
 	// ----------------------------------------------------------------
 	// 3.  Switch to the 3D pipeline
@@ -998,6 +1137,10 @@ void DX12_RenderScene(const refdef_t *fd)
 
 	// Set primitive topology for world geometry
 	dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+	// Restore full-screen viewport and scissor for the 3D pass
+	dx12.commandList->RSSetViewports(1, &dx12.viewport);
+	dx12.commandList->RSSetScissorRects(1, &dx12.scissorRect);
 
 	// ----------------------------------------------------------------
 	// 4.  Bind world vertex + index buffers (if world is loaded)
@@ -1031,7 +1174,7 @@ void DX12_RenderScene(const refdef_t *fd)
 
 				if (ds->isSky)
 				{
-					SCN_DrawSurface(ds, cbGpuVA);
+					SCN_DrawSurface(ds, cbBaseGpuVA);
 				}
 			}
 		}
@@ -1048,7 +1191,7 @@ void DX12_RenderScene(const refdef_t *fd)
 
 				if (!ds->isSky && !ds->isTranslucent && !ds->isFog)
 				{
-					SCN_DrawSurface(ds, cbGpuVA);
+					SCN_DrawSurface(ds, cbBaseGpuVA);
 				}
 			}
 		}
@@ -1065,7 +1208,7 @@ void DX12_RenderScene(const refdef_t *fd)
 
 				if (ds->isFog)
 				{
-					SCN_DrawSurface(ds, cbGpuVA);
+					SCN_DrawSurface(ds, cbBaseGpuVA);
 				}
 			}
 		}
@@ -1073,21 +1216,35 @@ void DX12_RenderScene(const refdef_t *fd)
 
 	// ----------------------------------------------------------------
 	// 6.  Entities
+	//     Each entity uses its own dedicated CB slot so all recorded
+	//     draw commands reference unique CB memory.
 	// ----------------------------------------------------------------
 	{
 		int i;
 
 		for (i = 0; i < dx12Scene.numEntities; i++)
 		{
-			dx12SceneEntity_t *ent = &dx12Scene.entities[i];
-			dx12SceneConstants_t entCB;
+			dx12SceneEntity_t    *ent = &dx12Scene.entities[i];
+			dx12SceneConstants_t  entCB;
+			UINT                  entSlot;
 			D3D12_GPU_VIRTUAL_ADDRESS entCBGpuVA;
+
+			// Clamp to the allocated range to guard against overflow
+			if (i >= DX12_MAX_SCENE_ENTITIES)
+			{
+				break;
+			}
+
+			// Each entity gets its own unique slot within this frame
+			entSlot   = cbBaseSlot + 1u + (UINT)i;
+			entCBGpuVA = dx12Scene.constantBuffer->GetGPUVirtualAddress()
+			             + (D3D12_GPU_VIRTUAL_ADDRESS)entSlot * dx12Scene.cbSlotSize;
 
 			// Build per-entity model matrix
 			BuildModelMatrix(entCB.modelMatrix, ent->origin,
 			                 (const vec3_t *)ent->axis);
 
-			// Copy the same viewProj
+			// Copy the shared viewProj and cameraPos
 			{
 				int r, c;
 
@@ -1105,10 +1262,8 @@ void DX12_RenderScene(const refdef_t *fd)
 			entCB.cameraPos[2] = cb.cameraPos[2];
 			entCB.cameraPos[3] = cb.cameraPos[3];
 
-			// Reuse slot (same frame slot; entities overwrite world CB
-			// but world is already drawn above)
-			SCN_UpdateCB(cbSlot, &entCB);
-			entCBGpuVA = cbGpuVA;
+			// Write to the entity's dedicated slot
+			SCN_UpdateCB(entSlot, &entCB);
 
 			// Draw the entity's MD3 surfaces (no-op if model has no geometry)
 			DX12_DrawEntity(ent, entCBGpuVA);
@@ -1118,16 +1273,13 @@ void DX12_RenderScene(const refdef_t *fd)
 	// ----------------------------------------------------------------
 	// 7a. World-space polys (decals, effects)
 	//     Rendered after entities, before translucent world surfaces.
-	//     Uses the same 3D pipeline with identity model matrix.
+	//     Uses the world CB slot (identity model matrix).
 	// ----------------------------------------------------------------
 	if (dx12Scene.numPolyVerts > 0 && dx12Scene.polyVerts &&
 	    dx12Scene.polyVertexBuffer && dx12Scene.polyVBMapped)
 	{
 		int b;
 		D3D12_VERTEX_BUFFER_VIEW pvbv = {};
-
-		// Restore identity model matrix for world-space poly verts
-		SCN_UpdateCB(cbSlot, &cb);
 
 		// Upload staging buffer to the GPU upload-heap VB
 		memcpy(dx12Scene.polyVBMapped, dx12Scene.polyVerts,
@@ -1161,6 +1313,7 @@ void DX12_RenderScene(const refdef_t *fd)
 				srvPoly = dx12.srvHeap->GetGPUDescriptorHandleForHeapStart();
 			}
 
+			dx12.commandList->SetGraphicsRootConstantBufferView(0, cbBaseGpuVA);
 			dx12.commandList->SetGraphicsRootDescriptorTable(1, srvPoly);
 			dx12.commandList->SetGraphicsRootDescriptorTable(2, srvPoly);
 
@@ -1188,28 +1341,33 @@ void DX12_RenderScene(const refdef_t *fd)
 	}
 
 	// ----------------------------------------------------------------
-	// 7.  Translucent / alpha world surfaces (back-to-front order)
-	//     The draw list is already sorted by the loader, so iterate
-	//     in reverse for correct alpha blending.
+	// 7b. Translucent / alpha world surfaces (back-to-front order)
+	//     Switch to the translucent PSO (alpha-blend, no depth-write).
+	//     The draw list is already sorted by the loader, so iterating
+	//     in reverse gives correct painter's-algorithm blending.
 	// ----------------------------------------------------------------
 	if (dx12World.loaded && dx12World.vertexBuffer && dx12World.indexBuffer)
 	{
-		// Restore world CB (entity loop may have modified it)
-		SCN_UpdateCB(cbSlot, &cb);
+		int i;
 
+		// Switch to translucent PSO if available
+		if (dx12Scene.pso3DTranslucent)
 		{
-			int i;
+			dx12.commandList->SetPipelineState(dx12Scene.pso3DTranslucent);
+		}
 
-			for (i = dx12World.numDrawSurfs - 1; i >= 0; i--)
+		for (i = dx12World.numDrawSurfs - 1; i >= 0; i--)
+		{
+			const dx12DrawSurf_t *ds = &dx12World.drawSurfs[i];
+
+			if (ds->isTranslucent)
 			{
-				const dx12DrawSurf_t *ds = &dx12World.drawSurfs[i];
-
-				if (ds->isTranslucent)
-				{
-					SCN_DrawSurface(ds, cbGpuVA);
-				}
+				SCN_DrawSurface(ds, cbBaseGpuVA);
 			}
 		}
+
+		// Restore opaque PSO for subsequent passes
+		dx12.commandList->SetPipelineState(dx12Scene.pso3D);
 	}
 
 	// ----------------------------------------------------------------

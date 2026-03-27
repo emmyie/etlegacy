@@ -63,6 +63,18 @@
 /** Far clip plane distance (units). */
 #define DX12_SCENE_FAR    65536.0f
 
+/**
+ * Number of constant-buffer slots allocated per frame:
+ *   slot 0        – world / identity model matrix
+ *   slots 1..N    – per-entity model matrices (up to DX12_MAX_SCENE_ENTITIES)
+ *
+ * Allocating a dedicated slot per entity ensures that per-frame command-list
+ * recording writes each entity's matrix to a unique memory location so that
+ * all recorded draw calls reference the correct matrix when the GPU executes
+ * the command list.
+ */
+#define DX12_MAX_CB_SLOTS_PER_FRAME  (1 + DX12_MAX_SCENE_ENTITIES)
+
 // ---------------------------------------------------------------------------
 // Constant-buffer layout  (must match SceneConstants in the world HLSL)
 // ---------------------------------------------------------------------------
@@ -126,10 +138,11 @@ typedef struct
 {
 	// 3D-specific GPU resources
 	ID3D12RootSignature  *rootSignature3D; ///< Root sig: CBV b0 + SRV table (t0, t1)
-	ID3D12PipelineState  *pso3D;           ///< PSO for dx12WorldVertex_t input
+	ID3D12PipelineState  *pso3D;           ///< PSO for dx12WorldVertex_t input – opaque
+	ID3D12PipelineState  *pso3DTranslucent; ///< Same layout but with alpha blending + no depth write
 
 	// Per-frame constant buffer (upload heap, persistently mapped, CBV_SIZE aligned)
-	ID3D12Resource *constantBuffer;       ///< Single allocation holding DX12_FRAME_COUNT slots
+	ID3D12Resource *constantBuffer;       ///< Holds DX12_FRAME_COUNT * DX12_MAX_CB_SLOTS_PER_FRAME slots
 	UINT8          *cbMapped;             ///< Persistently-mapped CPU pointer
 	UINT            cbSlotSize;           ///< Size of one aligned CBV slot in bytes
 

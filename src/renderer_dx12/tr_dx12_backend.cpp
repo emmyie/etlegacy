@@ -6,6 +6,7 @@
 #include "tr_dx12_local.h"
 #include "dx12_shader.h"
 #include "dx12_world.h"
+#include "dx12_model.h"
 #include "dx12_scene.h"
 
 #ifdef _WIN32
@@ -1235,6 +1236,7 @@ void R_DX12_Shutdown(qboolean destroyWindow)
 
 	// Release world geometry first (before texture registry and GPU objects)
 	DX12_SceneShutdown();
+	DX12_ShutdownModels();
 	DX12_ShutdownWorld();
 
 	// Release all D3D12 texture resources
