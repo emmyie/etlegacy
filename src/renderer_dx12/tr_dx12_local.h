@@ -185,6 +185,11 @@ typedef struct
 	ID3D12Resource       *renderTargets[DX12_FRAME_COUNT];
 	UINT                 rtvDescriptorSize;
 
+	// Depth stencil heap + per-frame depth buffers (D32_FLOAT)
+	ID3D12DescriptorHeap *dsvHeap;
+	UINT                  dsvDescriptorSize;
+	ID3D12Resource       *depthStencil[DX12_FRAME_COUNT];
+
 	// SRV descriptor heap (shader-visible, for textures)
 	ID3D12DescriptorHeap *srvHeap;
 	UINT                  srvDescriptorSize;

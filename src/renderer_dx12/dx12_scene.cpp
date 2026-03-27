@@ -577,7 +577,7 @@ qboolean DX12_SceneInit(void)
 		// Rasterizer
 		pso.RasterizerState.FillMode              = D3D12_FILL_MODE_SOLID;
 		pso.RasterizerState.CullMode              = D3D12_CULL_MODE_BACK;
-		pso.RasterizerState.FrontCounterClockwise = FALSE;
+		pso.RasterizerState.FrontCounterClockwise = TRUE;  // BSP/MD3 geometry uses CCW winding (OpenGL convention)
 		pso.RasterizerState.DepthBias             = D3D12_DEFAULT_DEPTH_BIAS;
 		pso.RasterizerState.DepthBiasClamp        = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
 		pso.RasterizerState.SlopeScaledDepthBias  = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
@@ -604,12 +604,15 @@ qboolean DX12_SceneInit(void)
 			rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
 		}
 
-		pso.DepthStencilState.DepthEnable    = FALSE; // No depth buffer in current renderer
+		pso.DepthStencilState.DepthEnable    = TRUE;
+		pso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+		pso.DepthStencilState.DepthFunc      = D3D12_COMPARISON_FUNC_LESS_EQUAL;
 		pso.DepthStencilState.StencilEnable  = FALSE;
 		pso.SampleMask                       = UINT_MAX;
 		pso.PrimitiveTopologyType            = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
 		pso.NumRenderTargets                 = 1;
 		pso.RTVFormats[0]                    = DXGI_FORMAT_R8G8B8A8_UNORM;
+		pso.DSVFormat                        = DXGI_FORMAT_D32_FLOAT;
 		pso.SampleDesc.Count                 = 1;
 
 		hr = dx12.device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&dx12Scene.pso3D));
@@ -1211,7 +1214,7 @@ void DX12_RenderScene(const refdef_t *fd)
 	// ----------------------------------------------------------------
 	dx12.commandList->SetGraphicsRootSignature(dx12.rootSignature);
 	dx12.commandList->SetPipelineState(dx12.pipelineState);
-	dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+	dx12.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 }
 
 #endif // _WIN32

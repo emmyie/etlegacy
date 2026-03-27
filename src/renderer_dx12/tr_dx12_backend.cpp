@@ -325,8 +325,22 @@ void DX12_BeginFrame(void)
 	rtvHandle.ptr = dx12.rtvHeap->GetCPUDescriptorHandleForHeapStart().ptr
 	                + dx12.frameIndex * dx12.rtvDescriptorSize;
 
-	dx12.commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, NULL);
-	dx12.commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, NULL);
+	// Bind RTV + DSV (if depth buffer is available for this frame)
+	if (dx12.dsvHeap && dx12.depthStencil[dx12.frameIndex])
+	{
+		D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle;
+
+		dsvHandle.ptr = dx12.dsvHeap->GetCPUDescriptorHandleForHeapStart().ptr
+		                + dx12.frameIndex * dx12.dsvDescriptorSize;
+		dx12.commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, &dsvHandle);
+		dx12.commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, NULL);
+		dx12.commandList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, NULL);
+	}
+	else
+	{
+		dx12.commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, NULL);
+		dx12.commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, NULL);
+	}
 
 	// Bind pipeline state
 	dx12.commandList->SetGraphicsRootSignature(dx12.rootSignature);
@@ -380,9 +394,14 @@ void DX12_InitSwapchain( void )
 	dx12.vidWidth = ( int )width;
 	dx12.vidHeight = ( int )height;
 
-	// Release old swapchain/render targets if any
+	// Release old swapchain/render targets/depth buffers if any
 	for ( int i = 0; i < DX12_FRAME_COUNT; i++ )
 	{
+		if ( dx12.depthStencil[ i ] )
+		{
+			dx12.depthStencil[ i ]->Release( );
+			dx12.depthStencil[ i ] = nullptr;
+		}
 		if ( dx12.renderTargets[ i ] )
 		{
 			dx12.renderTargets[ i ]->Release( );
@@ -468,6 +487,58 @@ void DX12_InitSwapchain( void )
 	dx12.scissorRect.bottom = ( LONG )height;
 
 	dx12.currentScissor = dx12.scissorRect;
+
+	// Create per-frame depth stencil textures (D32_FLOAT) if DSV heap is ready
+	if ( dx12.dsvHeap )
+	{
+		D3D12_HEAP_PROPERTIES dsHeapProps = {};
+		dsHeapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+		D3D12_RESOURCE_DESC dsDesc = {};
+		dsDesc.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+		dsDesc.Width            = width;
+		dsDesc.Height           = height;
+		dsDesc.DepthOrArraySize = 1;
+		dsDesc.MipLevels        = 1;
+		dsDesc.Format           = DXGI_FORMAT_D32_FLOAT;
+		dsDesc.SampleDesc.Count = 1;
+		dsDesc.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+		dsDesc.Flags            = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+
+		D3D12_CLEAR_VALUE dsClear = {};
+		dsClear.Format               = DXGI_FORMAT_D32_FLOAT;
+		dsClear.DepthStencil.Depth   = 1.0f;
+		dsClear.DepthStencil.Stencil = 0;
+
+		D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc = {};
+		dsvDesc.Format             = DXGI_FORMAT_D32_FLOAT;
+		dsvDesc.ViewDimension      = D3D12_DSV_DIMENSION_TEXTURE2D;
+		dsvDesc.Flags              = D3D12_DSV_FLAG_NONE;
+		dsvDesc.Texture2D.MipSlice = 0;
+
+		D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = dx12.dsvHeap->GetCPUDescriptorHandleForHeapStart();
+
+		for ( UINT i = 0; i < DX12_FRAME_COUNT; i++ )
+		{
+			hr = dx12.device->CreateCommittedResource(
+				&dsHeapProps,
+				D3D12_HEAP_FLAG_NONE,
+				&dsDesc,
+				D3D12_RESOURCE_STATE_DEPTH_WRITE,
+				&dsClear,
+				IID_PPV_ARGS( &dx12.depthStencil[ i ] ) );
+
+			if ( FAILED( hr ) )
+			{
+				dx12.ri.Error( ERR_FATAL,
+				               "DX12_InitSwapchain: CreateCommittedResource (depth[%u]) failed (0x%08lx)\n",
+				               i, hr );
+			}
+
+			dx12.device->CreateDepthStencilView( dx12.depthStencil[ i ], &dsvDesc, dsvHandle );
+			dsvHandle.ptr += dx12.dsvDescriptorSize;
+		}
+	}
 }
 
 /**
@@ -593,6 +664,25 @@ qboolean R_DX12_Init(void)
 		}
 
 		dx12.rtvDescriptorSize = dx12.device->GetDescriptorHandleIncrementSize( D3D12_DESCRIPTOR_HEAP_TYPE_RTV );
+	}
+
+	// ----------------------------------------------------------------
+	// DSV Descriptor Heap (one slot per swap-chain buffer)
+	// ----------------------------------------------------------------
+	{
+		D3D12_DESCRIPTOR_HEAP_DESC dsvHeapDesc = {};
+		dsvHeapDesc.NumDescriptors = DX12_FRAME_COUNT;
+		dsvHeapDesc.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+		dsvHeapDesc.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+
+		hr = dx12.device->CreateDescriptorHeap(&dsvHeapDesc, IID_PPV_ARGS(&dx12.dsvHeap));
+		if (FAILED(hr))
+		{
+			dx12.ri.Error(ERR_FATAL, "R_DX12_Init: CreateDescriptorHeap (DSV) failed (0x%08lx)\n", hr);
+			return qfalse;
+		}
+
+		dx12.dsvDescriptorSize = dx12.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
 	}
 
 	// ----------------------------------------------------------------
@@ -1179,6 +1269,21 @@ void R_DX12_Shutdown(qboolean destroyWindow)
 	{
 		dx12.rtvHeap->Release();
 		dx12.rtvHeap = NULL;
+	}
+
+	for (UINT i = 0; i < DX12_FRAME_COUNT; i++)
+	{
+		if (dx12.depthStencil[i])
+		{
+			dx12.depthStencil[i]->Release();
+			dx12.depthStencil[i] = NULL;
+		}
+	}
+
+	if (dx12.dsvHeap)
+	{
+		dx12.dsvHeap->Release();
+		dx12.dsvHeap = NULL;
 	}
 
 	if (dx12.srvHeap)
