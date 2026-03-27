@@ -342,6 +342,185 @@ static void RE_DX12_EndFrame(int *frontEndMsec, int *backEndMsec)
 }
 
 // ---------------------------------------------------------------------------
+// Skin registry – mirrors GL's RE_RegisterSkin / RE_GetSkinModel
+// ---------------------------------------------------------------------------
+
+/** Maximum surfaces per skin (matches the GL renderer's MAX_SKIN_SURFACES). */
+#define DX12_MAX_SKIN_SURFACES  256
+/** Maximum model-part entries per skin (matches GL's MAX_PART_MODELS). */
+#define DX12_MAX_PART_MODELS    7
+/** Maximum number of concurrently loaded skins. */
+#define DX12_MAX_SKINS          1024
+
+/**
+ * @struct dx12SkinSurface_t
+ * @brief One surface-to-material mapping parsed from a .skin file.
+ */
+typedef struct
+{
+	char      name[MAX_QPATH];  ///< Surface name (lower-cased)
+	int       hash;             ///< Pre-computed hash of name
+	qhandle_t matHandle;        ///< DX12 material / texture handle
+} dx12SkinSurface_t;
+
+/**
+ * @struct dx12SkinModel_t
+ * @brief One "md3_XXX,model.md3" entry parsed from a .skin file.
+ */
+typedef struct
+{
+	char type[MAX_QPATH];   ///< e.g. "md3_lower"
+	char model[MAX_QPATH];  ///< e.g. "models/players/soldier/lower.md3"
+	int  hash;
+} dx12SkinModel_t;
+
+/**
+ * @struct dx12Skin_t
+ * @brief A parsed skin file stored in the DX12 skin table.
+ */
+typedef struct
+{
+	char              name[MAX_QPATH];
+	int               numSurfaces;
+	int               numModels;
+	dx12SkinSurface_t surfaces[DX12_MAX_SKIN_SURFACES];
+	dx12SkinModel_t   models[DX12_MAX_PART_MODELS];
+} dx12Skin_t;
+
+static dx12Skin_t dx12Skins[DX12_MAX_SKINS];
+static int        dx12NumSkins = 0;
+
+/**
+ * @brief Compute a name-based hash (same algorithm as Com_HashKey in q_shared.c).
+ *
+ * @param[in] string  Input string (NUL-terminated).
+ * @param[in] maxlen  Maximum number of characters to hash.
+ * @return            Hash value.
+ */
+static int DX12_HashKey(char *string, int maxlen)
+{
+	int hash = 0;
+	int i;
+
+	for (i = 0; i < maxlen && string[i] != '\0'; i++)
+	{
+		hash += string[i] * (119 + i);
+	}
+	hash = (hash ^ (hash >> 10) ^ (hash >> 20));
+	return hash;
+}
+
+/**
+ * @brief Skin-file token parser: reads tokens separated by commas (or EOL).
+ *
+ * Mirrors the CommaParse() static function in the GL renderer's tr_image.c.
+ * The caller advances @p data_p through the text buffer; returns a pointer
+ * to a static token buffer that is overwritten on each call.
+ *
+ * @param[in,out] data_p  Pointer-to-pointer into the text buffer.
+ * @return Pointer to a NUL-terminated token, or "" on end-of-input.
+ */
+static char *DX12_CommaParse(char **data_p)
+{
+	int         c   = 0;
+	int         len = 0;
+	char       *data = *data_p;
+	static char com_token[MAX_TOKEN_CHARS];
+
+	com_token[0] = '\0';
+
+	if (!data)
+	{
+		*data_p = NULL;
+		return com_token;
+	}
+
+	// Skip whitespace and comments
+	while (1)
+	{
+		// skip whitespace
+		while ((c = *data) <= ' ')
+		{
+			if (!c)
+			{
+				break;
+			}
+			data++;
+		}
+		c = *data;
+
+		if (c == '/' && data[1] == '/')
+		{
+			while (*data && *data != '\n')
+			{
+				data++;
+			}
+		}
+		else if (c == '/' && data[1] == '*')
+		{
+			while (*data && (*data != '*' || data[1] != '/'))
+			{
+				data++;
+			}
+			if (*data)
+			{
+				data += 2;
+			}
+		}
+		else
+		{
+			break;
+		}
+	}
+
+	if (c == 0)
+	{
+		return (char *)"";
+	}
+
+	// Quoted string
+	if (c == '\"')
+	{
+		data++;
+		while (1)
+		{
+			c = *data++;
+			if (c == '\"' || !c)
+			{
+				com_token[len] = '\0';
+				*data_p        = data;
+				return com_token;
+			}
+			if (len < MAX_TOKEN_CHARS - 1)
+			{
+				com_token[len++] = (char)c;
+			}
+		}
+	}
+
+	// Regular word – stop at whitespace or comma
+	do
+	{
+		if (len < MAX_TOKEN_CHARS - 1)
+		{
+			com_token[len++] = (char)c;
+		}
+		data++;
+		c = *data;
+	}
+	while (c > 32 && c != ',');
+
+	if (len == MAX_TOKEN_CHARS)
+	{
+		len = 0;
+	}
+	com_token[len] = '\0';
+
+	*data_p = data;
+	return com_token;
+}
+
+// ---------------------------------------------------------------------------
 // Minimal model registry
 // ---------------------------------------------------------------------------
 
@@ -464,7 +643,130 @@ static qhandle_t RE_DX12_RegisterModelAllLODs(const char *name)
 
 static qhandle_t RE_DX12_RegisterSkin(const char *name)
 {
-	(void)name; return 0;
+	int        i;
+	int        slot;
+	dx12Skin_t *skin;
+	void       *text_v = NULL;
+	char       *text_p;
+	char       *token;
+	char        surfName[MAX_QPATH];
+	int         totalSurfaces = 0;
+
+	if (!name || !name[0])
+	{
+		dx12.ri.Printf(PRINT_DEVELOPER, "RE_DX12_RegisterSkin: empty name\n");
+		return 0;
+	}
+
+	if (strlen(name) >= MAX_QPATH)
+	{
+		dx12.ri.Printf(PRINT_DEVELOPER, "RE_DX12_RegisterSkin: name exceeds MAX_QPATH\n");
+		return 0;
+	}
+
+	// Deduplicate: return existing handle (1-based)
+	for (i = 0; i < dx12NumSkins; i++)
+	{
+		if (!DX12_Stricmp(dx12Skins[i].name, name))
+		{
+			return (dx12Skins[i].numSurfaces > 0) ? (qhandle_t)(i + 1) : 0;
+		}
+	}
+
+	// Allocate a new slot
+	if (dx12NumSkins >= DX12_MAX_SKINS)
+	{
+		dx12.ri.Printf(PRINT_WARNING, "RE_DX12_RegisterSkin: skin table full, dropping '%s'\n", name);
+		return 0;
+	}
+
+	slot = dx12NumSkins;
+	skin = &dx12Skins[slot];
+	Com_Memset(skin, 0, sizeof(*skin));
+	Q_strncpyz(skin->name, name, sizeof(skin->name));
+	dx12NumSkins++;
+
+	// Load the .skin file
+	dx12.ri.FS_ReadFile(name, &text_v);
+	if (!text_v)
+	{
+		dx12.ri.Printf(PRINT_DEVELOPER, "RE_DX12_RegisterSkin: '%s' not found\n", name);
+		return 0;
+	}
+
+	text_p = (char *)text_v;
+
+	while (text_p && *text_p)
+	{
+		// Get the surface name (left side of comma)
+		token = DX12_CommaParse(&text_p);
+		Q_strncpyz(surfName, token, sizeof(surfName));
+
+		if (!token[0])
+		{
+			break;
+		}
+
+		// Advance past comma
+		if (*text_p == ',')
+		{
+			text_p++;
+		}
+
+		// Skip tag entries
+		if (strstr(surfName, "tag_"))
+		{
+			continue;
+		}
+
+		// Model-part entry: "md3_lower,models/…/lower.md3"
+		if (strstr(surfName, "md3_") || strstr(surfName, "mdc_"))
+		{
+			if (skin->numModels < DX12_MAX_PART_MODELS)
+			{
+				dx12SkinModel_t *mdl = &skin->models[skin->numModels];
+				Q_strncpyz(mdl->type, surfName, sizeof(mdl->type));
+				mdl->hash = DX12_HashKey(mdl->type, sizeof(mdl->type));
+
+				token = DX12_CommaParse(&text_p);
+				Q_strncpyz(mdl->model, token, sizeof(mdl->model));
+				skin->numModels++;
+			}
+			continue;
+		}
+
+		// Surface-to-shader mapping: "surfacename,shadername"
+		token = DX12_CommaParse(&text_p);
+
+		if (totalSurfaces < DX12_MAX_SKIN_SURFACES && skin->numSurfaces < DX12_MAX_SKIN_SURFACES)
+		{
+			dx12SkinSurface_t *ss = &skin->surfaces[skin->numSurfaces];
+			Q_strncpyz(ss->name, surfName, sizeof(ss->name));
+			Q_strlwr(ss->name);
+			ss->hash      = DX12_HashKey(ss->name, sizeof(ss->name));
+			ss->matHandle = DX12_RegisterMaterial(token);
+			skin->numSurfaces++;
+		}
+
+		totalSurfaces++;
+	}
+
+	dx12.ri.FS_FreeFile(text_v);
+
+	if (totalSurfaces > DX12_MAX_SKIN_SURFACES)
+	{
+		dx12.ri.Printf(PRINT_WARNING,
+		               "RE_DX12_RegisterSkin: '%s' has %d surfaces, max is %d\n",
+		               name, totalSurfaces, DX12_MAX_SKIN_SURFACES);
+	}
+
+	if (skin->numSurfaces == 0)
+	{
+		dx12.ri.Printf(PRINT_DEVELOPER, "RE_DX12_RegisterSkin: '%s' has no usable surfaces\n", name);
+		return 0;
+	}
+
+	return (qhandle_t)(slot + 1);
 }
 
 static qhandle_t RE_DX12_RegisterShader(const char *name)
@@ -601,12 +903,65 @@ static void RE_DX12_LoadWorld(const char *name)
 
 static qboolean RE_DX12_GetSkinModel(qhandle_t skinid, const char *type, char *name)
 {
-	(void)skinid; (void)type; (void)name; return qfalse;
+	int        i;
+	int        hash;
+	dx12Skin_t *skin;
+
+	if (skinid < 1 || skinid > dx12NumSkins)
+	{
+		return qfalse;
+	}
+
+	skin = &dx12Skins[skinid - 1];
+	hash = DX12_HashKey((char *)type, (int)strlen(type));
+
+	for (i = 0; i < skin->numModels; i++)
+	{
+		if (hash != skin->models[i].hash)
+		{
+			continue;
+		}
+		if (!Q_stricmp(skin->models[i].type, type))
+		{
+			Q_strncpyz(name, skin->models[i].model, sizeof(skin->models[i].model));
+			return qtrue;
+		}
+	}
+
+	return qfalse;
 }
 
 static qhandle_t RE_DX12_GetShaderFromModel(qhandle_t modelid, int surfnum, int withlightmap)
 {
-	(void)modelid; (void)surfnum; (void)withlightmap; return 0;
+	int              slot;
+	dx12ModelEntry_t *mdl;
+
+	(void)withlightmap; // DX12 renderer does not distinguish lightmapped variants
+
+	if (modelid < 1 || modelid > dx12NumModels)
+	{
+		return 0;
+	}
+
+	slot = (int)modelid - 1;
+	mdl  = &dx12ModelData[slot];
+
+	if (!mdl->valid || mdl->numSurfaces <= 0)
+	{
+		return 0;
+	}
+
+	if (surfnum < 0)
+	{
+		surfnum = 0;
+	}
+
+	if (surfnum >= mdl->numSurfaces)
+	{
+		surfnum = 0;
+	}
+
+	return mdl->surfaces[surfnum].texHandle;
 }
 
 static void RE_DX12_SetWorldVisData(const byte *vis)
