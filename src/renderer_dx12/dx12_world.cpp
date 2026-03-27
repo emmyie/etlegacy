@@ -106,7 +106,12 @@ static qboolean WLD_UploadBuffer(const void *data, UINT64 sizeBytes,
 		&defaultHeap,
 		D3D12_HEAP_FLAG_NONE,
 		&bufDesc,
-		D3D12_RESOURCE_STATE_COPY_DEST,
+		// D3D12 buffers are always effectively created in COMMON state;
+		// using COPY_DEST triggers a debug layer warning.  COMMON buffers
+		// are implicitly promoted to COPY_DEST when used as a copy
+		// destination, so the explicit barrier below (COPY_DEST →
+		// GENERIC_READ) is still correct.
+		D3D12_RESOURCE_STATE_COMMON,
 		NULL,
 		IID_PPV_ARGS(outBuffer));
 
