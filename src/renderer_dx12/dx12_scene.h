@@ -95,17 +95,16 @@ typedef struct
 
 /**
  * @struct dx12Decal_t
- * @brief One world-space decal entry (simplified first-pass: stores the source
- *        polygon as-is; full BSP-clip projection is a TODO).
+ * @brief One world-space decal entry – stores already-projected polyVerts
+ *        (xyz + texcoords + base modulate) plus timing for alpha fade.
  */
 typedef struct
 {
 	qhandle_t  hShader;                       ///< Material handle
-	polyVert_t verts[DX12_MAX_DECAL_VERTS];   ///< World-space polygon vertices
+	polyVert_t verts[DX12_MAX_DECAL_VERTS];   ///< World-space polygon vertices (xyz/st/base modulate)
 	int        numVerts;                       ///< Actual vertex count (≤ DX12_MAX_DECAL_VERTS)
-	float      color[4];                       ///< Tint RGBA [0,1]
-	int        lifeTime;                       ///< Lifetime hint in ms (0 = infinite)
-	int        fadeTime;                       ///< Fade duration in ms
+	int        fadeStartTime;                  ///< ms at which fade begins (0 = no fade / permanent)
+	int        fadeEndTime;                    ///< ms at which decal expires (0 = permanent)
 } dx12Decal_t;
 
 /** Maximum ref-entities buffered between ClearScene and RenderScene. */
@@ -274,20 +273,19 @@ void DX12_ClearScene(void);
 void DX12_AddScenePoly(qhandle_t hShader, int numVerts, const polyVert_t *verts);
 
 /**
- * @brief DX12_AddDecalToScene – store a world-space decal polygon for persistent rendering.
+ * @brief DX12_AddDecalToScene – store an already-projected world-space decal polygon.
  *
  * Decals are NOT cleared by DX12_ClearScene().  Call DX12_ClearDecals() explicitly
  * (e.g. on map load) to remove all active decals.
  *
- * @param hShader   Material handle for the decal.
- * @param numVerts  Source polygon vertex count (clamped to DX12_MAX_DECAL_VERTS).
- * @param points    World-space polygon corners (vec3_t*).
- * @param color     Decal tint colour (RGBA, [0,1]).
- * @param lifeTime  Life hint in ms (0 = infinite).
- * @param fadeTime  Fade duration in ms.
+ * @param hShader        Material handle for the decal.
+ * @param numVerts       Projected polygon vertex count (clamped to DX12_MAX_DECAL_VERTS).
+ * @param verts          Already-projected vertices (xyz + st + base modulate).
+ * @param fadeStartTime  ms at which fade begins (0 = permanent decal).
+ * @param fadeEndTime    ms at which decal expires (0 = permanent decal).
  */
-void DX12_AddDecalToScene(qhandle_t hShader, int numVerts, vec3_t *points,
-                          const float *color, int lifeTime, int fadeTime);
+void DX12_AddDecalToScene(qhandle_t hShader, int numVerts, const polyVert_t *verts,
+                          int fadeStartTime, int fadeEndTime);
 
 /**
  * @brief DX12_ClearDecals – remove all persistent decals.

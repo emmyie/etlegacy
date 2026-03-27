@@ -1318,7 +1318,64 @@ void DX12_RenderScene(const refdef_t *fd)
 	}
 
 	// ----------------------------------------------------------------
-	// 7a. World-space polys (decals, effects)
+	// 7a. Persistent decals – re-submitted every frame with time-based fade.
+	//     Expired decals are skipped; live decals go through DX12_AddScenePoly
+	//     so they land in the poly vertex buffer drawn below.
+	// ----------------------------------------------------------------
+	{
+		int i, p;
+
+		for (i = 0; i < dx12Scene.numDecals; i++)
+		{
+			dx12Decal_t *dec = &dx12Scene.decals[i];
+			float        fadeAlpha = 1.0f;
+
+			// Check expiry (fadeEndTime==0 means permanent)
+			if (dec->fadeEndTime > 0)
+			{
+				if (fd->time >= dec->fadeEndTime)
+				{
+					continue; // expired – skip
+				}
+				if (fd->time >= dec->fadeStartTime && dec->fadeEndTime > dec->fadeStartTime)
+				{
+					int elapsed  = fd->time - dec->fadeStartTime;
+					int duration = dec->fadeEndTime - dec->fadeStartTime;
+
+					fadeAlpha = 1.0f - (float)elapsed / (float)duration;
+					if (fadeAlpha < 0.0f)
+					{
+						fadeAlpha = 0.0f;
+					}
+				}
+			}
+
+			if (dec->numVerts < 3)
+			{
+				continue;
+			}
+
+			// Build a local copy with alpha scaled by fade factor
+			if (fadeAlpha < 0.9999f)
+			{
+				polyVert_t fadedVerts[DX12_MAX_DECAL_VERTS];
+
+				for (p = 0; p < dec->numVerts; p++)
+				{
+					fadedVerts[p]              = dec->verts[p];
+					fadedVerts[p].modulate[3]  = (byte)((float)dec->verts[p].modulate[3] * fadeAlpha);
+				}
+				DX12_AddScenePoly(dec->hShader, dec->numVerts, fadedVerts);
+			}
+			else
+			{
+				DX12_AddScenePoly(dec->hShader, dec->numVerts, dec->verts);
+			}
+		}
+	}
+
+	// ----------------------------------------------------------------
+	// 7b. World-space polys (decals, effects)
 	//     Rendered after entities, before translucent world surfaces.
 	//     Uses the world CB slot (identity model matrix).
 	// ----------------------------------------------------------------
@@ -1453,20 +1510,21 @@ void DX12_RenderScene(const refdef_t *fd)
 // ---------------------------------------------------------------------------
 
 /**
- * @brief DX12_AddDecalToScene – store a world-space decal for persistent rendering.
+ * @brief DX12_AddDecalToScene – store an already-projected world-space decal polygon.
  *
- * Simplified first-pass: stores the source polygon vertices directly without
- * projecting them onto BSP geometry.  The decal is submitted as a poly batch
- * during each DX12_RenderScene call until DX12_ClearDecals() is called.
+ * @p verts must have xyz, st, and base modulate already computed (by
+ * RE_DX12_ProjectDecal).  The decal is re-submitted to the poly system on
+ * every DX12_RenderScene call, with the alpha channel scaled by the
+ * time-based fade factor, until it expires or DX12_ClearDecals() is called.
  */
-void DX12_AddDecalToScene(qhandle_t hShader, int numVerts, vec3_t *points,
-                          const float *color, int lifeTime, int fadeTime)
+void DX12_AddDecalToScene(qhandle_t hShader, int numVerts, const polyVert_t *verts,
+                          int fadeStartTime, int fadeEndTime)
 {
 	dx12Decal_t *dec;
 	int          i;
 	int          clampedVerts;
 
-	if (!points || numVerts < 3)
+	if (!verts || numVerts < 3)
 	{
 		return;
 	}
@@ -1481,35 +1539,15 @@ void DX12_AddDecalToScene(qhandle_t hShader, int numVerts, vec3_t *points,
 
 	clampedVerts = numVerts < DX12_MAX_DECAL_VERTS ? numVerts : DX12_MAX_DECAL_VERTS;
 
-	dec           = &dx12Scene.decals[dx12Scene.numDecals++];
-	dec->hShader  = hShader;
-	dec->numVerts = clampedVerts;
-	dec->lifeTime = lifeTime;
-	dec->fadeTime = fadeTime;
-
-	if (color)
-	{
-		dec->color[0] = color[0];
-		dec->color[1] = color[1];
-		dec->color[2] = color[2];
-		dec->color[3] = color[3];
-	}
-	else
-	{
-		dec->color[0] = dec->color[1] = dec->color[2] = dec->color[3] = 1.0f;
-	}
+	dec                = &dx12Scene.decals[dx12Scene.numDecals++];
+	dec->hShader       = hShader;
+	dec->numVerts      = clampedVerts;
+	dec->fadeStartTime = fadeStartTime;
+	dec->fadeEndTime   = fadeEndTime;
 
 	for (i = 0; i < clampedVerts; i++)
 	{
-		dec->verts[i].xyz[0] = points[i][0];
-		dec->verts[i].xyz[1] = points[i][1];
-		dec->verts[i].xyz[2] = points[i][2];
-		dec->verts[i].st[0]  = (float)i / (float)(clampedVerts - 1);
-		dec->verts[i].st[1]  = 0.5f;
-		dec->verts[i].modulate[0] = (byte)(dec->color[0] * 255.0f);
-		dec->verts[i].modulate[1] = (byte)(dec->color[1] * 255.0f);
-		dec->verts[i].modulate[2] = (byte)(dec->color[2] * 255.0f);
-		dec->verts[i].modulate[3] = (byte)(dec->color[3] * 255.0f);
+		dec->verts[i] = verts[i];
 	}
 }
 

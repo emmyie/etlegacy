@@ -1804,13 +1804,252 @@ static int RE_DX12_MarkFragments(int numPoints, const vec3_t *points, const vec3
 static void RE_DX12_ProjectDecal(qhandle_t hShader, int numPoints, vec3_t *points,
                                   vec4_t projection, vec4_t color, int lifeTime, int fadeTime)
 {
-	// Simplified first-pass: store the source polygon directly.  Full BSP-clip
-	// projection geometry is a TODO (the GL implementation clips world triangles
-	// against the projection volume; here we just feed the footprint polygon).
-	(void)projection;
-	DX12_AddDecalToScene(hShader, numPoints, points,
-	                     color ? (const float *)color : NULL,
-	                     lifeTime, fadeTime);
+	// ---------------------------------------------------------------------------
+	// Port of GL RE_ProjectDecal (renderer/tr_decals.c) adapted to use
+	// RE_DX12_MarkFragments for world-geometry clipping instead of walking
+	// BSP surfaces directly.
+	// ---------------------------------------------------------------------------
+
+	// Decal vertices built from the source polygon (xyz + standard ST layout)
+	typedef struct
+	{
+		vec3_t xyz;
+		float  st[2];
+	} dx12DeclVert_t;
+
+	dx12DeclVert_t  dv[4];
+	vec4_t          texMat[2];
+	vec4_t          proj;             // working copy of projection
+	int             numDvPoints;
+	int             now, fadeStartTime, fadeEndTime;
+
+	// Buffers for RE_DX12_MarkFragments output
+#define DX12_PROJ_MAX_POINTS    512
+#define DX12_PROJ_MAX_FRAGS     128
+	vec3_t          markPoints[DX12_PROJ_MAX_POINTS];
+	markFragment_t  markFrags[DX12_PROJ_MAX_FRAGS];
+	vec3_t          scaledProj;
+	int             numFrags;
+	int             f, p;
+
+	// ---- Input validation (matches GL RE_ProjectDecal) ----------------------
+	if (numPoints != 1 && numPoints != 3 && numPoints != 4)
+	{
+		return;
+	}
+	if (lifeTime == 0)
+	{
+		return;
+	}
+	if (projection[3] <= 0.0f)
+	{
+		return;
+	}
+
+	// ---- Timing (matches GL) ------------------------------------------------
+	if (lifeTime < 0 || fadeTime < 0)
+	{
+		lifeTime = 0;
+		fadeTime = 0;
+	}
+	now           = dx12.ri.Milliseconds();
+	fadeStartTime = now + lifeTime - fadeTime;
+	fadeEndTime   = fadeStartTime + fadeTime;
+
+	// ---- Byte colour components ---------------------------------------------
+	byte colR = (byte)(color[0] * 255.0f);
+	byte colG = (byte)(color[1] * 255.0f);
+	byte colB = (byte)(color[2] * 255.0f);
+	byte colA = (byte)(color[3] * 255.0f);
+
+	// ---- Standard UV layout (matches GL decalVert_t dv[0..3]) --------------
+	dv[0].st[0] = 0.0f; dv[0].st[1] = 0.0f;
+	dv[1].st[0] = 0.0f; dv[1].st[1] = 1.0f;
+	dv[2].st[0] = 1.0f; dv[2].st[1] = 1.0f;
+	dv[3].st[0] = 1.0f; dv[3].st[1] = 0.0f;
+
+	// Work on a local copy of projection so we can modify it for omnidirectional
+	proj[0] = projection[0];
+	proj[1] = projection[1];
+	proj[2] = projection[2];
+	proj[3] = projection[3];
+
+	// ---- Omnidirectional vs directional (matches GL) ------------------------
+	if (numPoints == 1)
+	{
+		float   radius, iDist;
+		vec3_t  corner;
+
+		radius = projection[3];
+		iDist  = 1.0f / (radius * 2.0f);
+
+		// Reconfigure as a downward-facing quad (GL omnidirectional path)
+		proj[0] = 0.0f; proj[1] = 0.0f; proj[2] = -1.0f; proj[3] = radius * 2.0f;
+
+		VectorSet(dv[0].xyz, points[0][0] - radius, points[0][1] - radius, points[0][2] + radius);
+		VectorSet(dv[1].xyz, points[0][0] - radius, points[0][1] + radius, points[0][2] + radius);
+		VectorSet(dv[2].xyz, points[0][0] + radius, points[0][1] + radius, points[0][2] + radius);
+		VectorSet(dv[3].xyz, points[0][0] + radius, points[0][1] - radius, points[0][2] + radius);
+		numDvPoints = 4;
+
+		// Build texMat for z-axis plane (xy coordinates)
+		VectorCopy(dv[0].xyz, corner);
+		texMat[0][0] = iDist; texMat[0][1] = 0.0f; texMat[0][2] = 0.0f;
+		texMat[0][3] = -DotProduct(texMat[0], corner);
+		texMat[1][0] = 0.0f;  texMat[1][1] = iDist; texMat[1][2] = 0.0f;
+		texMat[1][3] = -DotProduct(texMat[1], corner);
+	}
+	else
+	{
+		int i, j;
+		float  bb, s, t, d;
+		vec3_t pa, pb, pc;
+		vec3_t bary, origin, xyz;
+		vec3_t vecs[3], axis[3], lengths;
+
+		VectorCopy(points[0], dv[0].xyz);
+		VectorCopy(points[1], dv[1].xyz);
+		VectorCopy(points[2], dv[2].xyz);
+		if (numPoints >= 4)
+		{
+			VectorCopy(points[3], dv[3].xyz);
+		}
+		else
+		{
+			VectorCopy(points[2], dv[3].xyz); // pad degenerate quad
+		}
+		numDvPoints = 4;
+		omni        = qfalse;
+
+		// ---- MakeTextureMatrix (port of GL static MakeTextureMatrix) --------
+		// Project footprint triangle onto the projection plane
+		d = DotProduct(dv[0].xyz, proj) - proj[3];
+		VectorMA(dv[0].xyz, -d, proj, pa);
+		d = DotProduct(dv[1].xyz, proj) - proj[3];
+		VectorMA(dv[1].xyz, -d, proj, pb);
+		d = DotProduct(dv[2].xyz, proj) - proj[3];
+		VectorMA(dv[2].xyz, -d, proj, pc);
+
+		// Barycentric basis
+		bb = (dv[1].st[0] - dv[0].st[0]) * (dv[2].st[1] - dv[0].st[1])
+		     - (dv[2].st[0] - dv[0].st[0]) * (dv[1].st[1] - dv[0].st[1]);
+		if (Q_fabs(bb) < 0.00000001f)
+		{
+			return; // degenerate (matches GL "MakeTextureMatrix returns NULL")
+		}
+
+		// Texture origin (s=0, t=0)
+		s = 0.0f; t = 0.0f;
+		bary[0] = ((dv[1].st[0] - s) * (dv[2].st[1] - t) - (dv[2].st[0] - s) * (dv[1].st[1] - t)) / bb;
+		bary[1] = ((dv[2].st[0] - s) * (dv[0].st[1] - t) - (dv[0].st[0] - s) * (dv[2].st[1] - t)) / bb;
+		bary[2] = ((dv[0].st[0] - s) * (dv[1].st[1] - t) - (dv[1].st[0] - s) * (dv[0].st[1] - t)) / bb;
+		origin[0] = bary[0] * pa[0] + bary[1] * pb[0] + bary[2] * pc[0];
+		origin[1] = bary[0] * pa[1] + bary[1] * pb[1] + bary[2] * pc[1];
+		origin[2] = bary[0] * pa[2] + bary[1] * pb[2] + bary[2] * pc[2];
+
+		// S direction (s=1, t=0)
+		s = 1.0f; t = 0.0f;
+		bary[0] = ((dv[1].st[0] - s) * (dv[2].st[1] - t) - (dv[2].st[0] - s) * (dv[1].st[1] - t)) / bb;
+		bary[1] = ((dv[2].st[0] - s) * (dv[0].st[1] - t) - (dv[0].st[0] - s) * (dv[2].st[1] - t)) / bb;
+		bary[2] = ((dv[0].st[0] - s) * (dv[1].st[1] - t) - (dv[1].st[0] - s) * (dv[0].st[1] - t)) / bb;
+		xyz[0] = bary[0] * pa[0] + bary[1] * pb[0] + bary[2] * pc[0];
+		xyz[1] = bary[0] * pa[1] + bary[1] * pb[1] + bary[2] * pc[1];
+		xyz[2] = bary[0] * pa[2] + bary[1] * pb[2] + bary[2] * pc[2];
+		VectorSubtract(xyz, origin, vecs[0]);
+
+		// T direction (s=0, t=1)
+		s = 0.0f; t = 1.0f;
+		bary[0] = ((dv[1].st[0] - s) * (dv[2].st[1] - t) - (dv[2].st[0] - s) * (dv[1].st[1] - t)) / bb;
+		bary[1] = ((dv[2].st[0] - s) * (dv[0].st[1] - t) - (dv[0].st[0] - s) * (dv[2].st[1] - t)) / bb;
+		bary[2] = ((dv[0].st[0] - s) * (dv[1].st[1] - t) - (dv[1].st[0] - s) * (dv[0].st[1] - t)) / bb;
+		xyz[0] = bary[0] * pa[0] + bary[1] * pb[0] + bary[2] * pc[0];
+		xyz[1] = bary[0] * pa[1] + bary[1] * pb[1] + bary[2] * pc[1];
+		xyz[2] = bary[0] * pa[2] + bary[1] * pb[2] + bary[2] * pc[2];
+		VectorSubtract(xyz, origin, vecs[1]);
+
+		// Projection (R) direction
+		VectorScale(proj, -1.0f, vecs[2]);
+
+		// Normalise to build texMat rows
+		for (i = 0; i < 3; i++)
+		{
+			lengths[i] = VectorNormalize2(vecs[i], axis[i]);
+		}
+		for (i = 0; i < 2; i++)
+		{
+			for (j = 0; j < 3; j++)
+			{
+				texMat[i][j] = lengths[i] > 0.0f ? (axis[i][j] / lengths[i]) : 0.0f;
+			}
+		}
+		texMat[0][3] = dv[0].st[0] - DotProduct(pa, texMat[0]);
+		texMat[1][3] = dv[0].st[1] - DotProduct(pa, texMat[1]);
+	}
+
+	// ---- Call MarkFragments to get clipped world geometry -------------------
+	// MarkFragments expects projection as a vec3_t scaled by depth.
+	// proj[0..2] * proj[3] gives the directional extent vector.
+	scaledProj[0] = proj[0] * proj[3];
+	scaledProj[1] = proj[1] * proj[3];
+	scaledProj[2] = proj[2] * proj[3];
+
+	{
+		vec3_t dvXyz[4];
+
+		dvXyz[0][0] = dv[0].xyz[0]; dvXyz[0][1] = dv[0].xyz[1]; dvXyz[0][2] = dv[0].xyz[2];
+		dvXyz[1][0] = dv[1].xyz[0]; dvXyz[1][1] = dv[1].xyz[1]; dvXyz[1][2] = dv[1].xyz[2];
+		dvXyz[2][0] = dv[2].xyz[0]; dvXyz[2][1] = dv[2].xyz[1]; dvXyz[2][2] = dv[2].xyz[2];
+		dvXyz[3][0] = dv[3].xyz[0]; dvXyz[3][1] = dv[3].xyz[1]; dvXyz[3][2] = dv[3].xyz[2];
+
+		numFrags = RE_DX12_MarkFragments(numDvPoints, (const vec3_t *)dvXyz,
+		                                  scaledProj,
+		                                  DX12_PROJ_MAX_POINTS, markPoints[0],
+		                                  DX12_PROJ_MAX_FRAGS,  markFrags);
+	}
+
+	if (numFrags == 0)
+	{
+		return;
+	}
+
+	// ---- For each fragment: apply texMat ST, store as persistent decal ------
+	for (f = 0; f < numFrags; f++)
+	{
+		markFragment_t *mf = &markFrags[f];
+		polyVert_t      verts[DX12_MAX_DECAL_VERTS];
+		int             numV;
+
+		if (mf->numPoints < 3)
+		{
+			continue;
+		}
+
+		numV = mf->numPoints < DX12_MAX_DECAL_VERTS ? mf->numPoints : DX12_MAX_DECAL_VERTS;
+
+		for (p = 0; p < numV; p++)
+		{
+			float *xyz = markPoints[mf->firstPoint + p];
+
+			verts[p].xyz[0] = xyz[0];
+			verts[p].xyz[1] = xyz[1];
+			verts[p].xyz[2] = xyz[2];
+
+			// ST from texMat (matches GL ProjectDecalOntoWinding)
+			verts[p].st[0] = DotProduct(xyz, texMat[0]) + texMat[0][3];
+			verts[p].st[1] = DotProduct(xyz, texMat[1]) + texMat[1][3];
+
+			// Base colour (time-based alpha applied per-frame in DX12_RenderScene)
+			verts[p].modulate[0] = colR;
+			verts[p].modulate[1] = colG;
+			verts[p].modulate[2] = colB;
+			verts[p].modulate[3] = colA;
+		}
+
+		DX12_AddDecalToScene(hShader, numV, verts, fadeStartTime, fadeEndTime);
+	}
+
+#undef DX12_PROJ_MAX_POINTS
+#undef DX12_PROJ_MAX_FRAGS
 }
 
 static void RE_DX12_ClearDecals(void)
