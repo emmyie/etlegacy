@@ -23,6 +23,8 @@
 extern "C" int32_t puff(uint8_t *dest, uint32_t *destlen,
                          uint8_t *source, uint32_t *sourcelen);
 
+#define Q3IMAGE_BYTESPERPIXEL 4  // RGBA format: 4 bytes per pixel
+
 // ---------------------------------------------------------------------------
 // TGA decoding
 // ---------------------------------------------------------------------------
