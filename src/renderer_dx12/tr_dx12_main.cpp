@@ -2475,9 +2475,88 @@ static void RE_DX12_Finish(void)
 	}
 }
 
+// Forward declaration – defined in renderercommon/tr_image_jpg.c, linked with this module.
+extern "C" size_t RE_SaveJPGToBuffer(byte *buffer, size_t bufSize, int quality,
+                                     int image_width, int image_height,
+                                     byte *image_buffer, int padding);
+
+#ifndef AVI_LINE_PADDING
+#define AVI_LINE_PADDING 4
+#endif
+
+/**
+ * @brief RE_DX12_TakeVideoFrame
+ * @param[in] h            Frame height (first argument per tr_public.h TakeVideoFrame signature)
+ * @param[in] w            Frame width  (second argument)
+ * @param[in] captureBuffer Caller-supplied readback scratch buffer
+ * @param[in] encodeBuffer  Caller-supplied encode output buffer
+ * @param[in] motionJpeg    If qtrue, encode as JPEG; otherwise produce raw BGR AVI rows
+ */
 static void RE_DX12_TakeVideoFrame(int h, int w, byte *captureBuffer, byte *encodeBuffer, qboolean motionJpeg)
 {
-	(void)h; (void)w; (void)captureBuffer; (void)encodeBuffer; (void)motionJpeg;
+	// tr_public.h prototype: TakeVideoFrame(int h, int w, ...) – h is height, w is width.
+	int    width   = w;
+	int    height  = h;
+	byte  *cBuf    = captureBuffer;
+	size_t linelen;
+	int    padwidth;
+	int    avipadwidth;
+	int    avipadlen;
+	int    padlen;
+
+	if (!dx12.initialized || !cBuf || !encodeBuffer || width <= 0 || height <= 0)
+	{
+		return;
+	}
+
+	// Read back the current back-buffer into cBuf as packed RGB with 4-byte row padding
+	// (matches GL_PACK_ALIGNMENT=4 used by glReadPixels in the GL path).
+	if (!DX12_ReadbackRenderTarget(cBuf, width, height))
+	{
+		return;
+	}
+
+	linelen    = (size_t)width * 3;
+	padwidth   = ((int)linelen + 3) & ~3;   // PAD(linelen, 4)
+	padlen     = padwidth - (int)linelen;
+	avipadwidth = ((int)linelen + AVI_LINE_PADDING - 1) & ~(AVI_LINE_PADDING - 1);
+	avipadlen   = avipadwidth - (int)linelen;
+
+	if (motionJpeg)
+	{
+		size_t memcount = RE_SaveJPGToBuffer(encodeBuffer, linelen * (size_t)height,
+		                                     dx12.ri.Cvar_Get("r_screenshotJpegQuality", "90", 0)->integer,
+		                                     width, height, cBuf, padlen);
+		dx12.ri.CL_WriteAVIVideoFrame(encodeBuffer, (int)memcount);
+	}
+	else
+	{
+		// Swap R↔B (GL reads RGB; AVI expects BGR) and remove row padding.
+		byte       *srcptr  = cBuf;
+		byte       *destptr = encodeBuffer;
+		const byte *memend  = srcptr + (size_t)padwidth * (size_t)height;
+
+		while (srcptr < memend)
+		{
+			const byte *lineend = srcptr + linelen;
+
+			while (srcptr < lineend)
+			{
+				*destptr++ = srcptr[2];   // B
+				*destptr++ = srcptr[1];   // G
+				*destptr++ = srcptr[0];   // R
+				srcptr    += 3;
+			}
+
+			// AVI row padding (zero bytes)
+			Com_Memset(destptr, '\0', (size_t)avipadlen);
+			destptr += avipadlen;
+
+			srcptr += padlen;   // skip RGB row padding
+		}
+
+		dx12.ri.CL_WriteAVIVideoFrame(encodeBuffer, avipadwidth * height);
+	}
 }
 
 static void RE_DX12_InitOpenGL(void)
