@@ -169,9 +169,25 @@ static void RE_DX12_BeginRegistration(glconfig_t *config)
 	dx12.vidHeight = config->vidHeight;
 }
 
+/**
+ * @brief RE_DX12_EndRegistration
+ *
+ * Mirrors GL_EndRegistration semantics.  The GL implementation flushes
+ * pending render commands (R_IssuePendingRenderCommands) and optionally
+ * calls RB_ShowImages.  Neither concept applies to the DX12 renderer:
+ *
+ *  - DX12 does not use a registration-sequence counter, so there are no
+ *    "stale" skins, models, or materials to invalidate.
+ *  - DX12 has no deferred render-command queue to flush.
+ *  - World geometry, scene data, and GPU buffers must not be touched here
+ *    (per the function contract).
+ *
+ * Therefore this function is intentionally a no-op.  The hook is retained
+ * so that future DX12 resource-lifetime tracking can be wired in here
+ * without changing the call-site.
+ */
 static void RE_DX12_EndRegistration(void)
 {
-	// Nothing to do for a minimal implementation
 }
 
 static void RE_DX12_RenderScene(const refdef_t *fd)
