@@ -382,11 +382,15 @@ static void SCN_DrawSurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDRESS 
 	}
 
 	// --- Issue draw call ---
+	// Indices in the world index buffer are absolute (the loader rebases them
+	// to the global vertex array), so BaseVertexLocation must be 0.
+	// Using ds->firstVertex here would double-add the per-surface base offset
+	// and cause "vertex buffer too small" / "index buffer too small" errors.
 	dx12.commandList->DrawIndexedInstanced(
 		(UINT)ds->numIndexes,   // IndexCountPerInstance
 		1,                      // InstanceCount
 		(UINT)ds->firstIndex,   // StartIndexLocation
-		ds->firstVertex,        // BaseVertexLocation
+		0,                      // BaseVertexLocation (indices are already absolute)
 		0                       // StartInstanceLocation
 		);
 }

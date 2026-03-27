@@ -675,8 +675,8 @@ void DX12_LoadWorld(const char *name)
 		if (count > 0)
 		{
 			// ---- Allocate parallel arrays for batch upload ----
-			ID3D12Resource **texResources    = (ID3D12Resource **)dx12.ri.Z_Malloc(count * (int)sizeof(ID3D12Resource *));
-			ID3D12Resource **uploadBuffers   = (ID3D12Resource **)dx12.ri.Z_Malloc(count * (int)sizeof(ID3D12Resource *));
+			ID3D12Resource **texResources    = (ID3D12Resource **)dx12.ri.Z_Malloc((int)((size_t)count * sizeof(ID3D12Resource *)));
+			ID3D12Resource **uploadBuffers   = (ID3D12Resource **)dx12.ri.Z_Malloc((int)((size_t)count * sizeof(ID3D12Resource *)));
 			HRESULT          hr;
 
 			if (!texResources || !uploadBuffers)
