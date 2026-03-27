@@ -41,28 +41,40 @@ static const char *g_shaderSource =
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Wait for the GPU to finish processing the current fence value
+ * @brief Wait for all outstanding GPU work on the main queue to complete.
+ *
+ * Uses a strictly-increasing signal value (++nextFenceValue) so the fence
+ * value is always greater than any previously signaled value.  Using the
+ * per-frame fenceValues[] as the signal target is incorrect because those
+ * values were already signaled by DX12_MoveToNextFrame, and D3D12 requires
+ * each new Signal call to use a strictly increasing value.
  */
 static void DX12_WaitForGpu(void)
 {
-	HRESULT hr;
+	HRESULT      hr;
+	const UINT64 signalValue = ++dx12.nextFenceValue;
 
-	hr = dx12.commandQueue->Signal(dx12.fence, dx12.fenceValues[dx12.frameIndex]);
+	hr = dx12.commandQueue->Signal(dx12.fence, signalValue);
 	if (FAILED(hr))
 	{
 		dx12.ri.Printf(PRINT_WARNING, "R_DX12: Signal failed (0x%08lx)\n", hr);
 		return;
 	}
 
-	hr = dx12.fence->SetEventOnCompletion(dx12.fenceValues[dx12.frameIndex], dx12.fenceEvent);
-	if (FAILED(hr))
+	if (dx12.fence->GetCompletedValue() < signalValue)
 	{
-		dx12.ri.Printf(PRINT_WARNING, "R_DX12: SetEventOnCompletion failed (0x%08lx)\n", hr);
-		return;
+		hr = dx12.fence->SetEventOnCompletion(signalValue, dx12.fenceEvent);
+		if (FAILED(hr))
+		{
+			dx12.ri.Printf(PRINT_WARNING, "R_DX12: SetEventOnCompletion failed (0x%08lx)\n", hr);
+			return;
+		}
+		WaitForSingleObjectEx(dx12.fenceEvent, INFINITE, FALSE);
 	}
 
-	WaitForSingleObjectEx(dx12.fenceEvent, INFINITE, FALSE);
-	dx12.fenceValues[dx12.frameIndex]++;
+	// Record the signaled value for the current frame slot so MoveToNextFrame
+	// can skip an unnecessary wait if the GPU already caught up.
+	dx12.fenceValues[dx12.frameIndex] = signalValue;
 }
 
 /**
@@ -99,50 +111,49 @@ static void DX12_MoveToNextFrame( void )
 	}
 }
 
+/**
+ * @brief Block the CPU until all commands already submitted to @p queue have
+ *        completed on the GPU.
+ *
+ * Uses the shared dx12.fence and dx12.fenceEvent with a monotonically
+ * increasing signal value rather than allocating a new fence and Win32 event
+ * on every call.  The old implementation created a fence+event pair for every
+ * texture or model upload (hundreds of calls at map load), which is expensive
+ * and unnecessary.
+ *
+ * @p queue must be dx12.commandQueue; the parameter is kept for API
+ * compatibility with existing call sites.
+ */
 void DX12_WaitForUpload( ID3D12CommandQueue* queue )
 {
-	ID3D12Fence* fence = NULL;
-	HANDLE event;
-	UINT64 value = 1;
-	HRESULT hr;
+	HRESULT      hr;
+	const UINT64 signalValue = ++dx12.nextFenceValue;
 
-	event = CreateEvent( NULL, FALSE, FALSE, NULL );
-	if ( !event )
+	// Require shared fence and event (both are created during R_DX12_Init,
+	// before any upload call is made).
+	if ( !dx12.fence || !dx12.fenceEvent )
 	{
-		dx12.ri.Printf( PRINT_WARNING, "DX12_WaitForUpload: CreateEvent failed\n" );
+		dx12.ri.Printf( PRINT_WARNING, "DX12_WaitForUpload: fence/event not initialized\n" );
 		return;
 	}
 
-	hr = dx12.device->CreateFence( 0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS( &fence ) );
-	if ( FAILED( hr ) || !fence )
-	{
-		dx12.ri.Printf( PRINT_WARNING, "DX12_WaitForUpload: CreateFence failed (0x%08lx)\n", hr );
-		CloseHandle( event );
-		return;
-	}
-
-	hr = queue->Signal( fence, value );
+	hr = queue->Signal( dx12.fence, signalValue );
 	if ( FAILED( hr ) )
 	{
 		dx12.ri.Printf( PRINT_WARNING, "DX12_WaitForUpload: Signal failed (0x%08lx)\n", hr );
-		fence->Release();
-		CloseHandle( event );
 		return;
 	}
 
-	hr = fence->SetEventOnCompletion( value, event );
-	if ( FAILED( hr ) )
+	if ( dx12.fence->GetCompletedValue() < signalValue )
 	{
-		dx12.ri.Printf( PRINT_WARNING, "DX12_WaitForUpload: SetEventOnCompletion failed (0x%08lx)\n", hr );
-		fence->Release();
-		CloseHandle( event );
-		return;
+		hr = dx12.fence->SetEventOnCompletion( signalValue, dx12.fenceEvent );
+		if ( FAILED( hr ) )
+		{
+			dx12.ri.Printf( PRINT_WARNING, "DX12_WaitForUpload: SetEventOnCompletion failed (0x%08lx)\n", hr );
+			return;
+		}
+		WaitForSingleObjectEx( dx12.fenceEvent, INFINITE, FALSE );
 	}
-
-	WaitForSingleObject( event, INFINITE );
-
-	CloseHandle( event );
-	fence->Release( );
 }
 
 // ---------------------------------------------------------------------------
@@ -1238,6 +1249,9 @@ void R_DX12_Shutdown(qboolean destroyWindow)
 	DX12_SceneShutdown();
 	DX12_ShutdownModels();
 	DX12_ShutdownWorld();
+
+	// Release cinematic scratch textures
+	DX12_ShutdownScratchTextures();
 
 	// Release all D3D12 texture resources
 	DX12_ShutdownTextures();

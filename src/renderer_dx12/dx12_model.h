@@ -49,10 +49,11 @@
 #ifdef _WIN32
 
 #include "tr_dx12_local.h"
-#include "dx12_scene.h"   // dx12SceneEntity_t
+#include "dx12_scene.h"      // dx12SceneEntity_t
+#include "dx12_skeletal.h"   // dx12ModelType_t
 
 extern "C" {
-#include "../qcommon/qfiles.h"  // md3Tag_t, md3Header_t
+#include "../qcommon/qfiles.h"  // md3Tag_t, md3Header_t, mdsHeader_t, mdmHeader_t, mdxHeader_t
 }
 
 // ---------------------------------------------------------------------------
@@ -104,6 +105,18 @@ typedef struct
 	md3Tag_t *tags;     ///< Flattened array: tags[frame * numTags + tagIdx]
 	int       numTags;  ///< Tags per frame
 	int       numFrames;///< Total animation frames
+
+	// Model type – controls which tag/bounds path to use.
+	dx12ModelType_t modelType;
+
+	// Raw skeletal data – malloc'd heap copy of the on-disk binary.
+	// Interpretation depends on modelType:
+	//   DX12_MOD_MDS → mdsHeader_t*  (embedded bone + frame data)
+	//   DX12_MOD_MDM → mdmHeader_t*  (tag data; animation via companion MDX)
+	//   DX12_MOD_MDX → mdxHeader_t*  (pure animation data for MDM)
+	// Freed by DX12_ShutdownModels.
+	void *rawData;
+	int   rawDataSize;
 } dx12ModelEntry_t;
 
 /** Parallel to dx12ModelNames[] in tr_dx12_main.cpp. */

@@ -106,7 +106,12 @@ static qboolean WLD_UploadBuffer(const void *data, UINT64 sizeBytes,
 		&defaultHeap,
 		D3D12_HEAP_FLAG_NONE,
 		&bufDesc,
-		D3D12_RESOURCE_STATE_COPY_DEST,
+		// D3D12 buffers are always effectively created in COMMON state;
+		// using COPY_DEST triggers a debug layer warning.  COMMON buffers
+		// are implicitly promoted to COPY_DEST when used as a copy
+		// destination, so the explicit barrier below (COPY_DEST →
+		// GENERIC_READ) is still correct.
+		D3D12_RESOURCE_STATE_COMMON,
 		NULL,
 		IID_PPV_ARGS(outBuffer));
 
@@ -365,8 +370,31 @@ void DX12_ShutdownWorld(void)
 	if (dx12World.entityString)
 	{
 		dx12.ri.Free(dx12World.entityString);
-		//free( dx12World.entityString );
 		dx12World.entityString = NULL;
+	}
+
+	if (dx12World.bspNodes)
+	{
+		free(dx12World.bspNodes);
+		dx12World.bspNodes = NULL;
+	}
+
+	if (dx12World.bspPlanes)
+	{
+		free(dx12World.bspPlanes);
+		dx12World.bspPlanes = NULL;
+	}
+
+	if (dx12World.vis)
+	{
+		free(dx12World.vis);
+		dx12World.vis = NULL;
+	}
+
+	if (dx12World.novis)
+	{
+		free(dx12World.novis);
+		dx12World.novis = NULL;
 	}
 
 	Com_Memset(&dx12World, 0, sizeof(dx12World));
@@ -458,6 +486,150 @@ void DX12_LoadWorld(const char *name)
 	}
 
 	// ----------------------------------------------------------------
+	// 0a.  BSP planes (LUMP_PLANES) – needed by DX12_inPVS
+	// ----------------------------------------------------------------
+	{
+		lump_t   *lump  = &header->lumps[LUMP_PLANES];
+		dplane_t *in    = (dplane_t *)(fileBase + lump->fileofs);
+		int       count = 0;
+
+		if (lump->filelen > 0 && (lump->filelen % (int)sizeof(dplane_t)) == 0)
+		{
+			count = lump->filelen / (int)sizeof(dplane_t);
+			dx12World.bspPlanes = (dplane_t *)malloc((size_t)count * sizeof(dplane_t));
+			if (dx12World.bspPlanes)
+			{
+				int pi;
+
+				for (pi = 0; pi < count; pi++)
+				{
+					dx12World.bspPlanes[pi].normal[0] = in[pi].normal[0];
+					dx12World.bspPlanes[pi].normal[1] = in[pi].normal[1];
+					dx12World.bspPlanes[pi].normal[2] = in[pi].normal[2];
+					dx12World.bspPlanes[pi].dist       = in[pi].dist;
+				}
+				dx12World.numBspPlanes = count;
+			}
+		}
+	}
+
+	// ----------------------------------------------------------------
+	// 0b.  BSP nodes + leaves (LUMP_NODES, LUMP_LEAFS) – for PointInLeaf
+	// ----------------------------------------------------------------
+	{
+		lump_t   *nodeLump = &header->lumps[LUMP_NODES];
+		lump_t   *leafLump = &header->lumps[LUMP_LEAFS];
+		dnode_t  *inNodes  = (dnode_t *)(fileBase + nodeLump->fileofs);
+		dleaf_t  *inLeafs  = (dleaf_t *)(fileBase + leafLump->fileofs);
+		int       numNodes = 0;
+		int       numLeafs = 0;
+		int       ni;
+
+		if (nodeLump->filelen > 0 && (nodeLump->filelen % (int)sizeof(dnode_t)) == 0)
+		{
+			numNodes = nodeLump->filelen / (int)sizeof(dnode_t);
+		}
+		if (leafLump->filelen > 0 && (leafLump->filelen % (int)sizeof(dleaf_t)) == 0)
+		{
+			numLeafs = leafLump->filelen / (int)sizeof(dleaf_t);
+		}
+
+		if (numNodes > 0 || numLeafs > 0)
+		{
+			int total = numNodes + numLeafs;
+
+			dx12World.bspNodes = (dx12BspNode_t *)malloc((size_t)total * sizeof(dx12BspNode_t));
+			if (dx12World.bspNodes)
+			{
+				dx12BspNode_t *out = dx12World.bspNodes;
+
+				dx12World.numBspNodes      = total;
+				dx12World.numDecisionNodes = numNodes;
+
+				// Load decision nodes
+				for (ni = 0; ni < numNodes; ni++, out++)
+				{
+					int c0 = LittleLong(inNodes[ni].children[0]);
+					int c1 = LittleLong(inNodes[ni].children[1]);
+
+					out->contents = -1;  // decision node sentinel
+					out->cluster  = -1;
+					out->planeIdx = LittleLong(inNodes[ni].planeNum);
+
+					// Positive children are node indices; negative are leaf indices
+					// encoded as -(leaf+1).  Map both into the combined array:
+					// nodes occupy [0, numNodes), leaves occupy [numNodes, total).
+					out->children[0] = (c0 >= 0) ? c0 : (numNodes + (-1 - c0));
+					out->children[1] = (c1 >= 0) ? c1 : (numNodes + (-1 - c1));
+				}
+
+				// Load leaves
+				for (ni = 0; ni < numLeafs; ni++, out++)
+				{
+					int cluster = LittleLong(inLeafs[ni].cluster);
+
+					out->contents    = 0;   // leaf sentinel (>= 0)
+					out->cluster     = cluster;
+					out->planeIdx    = -1;
+					out->children[0] = -1;
+					out->children[1] = -1;
+
+					// Track maximum cluster count from leaves
+					if (cluster >= dx12World.numClusters)
+					{
+						dx12World.numClusters = cluster + 1;
+					}
+				}
+			}
+		}
+	}
+
+	// ----------------------------------------------------------------
+	// 0c.  Visibility data (LUMP_VISIBILITY) – for DX12_inPVS
+	// ----------------------------------------------------------------
+	{
+		lump_t     *lump = &header->lumps[LUMP_VISIBILITY];
+		const byte *buf  = fileBase + lump->fileofs;
+		int         len  = lump->filelen;
+
+		// Allocate an all-0xFF "novis" row so DX12_inPVS always has a fallback
+		{
+			int novisLen = dx12World.numClusters > 0
+			               ? ((dx12World.numClusters + 63) & ~63)   // PAD to 64
+			               : 64;
+
+			dx12World.novis = (byte *)malloc((size_t)novisLen);
+			if (dx12World.novis)
+			{
+				memset(dx12World.novis, 0xFF, (size_t)novisLen);
+			}
+		}
+
+		if (len >= 8)
+		{
+			// Visibility lump layout: [ int numClusters | int clusterBytes | data... ]
+			int numClusters  = LittleLong(((const int *)buf)[0]);
+			int clusterBytes = LittleLong(((const int *)buf)[1]);
+			int dataLen      = len - 8;
+
+			if (numClusters > 0 && clusterBytes > 0 && dataLen > 0)
+			{
+				dx12World.vis = (byte *)malloc((size_t)dataLen);
+				if (dx12World.vis)
+				{
+					memcpy(dx12World.vis, buf + 8, (size_t)dataLen);
+					dx12World.numClusters  = numClusters;
+					dx12World.clusterBytes = clusterBytes;
+				}
+			}
+		}
+
+		dx12.ri.Printf(PRINT_DEVELOPER,
+		               "DX12_LoadWorld: %d PVS clusters, %d bytes/cluster\n",
+		               dx12World.numClusters, dx12World.clusterBytes);
+	}
+
+	// ----------------------------------------------------------------
 	// 1.  BSP shader lump → register DX12 materials
 	// ----------------------------------------------------------------
 	{
@@ -503,8 +675,8 @@ void DX12_LoadWorld(const char *name)
 		if (count > 0)
 		{
 			// ---- Allocate parallel arrays for batch upload ----
-			ID3D12Resource **texResources    = (ID3D12Resource **)dx12.ri.Malloc(count * (int)sizeof(ID3D12Resource *));
-			ID3D12Resource **uploadBuffers   = (ID3D12Resource **)dx12.ri.Malloc(count * (int)sizeof(ID3D12Resource *));
+			ID3D12Resource **texResources    = (ID3D12Resource **)dx12.ri.Z_Malloc((int)((size_t)count * sizeof(ID3D12Resource *)));
+			ID3D12Resource **uploadBuffers   = (ID3D12Resource **)dx12.ri.Z_Malloc((int)((size_t)count * sizeof(ID3D12Resource *)));
 			HRESULT          hr;
 
 			if (!texResources || !uploadBuffers)
@@ -1296,6 +1468,118 @@ patch_overflow:
 	               name, dx12World.numDrawSurfs,
 	               (int)dx12World.numVertices, (int)dx12World.numIndexes,
 	               dx12World.numFogs - 1);
+}
+
+// ---------------------------------------------------------------------------
+// DX12_inPVS
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Traverse the BSP tree from root to find the leaf containing point p.
+ *
+ * @param[in] p  World-space point.
+ * @return       Pointer to the leaf node; NULL if world not loaded.
+ */
+static const dx12BspNode_t *DX12_PointInLeaf(const vec3_t p)
+{
+	int nodeIdx = 0; // start at root
+
+	if (!dx12World.bspNodes || !dx12World.bspPlanes || dx12World.numBspNodes == 0)
+	{
+		return NULL;
+	}
+
+	while (nodeIdx < dx12World.numDecisionNodes)
+	{
+		const dx12BspNode_t *node   = &dx12World.bspNodes[nodeIdx];
+		float                dist;
+
+		if (node->planeIdx < 0 || node->planeIdx >= dx12World.numBspPlanes)
+		{
+			return NULL;
+		}
+
+		{
+			const dplane_t *plane = &dx12World.bspPlanes[node->planeIdx];
+			dist = DotProduct(p, plane->normal) - plane->dist;
+		}
+		nodeIdx = (dist >= 0.0f) ? node->children[0] : node->children[1];
+
+		if (nodeIdx < 0 || nodeIdx >= dx12World.numBspNodes)
+		{
+			return NULL;
+		}
+	}
+
+	return &dx12World.bspNodes[nodeIdx];
+}
+
+/**
+ * @brief Return the PVS bit-vector row for the given cluster index.
+ *
+ * @param[in] cluster  PVS cluster index.
+ * @return             Pointer to the cluster's bit-vector row in vis[].
+ *                     Returns novis (all-visible) if vis data is absent.
+ */
+static const byte *DX12_ClusterPVS(int cluster)
+{
+	if (!dx12World.vis || cluster < 0 || cluster >= dx12World.numClusters)
+	{
+		return dx12World.novis;
+	}
+
+	return dx12World.vis + (size_t)cluster * (size_t)dx12World.clusterBytes;
+}
+
+/**
+ * @brief DX12_inPVS
+ *
+ * Returns qtrue if the two world-space points p1 and p2 are in the same or
+ * mutually-visible PVS clusters (mirrors GL's R_inPVS).
+ */
+qboolean DX12_inPVS(const vec3_t p1, const vec3_t p2)
+{
+	const dx12BspNode_t *leaf;
+	const byte          *vis;
+	int                  cluster;
+
+	if (!dx12World.loaded || !dx12World.bspNodes)
+	{
+		return qfalse;
+	}
+
+	leaf = DX12_PointInLeaf(p1);
+	if (!leaf)
+	{
+		return qfalse;
+	}
+
+	vis = DX12_ClusterPVS(leaf->cluster);
+
+	leaf = DX12_PointInLeaf(p2);
+	if (!leaf)
+	{
+		return qfalse;
+	}
+
+	cluster = leaf->cluster;
+	if (cluster < 0)
+	{
+		return qfalse;
+	}
+
+	if (!dx12World.vis)
+	{
+		// No vis data – treat everything as visible
+		return qtrue;
+	}
+
+	if (!(vis[cluster >> 3] & (1 << (cluster & 7))))
+	{
+		return qfalse;
+	}
+
+	return qtrue;
 }
 
 #endif // _WIN32
