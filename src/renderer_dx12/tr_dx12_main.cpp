@@ -455,7 +455,7 @@ static void RE_DX12_ClearDecals(void)
 static int RE_DX12_LerpTag(orientation_t *tag, const refEntity_t *refent,
                             const char *tagName, int startIndex)
 {
-	(void)tag; (void)refent; (void)tagName; (void)startIndex; return 0;
+	return DX12_LerpTag(tag, refent, tagName, startIndex);
 }
 
 static void RE_DX12_ModelBounds(qhandle_t model, vec3_t mins, vec3_t maxs)

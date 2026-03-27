@@ -51,6 +51,10 @@
 #include "tr_dx12_local.h"
 #include "dx12_scene.h"   // dx12SceneEntity_t
 
+extern "C" {
+#include "../qcommon/qfiles.h"  // md3Tag_t, md3Header_t
+}
+
 // ---------------------------------------------------------------------------
 // Limits
 // ---------------------------------------------------------------------------
@@ -94,6 +98,12 @@ typedef struct
 	float              mins[3]; ///< Frame-0 AABB minimum (local space)
 	float              maxs[3]; ///< Frame-0 AABB maximum (local space)
 	qboolean           valid;   ///< qtrue when GPU buffers are ready
+
+	// MD3 tag data (all frames × all tags) – used by DX12_LerpTag.
+	// Allocated by DX12_LoadMD3, freed by DX12_ShutdownModels.
+	md3Tag_t *tags;     ///< Flattened array: tags[frame * numTags + tagIdx]
+	int       numTags;  ///< Tags per frame
+	int       numFrames;///< Total animation frames
 } dx12ModelEntry_t;
 
 /** Parallel to dx12ModelNames[] in tr_dx12_main.cpp. */
@@ -134,6 +144,21 @@ void DX12_DrawEntity(const dx12SceneEntity_t *ent, D3D12_GPU_VIRTUAL_ADDRESS cbG
  * Should be called from R_DX12_Shutdown() before releasing the device.
  */
 void DX12_ShutdownModels(void);
+
+/**
+ * @brief Interpolate an MD3 tag between two animation frames.
+ *
+ * Mirrors GL's R_LerpTag for the MD3 (MOD_MESH) case.  The caller provides
+ * the refEntity_t so this function can read the frame indices and backlerp.
+ *
+ * @param[out] tag       Receives the interpolated orientation.
+ * @param[in]  refent    Entity whose model and frame data to use.
+ * @param[in]  tagName   Tag to find (case-sensitive).
+ * @param[in]  startIndex Start search at this tag index (for duplicate names).
+ * @return     Tag index found, or -1 on failure.
+ */
+int DX12_LerpTag(orientation_t *tag, const refEntity_t *refent,
+                 const char *tagName, int startIndex);
 
 #endif // _WIN32
 #endif // DX12_MODEL_H

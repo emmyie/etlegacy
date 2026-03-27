@@ -43,6 +43,10 @@
 
 #include "tr_dx12_local.h"
 
+extern "C" {
+#include "../qcommon/qfiles.h"   // dnode_t, dleaf_t, dplane_t, LUMP_* defines
+}
+
 // ---------------------------------------------------------------------------
 // Limits
 // ---------------------------------------------------------------------------
@@ -57,6 +61,25 @@
 #define DX12_MAX_DRAW_SURFS      0x20000 ///< MAX_MAP_DRAW_SURFS
 /** Maximum simultaneously loaded lightmap textures. */
 #define DX12_MAX_LIGHTMAPS       256
+
+// ---------------------------------------------------------------------------
+// BSP node/leaf – simplified version for PVS traversal only
+// ---------------------------------------------------------------------------
+
+/**
+ * @struct dx12BspNode_t
+ * @brief Minimal BSP node or leaf used only for PointInLeaf traversal.
+ *
+ * For nodes: contents == -1, planeIdx >= 0, children[0/1] are valid.
+ * For leaves: contents >= 0 (cluster, -1 for opaque), planeIdx == -1.
+ */
+typedef struct
+{
+	int contents;    ///< -1 = decision node; >= 0 = leaf (cluster index, or -1)
+	int cluster;     ///< Leaf cluster (-1 for opaque/solid leaves)
+	int planeIdx;    ///< Index into dx12World.bspPlanes (nodes only)
+	int children[2]; ///< Child indices into bspNodes[] (nodes only); negative = -(leaf+1)
+} dx12BspNode_t;
 
 // ---------------------------------------------------------------------------
 // Vertex layout
@@ -183,6 +206,18 @@ typedef struct
 	char       *entityString;     ///< Allocated copy of the raw entity lump text
 	char *entityParsePoint; ///< Current parse position within entityString
 
+	// BSP node/leaf/visibility data – used by DX12_inPVS
+	dx12BspNode_t *bspNodes;      ///< Combined node + leaf array (malloc'd)
+	int            numBspNodes;   ///< Total node + leaf count
+	int            numDecisionNodes; ///< Number of decision nodes (nodes, not leaves)
+	dplane_t      *bspPlanes;     ///< Plane array (malloc'd)
+	int            numBspPlanes;  ///< Plane count
+
+	byte *vis;           ///< Raw PVS data (malloc'd; NULL if no vis data)
+	byte *novis;         ///< All-0xFF row for "visible" fallback (malloc'd)
+	int   numClusters;   ///< Number of PVS clusters
+	int   clusterBytes;  ///< Bytes per cluster row in vis[]
+
 	qboolean loaded; ///< qtrue after a successful DX12_LoadWorld() call
 } dx12World_t;
 
@@ -209,6 +244,18 @@ void DX12_LoadWorld(const char *name);
  * at any time; does nothing if no world is currently loaded.
  */
 void DX12_ShutdownWorld(void);
+
+/**
+ * @brief DX12_inPVS
+ *
+ * Returns qtrue if the two world-space points p1 and p2 are in the same or
+ * mutually-visible PVS clusters (mirrors GL's R_inPVS).
+ *
+ * @param[in] p1  First world-space point.
+ * @param[in] p2  Second world-space point.
+ * @return         qtrue when p2 is potentially visible from p1.
+ */
+qboolean DX12_inPVS(const vec3_t p1, const vec3_t p2);
 
 #endif // _WIN32
 #endif // DX12_WORLD_H

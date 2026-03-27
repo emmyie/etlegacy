@@ -437,15 +437,41 @@ qboolean DX12_LoadMD3(int slot, const char *name)
 		surf = (md3Surface_t *)((byte *)surf + surf->ofsEnd);
 	}
 
+	// -----------------------------------------------------------------------
+	// Parse tag data (all frames) for DX12_LerpTag
+	// -----------------------------------------------------------------------
+	if (header->numTags > 0 && header->numFrames > 0
+	    && header->ofsTags >= (int)sizeof(md3Header_t)
+	    && header->ofsTags < fileLen)
+	{
+		int     tagTotal = header->numFrames * header->numTags;
+		size_t  tagBytes = (size_t)tagTotal * sizeof(md3Tag_t);
+
+		// Validate the tag block fits inside the file
+		if (header->ofsTags + (int)tagBytes <= fileLen)
+		{
+			entry->tags = (md3Tag_t *)malloc(tagBytes);
+			if (entry->tags)
+			{
+				memcpy(entry->tags,
+				       (byte *)fileData + header->ofsTags,
+				       tagBytes);
+				entry->numTags   = header->numTags;
+				entry->numFrames = header->numFrames;
+			}
+		}
+	}
+
 	dx12.ri.FS_FreeFile(fileData);
 
 	if (entry->numSurfaces > 0)
 	{
 		entry->valid = qtrue;
 		dx12.ri.Printf(PRINT_DEVELOPER,
-		               "DX12_LoadMD3: loaded '%s' (%d surface%s)\n",
+		               "DX12_LoadMD3: loaded '%s' (%d surface%s, %d tags)\n",
 		               name, entry->numSurfaces,
-		               entry->numSurfaces == 1 ? "" : "s");
+		               entry->numSurfaces == 1 ? "" : "s",
+		               entry->numTags);
 	}
 
 	return entry->valid;
@@ -583,7 +609,118 @@ void DX12_ShutdownModels(void)
 
 		dx12ModelData[i].valid       = qfalse;
 		dx12ModelData[i].numSurfaces = 0;
+
+		// Free tag data
+		if (dx12ModelData[i].tags)
+		{
+			free(dx12ModelData[i].tags);
+			dx12ModelData[i].tags     = NULL;
+		}
+		dx12ModelData[i].numTags   = 0;
+		dx12ModelData[i].numFrames = 0;
 	}
+}
+
+// ---------------------------------------------------------------------------
+// DX12_LerpTag
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief DX12_LerpTag – mirror of GL's R_LerpTag for MD3 models.
+ *
+ * Finds the named tag at the entity's start/end frame and linearly
+ * interpolates its origin and axis by the entity's backlerp factor.
+ *
+ * @param[out] tag       Receives the interpolated orientation.
+ * @param[in]  refent    Entity to query (hModel, frame, oldframe, backlerp).
+ * @param[in]  tagName   Tag name to search for (case-sensitive).
+ * @param[in]  startIndex Start scanning from this index (for duplicate names).
+ * @return     Tag index found, or -1 on failure.
+ */
+int DX12_LerpTag(orientation_t *tag, const refEntity_t *refent,
+                 const char *tagName, int startIndex)
+{
+	dx12ModelEntry_t *entry;
+	md3Tag_t         *startTag;
+	md3Tag_t         *endTag;
+	int               idx;
+	int               startFrame;
+	int               endFrame;
+	float             frontLerp;
+	float             backLerp;
+	int               i;
+
+	if (!tag || !refent || !tagName)
+	{
+		return -1;
+	}
+
+	idx = (int)refent->hModel - 1;
+	if (idx < 0 || idx >= DX12_MAX_MODELS)
+	{
+		AxisClear(tag->axis);
+		VectorClear(tag->origin);
+		return -1;
+	}
+
+	entry = &dx12ModelData[idx];
+	if (!entry->valid || !entry->tags || entry->numTags <= 0 || entry->numFrames <= 0)
+	{
+		AxisClear(tag->axis);
+		VectorClear(tag->origin);
+		return -1;
+	}
+
+	// Clamp frames to valid range
+	startFrame = refent->oldframe;
+	endFrame   = refent->frame;
+	if (startFrame >= entry->numFrames) { startFrame = entry->numFrames - 1; }
+	if (startFrame < 0)                 { startFrame = 0; }
+	if (endFrame >= entry->numFrames)   { endFrame = entry->numFrames - 1; }
+	if (endFrame < 0)                   { endFrame = 0; }
+
+	backLerp  = refent->backlerp;
+	frontLerp = 1.0f - backLerp;
+
+	// Find the tag by name (scanning from startIndex)
+	startTag = NULL;
+	endTag   = NULL;
+	idx      = -1;
+
+	for (i = startIndex; i < entry->numTags; i++)
+	{
+		md3Tag_t *t = &entry->tags[startFrame * entry->numTags + i];
+
+		if (!strcmp(t->name, tagName))
+		{
+			startTag = t;
+			endTag   = &entry->tags[endFrame * entry->numTags + i];
+			idx      = i;
+			break;
+		}
+	}
+
+	if (!startTag || !endTag)
+	{
+		AxisClear(tag->axis);
+		VectorClear(tag->origin);
+		return -1;
+	}
+
+	// Interpolate origin and axis
+	for (i = 0; i < 3; i++)
+	{
+		tag->origin[i]  = startTag->origin[i] * backLerp + endTag->origin[i] * frontLerp;
+		tag->axis[0][i] = startTag->axis[0][i] * backLerp + endTag->axis[0][i] * frontLerp;
+		tag->axis[1][i] = startTag->axis[1][i] * backLerp + endTag->axis[1][i] * frontLerp;
+		tag->axis[2][i] = startTag->axis[2][i] * backLerp + endTag->axis[2][i] * frontLerp;
+	}
+
+	VectorNormalize(tag->axis[0]);
+	VectorNormalize(tag->axis[1]);
+	VectorNormalize(tag->axis[2]);
+
+	return idx;
 }
 
 #endif // _WIN32
