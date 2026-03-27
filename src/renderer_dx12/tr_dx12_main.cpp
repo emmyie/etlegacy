@@ -1919,7 +1919,6 @@ static void RE_DX12_ProjectDecal(qhandle_t hShader, int numPoints, vec3_t *point
 			VectorCopy(points[2], dv[3].xyz); // pad degenerate quad
 		}
 		numDvPoints = 4;
-		omni        = qfalse;
 
 		// ---- MakeTextureMatrix (port of GL static MakeTextureMatrix) --------
 		// Project footprint triangle onto the projection plane
@@ -2205,27 +2204,78 @@ static void RE_DX12_AddPolyBufferToScene(polyBuffer_t *pPolyBuffer)
 
 static void RE_DX12_SetGlobalFog(qboolean restore, int duration, float r, float g, float b, float depthForOpaque)
 {
-	// Store fog parameters in dx12World for consumption by shaders.
-	// The `restore` flag would restore the original BSP fog; full transition
-	// interpolation over `duration` is a TODO (mirrors GL's tcScale etc.).
-	(void)duration;
-
+	// Full port of GL RE_SetGlobalFog (renderer/tr_cmds.c).
+	// Saves original fog on first activation; drives timed transitions via
+	// dx12World.globalFogTrans* fields ticked in DX12_RenderScene.
 	if (restore)
 	{
-		// Reset to no override; shaders revert to BSP-defined fog.
-		dx12World.globalFogActive  = qfalse;
-		dx12World.globalFogDepth   = 0.0f;
-		dx12World.globalFogColor[0] = 0.0f;
-		dx12World.globalFogColor[1] = 0.0f;
-		dx12World.globalFogColor[2] = 0.0f;
+		if (duration > 0)
+		{
+			// Transition from current back to original
+			dx12World.globalFogTransStartFog[0] = dx12World.globalFogColor[0];
+			dx12World.globalFogTransStartFog[1] = dx12World.globalFogColor[1];
+			dx12World.globalFogTransStartFog[2] = dx12World.globalFogColor[2];
+			dx12World.globalFogTransStartFog[3] = dx12World.globalFogDepth;
+
+			dx12World.globalFogTransEndFog[0] = dx12World.globalFogOrigColor[0];
+			dx12World.globalFogTransEndFog[1] = dx12World.globalFogOrigColor[1];
+			dx12World.globalFogTransEndFog[2] = dx12World.globalFogOrigColor[2];
+			dx12World.globalFogTransEndFog[3] = dx12World.globalFogOrigColor[3];
+
+			dx12World.globalFogTransStartTime = dx12.ri.Milliseconds();
+			dx12World.globalFogTransEndTime   = dx12World.globalFogTransStartTime + duration;
+		}
+		else
+		{
+			// Instant restore
+			dx12World.globalFogColor[0]       = dx12World.globalFogOrigColor[0];
+			dx12World.globalFogColor[1]       = dx12World.globalFogOrigColor[1];
+			dx12World.globalFogColor[2]       = dx12World.globalFogOrigColor[2];
+			dx12World.globalFogDepth          = dx12World.globalFogOrigColor[3];
+			dx12World.globalFogActive         = (dx12World.globalFogDepth > 0.0f) ? qtrue : qfalse;
+			dx12World.globalFogTransEndTime   = 0;
+			dx12World.globalFogTransStartTime = 0;
+		}
 	}
 	else
 	{
-		dx12World.globalFogColor[0] = r;
-		dx12World.globalFogColor[1] = g;
-		dx12World.globalFogColor[2] = b;
-		dx12World.globalFogDepth    = depthForOpaque < 1.0f ? 1.0f : depthForOpaque;
-		dx12World.globalFogActive   = qtrue;
+		// First call: save original state so restore can return to it
+		if (!dx12World.globalFogActive && dx12World.globalFogTransEndTime == 0)
+		{
+			dx12World.globalFogOrigColor[0] = dx12World.globalFogColor[0];
+			dx12World.globalFogOrigColor[1] = dx12World.globalFogColor[1];
+			dx12World.globalFogOrigColor[2] = dx12World.globalFogColor[2];
+			dx12World.globalFogOrigColor[3] = dx12World.globalFogDepth;
+		}
+
+		if (duration > 0)
+		{
+			// Transition from current to new
+			dx12World.globalFogTransStartFog[0] = dx12World.globalFogColor[0];
+			dx12World.globalFogTransStartFog[1] = dx12World.globalFogColor[1];
+			dx12World.globalFogTransStartFog[2] = dx12World.globalFogColor[2];
+			dx12World.globalFogTransStartFog[3] = dx12World.globalFogDepth;
+
+			dx12World.globalFogTransEndFog[0] = r;
+			dx12World.globalFogTransEndFog[1] = g;
+			dx12World.globalFogTransEndFog[2] = b;
+			dx12World.globalFogTransEndFog[3] = depthForOpaque < 1.0f ? 1.0f : depthForOpaque;
+
+			dx12World.globalFogTransStartTime = dx12.ri.Milliseconds();
+			dx12World.globalFogTransEndTime   = dx12World.globalFogTransStartTime + duration;
+			dx12World.globalFogActive         = qtrue;
+		}
+		else
+		{
+			// Instant set
+			dx12World.globalFogColor[0]       = r;
+			dx12World.globalFogColor[1]       = g;
+			dx12World.globalFogColor[2]       = b;
+			dx12World.globalFogDepth          = depthForOpaque < 1.0f ? 1.0f : depthForOpaque;
+			dx12World.globalFogActive         = qtrue;
+			dx12World.globalFogTransEndTime   = 0;
+			dx12World.globalFogTransStartTime = 0;
+		}
 	}
 }
 

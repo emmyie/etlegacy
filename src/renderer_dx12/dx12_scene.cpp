@@ -1129,6 +1129,41 @@ void DX12_RenderScene(const refdef_t *fd)
 	}
 
 	// ----------------------------------------------------------------
+	// 0.  Tick global fog transition (matches GL tr_main.c ~line 622)
+	// ----------------------------------------------------------------
+	if (dx12World.loaded && dx12World.globalFogTransEndTime > 0)
+	{
+		int now = dx12.ri.Milliseconds();
+
+		if (now < dx12World.globalFogTransEndTime)
+		{
+			int   fadeTime = dx12World.globalFogTransEndTime - dx12World.globalFogTransStartTime;
+			float lerpPos  = (float)(now - dx12World.globalFogTransStartTime) / (float)fadeTime;
+			int   i;
+
+			for (i = 0; i < 3; i++)
+			{
+				dx12World.globalFogColor[i] = dx12World.globalFogTransStartFog[i]
+				                              + (dx12World.globalFogTransEndFog[i] - dx12World.globalFogTransStartFog[i]) * lerpPos;
+			}
+			dx12World.globalFogDepth = dx12World.globalFogTransStartFog[3]
+			                           + (dx12World.globalFogTransEndFog[3] - dx12World.globalFogTransStartFog[3]) * lerpPos;
+			dx12World.globalFogActive = qtrue;
+		}
+		else
+		{
+			// Transition complete – snap to end values
+			dx12World.globalFogColor[0]       = dx12World.globalFogTransEndFog[0];
+			dx12World.globalFogColor[1]       = dx12World.globalFogTransEndFog[1];
+			dx12World.globalFogColor[2]       = dx12World.globalFogTransEndFog[2];
+			dx12World.globalFogDepth          = dx12World.globalFogTransEndFog[3];
+			dx12World.globalFogActive         = (dx12World.globalFogDepth > 0.0f) ? qtrue : qfalse;
+			dx12World.globalFogTransEndTime   = 0;
+			dx12World.globalFogTransStartTime = 0;
+		}
+	}
+
+	// ----------------------------------------------------------------
 	// 1.  Build view and projection matrices
 	// ----------------------------------------------------------------
 	BuildViewMatrix(view, fd->vieworg, (const vec3_t *)fd->viewaxis);

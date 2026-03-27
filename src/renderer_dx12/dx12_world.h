@@ -220,9 +220,14 @@ typedef struct
 	const byte  *externalVisData; ///< Override from RE_DX12_SetWorldVisData (not malloc'd)
 
 	// Global fog override (set by RE_DX12_SetGlobalFog)
-	float    globalFogColor[3]; ///< Current fog RGB [0,1]
-	float    globalFogDepth;    ///< Depth at which fog is fully opaque (0 = no override)
-	qboolean globalFogActive;   ///< qtrue when a global fog override is in effect
+	float    globalFogColor[3];         ///< Current fog RGB [0,1]
+	float    globalFogDepth;            ///< Depth at which fog is fully opaque (0 = no override)
+	qboolean globalFogActive;           ///< qtrue when a global fog override is in effect
+	float    globalFogOrigColor[4];     ///< Saved original fog state (RGB + depth) for restore
+	float    globalFogTransStartFog[4]; ///< Start fog state (RGB + depth) for timed transition
+	float    globalFogTransEndFog[4];   ///< End fog state (RGB + depth) for timed transition
+	int      globalFogTransStartTime;   ///< ri.Milliseconds() at transition start (0 = none)
+	int      globalFogTransEndTime;     ///< ri.Milliseconds() at transition end (0 = none)
 
 	// Light grid (LUMP_LIGHTGRID).  NULL when the lump is absent or mismatched.
 	// Each cell is 8 bytes: [0..2] ambient RGB, [3..5] directed RGB, [6] lng, [7] lat.
