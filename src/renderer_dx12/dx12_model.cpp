@@ -728,22 +728,24 @@ int DX12_LerpTag(orientation_t *tag, const refEntity_t *refent,
 
 		// If any MDX header is missing, fall back to the same as the frame one
 		// (prevents a null-pointer crash; accuracy degrades gracefully).
+		// If all four handles were invalid, mdxFrame remains NULL and we fall
+		// through to the guard below which returns -1 cleanly.
 		if (!mdxFrame)     { mdxFrame     = mdxOldFrame ? mdxOldFrame : (mdxTorso ? mdxTorso : mdxOldTorso); }
 		if (!mdxOldFrame)  { mdxOldFrame  = mdxFrame; }
 		if (!mdxTorso)     { mdxTorso     = mdxFrame; }
 		if (!mdxOldTorso)  { mdxOldTorso  = mdxTorso; }
 
-		if (mdxFrame)
+		if (!mdxFrame)
 		{
-			return DX12_GetBoneTagMDM(tag, (mdmHeader_t *)entry->rawData,
-			                          mdxFrame, mdxOldFrame, mdxTorso, mdxOldTorso,
-			                          refent, tagName, startIndex);
+			// No valid MDX companion was registered – cannot compute tag.
+			AxisClear(tag->axis);
+			VectorClear(tag->origin);
+			return -1;
 		}
 
-		// No MDX companion found – fall through to return -1 gracefully
-		AxisClear(tag->axis);
-		VectorClear(tag->origin);
-		return -1;
+		return DX12_GetBoneTagMDM(tag, (mdmHeader_t *)entry->rawData,
+		                          mdxFrame, mdxOldFrame, mdxTorso, mdxOldTorso,
+		                          refent, tagName, startIndex);
 	}
 
 	// ---------------------------------------------------------------------------

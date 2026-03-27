@@ -105,10 +105,11 @@ static ID_INLINE void SKL_SLerp_Normal(vec3_t from, vec3_t to, float tt, vec3_t 
 /** Decompress a pair of 16-bit pitch/yaw values into a unit direction vector. */
 static ID_INLINE void SKL_LocalAngleVector(float pitch_deg, float yaw_deg, vec3_t out)
 {
-	float sp = (float)sin(pitch_deg * (M_TAU_F / 360));
-	float cp = (float)cos(pitch_deg * (M_TAU_F / 360));
-	float sy = (float)sin(yaw_deg  * (M_TAU_F / 360));
-	float cy = (float)cos(yaw_deg  * (M_TAU_F / 360));
+	static const float DEG_TO_RAD = M_TAU_F / 360.0f;
+	float sp = (float)sin(pitch_deg * DEG_TO_RAD);
+	float cp = (float)cos(pitch_deg * DEG_TO_RAD);
+	float sy = (float)sin(yaw_deg  * DEG_TO_RAD);
+	float cy = (float)cos(yaw_deg  * DEG_TO_RAD);
 
 	out[0] = cp * cy;
 	out[1] = cp * sy;
@@ -183,7 +184,7 @@ static ID_INLINE void SKL_Matrix3Transpose(const vec3_t matrix[3], vec3_t transp
 }
 
 #define SKL_ANGLES_SHORT_TO_FLOAT(pf, sh) \
-	{ *(pf++) = SHORT2ANGLE(*(sh++)); *(pf++) = SHORT2ANGLE(*(sh++)); *(pf++) = SHORT2ANGLE(*(sh++)); }
+	do { *(pf++) = SHORT2ANGLE(*(sh++)); *(pf++) = SHORT2ANGLE(*(sh++)); *(pf++) = SHORT2ANGLE(*(sh++)); } while (0)
 
 // ===========================================================================
 // MDS Bone Calculator
