@@ -43,6 +43,7 @@
 #include "dx12_model.h"
 #include "dx12_world.h"    // dx12WorldVertex_t
 #include "dx12_shader.h"   // DX12_RegisterTexture, DX12_GetTexture, DX12_RegisterMaterial, DX12_GetMaterial
+#include "dx12_skeletal.h" // DX12_GetBoneTagMDS, DX12_GetBoneTagMDM, DX12_FreeSkeletal
 
 #ifdef _WIN32
 
@@ -471,7 +472,8 @@ qboolean DX12_LoadMD3(int slot, const char *name)
 
 	if (entry->numSurfaces > 0)
 	{
-		entry->valid = qtrue;
+		entry->valid     = qtrue;
+		entry->modelType = DX12_MOD_MD3;  // mark as MD3 for LerpTag dispatch
 		dx12.ri.Printf(PRINT_DEVELOPER,
 		               "DX12_LoadMD3: loaded '%s' (%d surface%s, %d tags)\n",
 		               name, entry->numSurfaces,
@@ -615,7 +617,7 @@ void DX12_ShutdownModels(void)
 		dx12ModelData[i].valid       = qfalse;
 		dx12ModelData[i].numSurfaces = 0;
 
-		// Free tag data
+		// Free MD3 tag data
 		if (dx12ModelData[i].tags)
 		{
 			free(dx12ModelData[i].tags);
@@ -623,6 +625,15 @@ void DX12_ShutdownModels(void)
 		}
 		dx12ModelData[i].numTags   = 0;
 		dx12ModelData[i].numFrames = 0;
+
+		// Free skeletal raw data (MDS / MDM / MDX)
+		if (dx12ModelData[i].rawData)
+		{
+			DX12_FreeSkeletal(dx12ModelData[i].rawData);
+			dx12ModelData[i].rawData     = NULL;
+			dx12ModelData[i].rawDataSize = 0;
+		}
+		dx12ModelData[i].modelType = DX12_MOD_UNKNOWN;
 	}
 }
 
@@ -631,13 +642,15 @@ void DX12_ShutdownModels(void)
 // ---------------------------------------------------------------------------
 
 /**
- * @brief DX12_LerpTag – mirror of GL's R_LerpTag for MD3 models.
+ * @brief DX12_LerpTag – mirror of GL's R_LerpTag.
  *
- * Finds the named tag at the entity's start/end frame and linearly
- * interpolates its origin and axis by the entity's backlerp factor.
+ * Dispatches to the appropriate tag-lookup path based on the model type:
+ *   - MD3: interpolate between two MD3 tag frames.
+ *   - MDS: compute bone hierarchy and extract tag bone orientation.
+ *   - MDM: compute bone hierarchy from MDX companion and extract tag orientation.
  *
  * @param[out] tag       Receives the interpolated orientation.
- * @param[in]  refent    Entity to query (hModel, frame, oldframe, backlerp).
+ * @param[in]  refent    Entity to query (hModel, frame, oldframe, backlerp…).
  * @param[in]  tagName   Tag name to search for (case-sensitive).
  * @param[in]  startIndex Start scanning from this index (for duplicate names).
  * @return     Tag index found, or -1 on failure.
@@ -669,6 +682,73 @@ int DX12_LerpTag(orientation_t *tag, const refEntity_t *refent,
 	}
 
 	entry = &dx12ModelData[idx];
+
+	// ---------------------------------------------------------------------------
+	// MDS: bone-based tag lookup (player bodies, e.g. tag_footleft)
+	// ---------------------------------------------------------------------------
+	if (entry->modelType == DX12_MOD_MDS && entry->rawData)
+	{
+		return DX12_GetBoneTagMDS(tag, (mdsHeader_t *)entry->rawData, refent, tagName, startIndex);
+	}
+
+	// ---------------------------------------------------------------------------
+	// MDM: bone-based tag lookup with MDX companion animation data
+	// ---------------------------------------------------------------------------
+	if (entry->modelType == DX12_MOD_MDM && entry->rawData)
+	{
+		// Resolve the four MDX frame headers from the DX12 model registry.
+		// refent->frameModel, oldframeModel, torsoFrameModel, oldTorsoFrameModel
+		// are handles returned by RE_DX12_RegisterModel for the companion MDX files.
+		mdxHeader_t *mdxFrame     = NULL;
+		mdxHeader_t *mdxOldFrame  = NULL;
+		mdxHeader_t *mdxTorso     = NULL;
+		mdxHeader_t *mdxOldTorso  = NULL;
+
+		int fi  = (int)refent->frameModel - 1;
+		int ofi = (int)refent->oldframeModel - 1;
+		int ti  = (int)refent->torsoFrameModel - 1;
+		int oti = (int)refent->oldTorsoFrameModel - 1;
+
+		if (fi >= 0 && fi < DX12_MAX_MODELS  && dx12ModelData[fi].modelType  == DX12_MOD_MDX)
+		{
+			mdxFrame = (mdxHeader_t *)dx12ModelData[fi].rawData;
+		}
+		if (ofi >= 0 && ofi < DX12_MAX_MODELS && dx12ModelData[ofi].modelType == DX12_MOD_MDX)
+		{
+			mdxOldFrame = (mdxHeader_t *)dx12ModelData[ofi].rawData;
+		}
+		if (ti >= 0 && ti < DX12_MAX_MODELS  && dx12ModelData[ti].modelType  == DX12_MOD_MDX)
+		{
+			mdxTorso = (mdxHeader_t *)dx12ModelData[ti].rawData;
+		}
+		if (oti >= 0 && oti < DX12_MAX_MODELS && dx12ModelData[oti].modelType == DX12_MOD_MDX)
+		{
+			mdxOldTorso = (mdxHeader_t *)dx12ModelData[oti].rawData;
+		}
+
+		// If any MDX header is missing, fall back to the same as the frame one
+		// (prevents a null-pointer crash; accuracy degrades gracefully).
+		if (!mdxFrame)     { mdxFrame     = mdxOldFrame ? mdxOldFrame : (mdxTorso ? mdxTorso : mdxOldTorso); }
+		if (!mdxOldFrame)  { mdxOldFrame  = mdxFrame; }
+		if (!mdxTorso)     { mdxTorso     = mdxFrame; }
+		if (!mdxOldTorso)  { mdxOldTorso  = mdxTorso; }
+
+		if (mdxFrame)
+		{
+			return DX12_GetBoneTagMDM(tag, (mdmHeader_t *)entry->rawData,
+			                          mdxFrame, mdxOldFrame, mdxTorso, mdxOldTorso,
+			                          refent, tagName, startIndex);
+		}
+
+		// No MDX companion found – fall through to return -1 gracefully
+		AxisClear(tag->axis);
+		VectorClear(tag->origin);
+		return -1;
+	}
+
+	// ---------------------------------------------------------------------------
+	// MD3: interpolate between per-frame tag arrays
+	// ---------------------------------------------------------------------------
 	if (!entry->valid || !entry->tags || entry->numTags <= 0 || entry->numFrames <= 0)
 	{
 		AxisClear(tag->axis);

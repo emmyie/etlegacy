@@ -9,6 +9,7 @@
 #include "dx12_world.h"
 #include "dx12_scene.h"
 #include "dx12_model.h"
+#include "dx12_skeletal.h"  // DX12_LoadMDS, DX12_LoadMDX, DX12_LoadMDM
 
 #ifdef _WIN32
 
@@ -390,10 +391,68 @@ static qhandle_t RE_DX12_RegisterModel(const char *name)
 	Q_strncpyz(dx12ModelNames[slot], name, MAX_QPATH);
 	dx12NumModels++;
 
-	// Attempt to load MD3 geometry into GPU buffers.
-	// MDX/MDM (skeletal) files are silently skipped: the handle is still
-	// valid for the animation system even without GPU geometry.
-	DX12_LoadMD3(slot, name);
+	// Choose loader based on file extension.
+	{
+		const char *ext = strrchr(name, '.');
+		if (ext)
+		{
+			if (!Q_stricmp(ext, ".mds"))
+			{
+				// MDS: mesh + embedded animation (player bodies).
+				// Store raw data for bone-based tag lookup.
+				void    *rawData  = NULL;
+				int      rawSize  = 0;
+				if (DX12_LoadMDS(name, &rawData, &rawSize))
+				{
+					dx12ModelData[slot].rawData     = rawData;
+					dx12ModelData[slot].rawDataSize = rawSize;
+					dx12ModelData[slot].modelType   = DX12_MOD_MDS;
+					dx12ModelData[slot].valid       = qtrue;
+
+					// Use frame-0 bounds from the MDS header
+					mdsHeader_t *mds    = (mdsHeader_t *)rawData;
+					mdsFrame_t  *frame0 = (mdsFrame_t *)((byte *)mds + mds->ofsFrames);
+					VectorCopy(frame0->bounds[0], dx12ModelData[slot].mins);
+					VectorCopy(frame0->bounds[1], dx12ModelData[slot].maxs);
+				}
+			}
+			else if (!Q_stricmp(ext, ".mdx"))
+			{
+				// MDX: pure animation companion for MDM models.
+				void    *rawData = NULL;
+				int      rawSize = 0;
+				if (DX12_LoadMDX(name, &rawData, &rawSize))
+				{
+					dx12ModelData[slot].rawData     = rawData;
+					dx12ModelData[slot].rawDataSize = rawSize;
+					dx12ModelData[slot].modelType   = DX12_MOD_MDX;
+					dx12ModelData[slot].valid       = qtrue;
+				}
+			}
+			else if (!Q_stricmp(ext, ".mdm"))
+			{
+				// MDM: skeletal mesh without embedded animation.
+				void    *rawData = NULL;
+				int      rawSize = 0;
+				if (DX12_LoadMDM(name, &rawData, &rawSize))
+				{
+					dx12ModelData[slot].rawData     = rawData;
+					dx12ModelData[slot].rawDataSize = rawSize;
+					dx12ModelData[slot].modelType   = DX12_MOD_MDM;
+					dx12ModelData[slot].valid       = qtrue;
+				}
+			}
+			else
+			{
+				// Attempt MD3 (includes .md3 and any unrecognised extension).
+				DX12_LoadMD3(slot, name);
+			}
+		}
+		else
+		{
+			DX12_LoadMD3(slot, name);
+		}
+	}
 
 	return (qhandle_t)(slot + 1);
 }
