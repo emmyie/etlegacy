@@ -34,6 +34,50 @@ dx12Material_t dx12Materials[DX12_MAX_MATERIALS];
 int            dx12NumMaterials = 0;
 
 // ---------------------------------------------------------------------------
+// One-time "missing asset" warning deduplication.
+// Prevents thousands of repeated "could not load" / "could not resolve"
+// messages when the same texture or material name fails on every frame that
+// requests it (e.g. sky shaders, decals, player skins).
+//
+// SHD_WarnOnce() returns qtrue on the FIRST call for a given @p name and
+// qfalse on every subsequent call.  The caller should print its warning and
+// return 0 only when the function returns qtrue.
+// ---------------------------------------------------------------------------
+
+#define DX12_MAX_MISSING_WARN 512
+
+static char s_missingNames[DX12_MAX_MISSING_WARN][MAX_QPATH];
+static int  s_numMissingNames = 0;
+
+/**
+ * @brief Returns qtrue (and records @p name) on the first call for a given
+ *        asset name; returns qfalse on every subsequent call for the same name.
+ *
+ * @param[in] name  Asset name to check (case-insensitive).
+ * @return qtrue if this is the first occurrence, qfalse if already recorded.
+ */
+static qboolean SHD_WarnOnce(const char *name)
+{
+	int i;
+
+	for (i = 0; i < s_numMissingNames; i++)
+	{
+		if (!DX12_Stricmp(s_missingNames[i], name))
+		{
+			return qfalse;
+		}
+	}
+
+	if (s_numMissingNames < DX12_MAX_MISSING_WARN)
+	{
+		Q_strncpyz(s_missingNames[s_numMissingNames], name, MAX_QPATH);
+		s_numMissingNames++;
+	}
+
+	return qtrue;
+}
+
+// ---------------------------------------------------------------------------
 // DX12_InitTextures
 // ---------------------------------------------------------------------------
 
@@ -53,6 +97,10 @@ void DX12_InitTextures(void)
 
 	Com_Memset(dx12Materials, 0, sizeof(dx12Materials));
 	dx12NumMaterials = 0;
+
+	// Reset the one-time missing-asset warning table so that every map load
+	// gets a fresh set of warnings for its own assets.
+	s_numMissingNames = 0;
 
 	// Slot 0: 1×1 opaque-white fallback
 	{
@@ -575,7 +623,10 @@ qhandle_t DX12_RegisterTexture(const char *name)
 
 	if (!pic || width <= 0 || height <= 0)
 	{
-		dx12.ri.Printf(PRINT_DEVELOPER, "DX12_RegisterTexture: could not load '%s'\n", name);
+		if (SHD_WarnOnce(name))
+		{
+			dx12.ri.Printf(PRINT_DEVELOPER, "DX12_RegisterTexture: could not load '%s'\n", name);
+		}
 		return 0;
 	}
 
@@ -1160,8 +1211,11 @@ qhandle_t DX12_RegisterMaterial(const char *name)
 
 		if (!texHandle)
 		{
-			dx12.ri.Printf(PRINT_DEVELOPER,
-			               "DX12_RegisterMaterial: could not resolve '%s'\n", name);
+			if (SHD_WarnOnce(name))
+			{
+				dx12.ri.Printf(PRINT_DEVELOPER,
+				               "DX12_RegisterMaterial: could not resolve '%s'\n", name);
+			}
 			return 0;
 		}
 
