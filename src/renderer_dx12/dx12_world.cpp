@@ -783,6 +783,7 @@ void DX12_LoadWorld(const char *name)
 			int         sType   = LittleLong(in->surfaceType);
 			int         shNum   = LittleLong(in->shaderNum);
 			int         fogNum  = LittleLong(in->fogNum);
+			int         lmNum   = LittleLong(in->lightmapNum);
 			int         fv      = LittleLong(in->firstVert);
 			int         nv      = LittleLong(in->numVerts);
 			int         fi      = LittleLong(in->firstIndex);
@@ -821,6 +822,9 @@ void DX12_LoadWorld(const char *name)
 
 			ds->materialHandle = matH;
 			ds->fogIndex       = (fogNum >= 0 && fogNum < dx12World.numFogs - 1) ? (fogNum + 1) : 0;
+			// Store the BSP lightmap index for correct SRV binding at draw time.
+			// lmNum == -1 means "no lightmap" (vertex-lit surface).
+			ds->lightmapIndex  = (lmNum >= 0 && lmNum < dx12World.numLightmaps) ? lmNum : -1;
 			ds->surfaceType    = sType;
 			ds->isSky          = mat ? mat->isSky         : qfalse;
 			ds->isTranslucent  = mat ? mat->isTranslucent : qfalse;

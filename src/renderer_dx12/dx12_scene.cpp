@@ -321,10 +321,9 @@ static void SCN_UpdateCB(UINT slot, const dx12SceneConstants_t *cb)
  */
 static void SCN_DrawSurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDRESS cbGpuVA)
 {
-	dx12Material_t *mat      = NULL;
-	dx12Texture_t  *diffTex  = NULL;
-	dx12Texture_t  *lmTex    = NULL;
-	D3D12_GPU_DESCRIPTOR_HANDLE srvBase;
+	dx12Material_t *mat     = NULL;
+	dx12Texture_t  *diffTex = NULL;
+	dx12Texture_t  *lmTex   = NULL;
 
 	if (ds->numIndexes <= 0 || ds->numVertices <= 0)
 	{
@@ -341,11 +340,6 @@ static void SCN_DrawSurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDRESS 
 	{
 		diffTex = DX12_GetTexture(mat->stages[0].texHandle);
 	}
-
-	// Lightmap handle is stored in dx12World per surface-shader entry.
-	// For now, use the material's stage-0 texture as diffuse and fall back
-	// to the same texture for the lightmap if no dedicated lightmap is wired.
-	// (Full lightmap binding requires model-specific data beyond current scope.)
 
 	// --- Bind SRV descriptor table (slot 1) ---
 	{
@@ -364,16 +358,23 @@ static void SCN_DrawSurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDRESS 
 		// Bind diffuse (t0) via descriptor table root param 1
 		dx12.commandList->SetGraphicsRootDescriptorTable(1, srvHandle);
 
-		// Bind lightmap (t1) – use diffuse as fallback if no dedicated lm
-		if (ds->fogIndex > 0 && ds->fogIndex < dx12World.numFogs)
+		// Bind lightmap (t1) from the correct BSP lightmap slot.
+		// Falls back to the diffuse texture when no lightmap is assigned
+		// (vertex-lit surface or lightmapIndex == -1).
+		D3D12_GPU_DESCRIPTOR_HANDLE lmHandle = srvHandle;
+
+		if (ds->lightmapIndex >= 0 && ds->lightmapIndex < dx12World.numLightmaps)
 		{
-			qhandle_t lmH = dx12World.fogs[ds->fogIndex].materialHandle;
+			qhandle_t lmH = dx12World.lightmapHandles[ds->lightmapIndex];
 
 			lmTex = DX12_GetTexture(lmH);
+			if (lmTex && lmTex->resource)
+			{
+				lmHandle = lmTex->gpuHandle;
+			}
 		}
 
-		srvBase = lmTex ? lmTex->gpuHandle : srvHandle;
-		dx12.commandList->SetGraphicsRootDescriptorTable(2, srvBase);
+		dx12.commandList->SetGraphicsRootDescriptorTable(2, lmHandle);
 	}
 
 	// --- Issue draw call ---

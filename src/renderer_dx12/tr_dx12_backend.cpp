@@ -100,12 +100,43 @@ static void DX12_MoveToNextFrame( void )
 void DX12_WaitForUpload( ID3D12CommandQueue* queue )
 {
 	ID3D12Fence* fence = NULL;
-	HANDLE event = CreateEvent( NULL, FALSE, FALSE, NULL );
+	HANDLE event;
 	UINT64 value = 1;
+	HRESULT hr;
 
-	dx12.device->CreateFence( 0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS( &fence ) );
-	queue->Signal( fence, value );
-	fence->SetEventOnCompletion( value, event );
+	event = CreateEvent( NULL, FALSE, FALSE, NULL );
+	if ( !event )
+	{
+		dx12.ri.Printf( PRINT_WARNING, "DX12_WaitForUpload: CreateEvent failed\n" );
+		return;
+	}
+
+	hr = dx12.device->CreateFence( 0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS( &fence ) );
+	if ( FAILED( hr ) || !fence )
+	{
+		dx12.ri.Printf( PRINT_WARNING, "DX12_WaitForUpload: CreateFence failed (0x%08lx)\n", hr );
+		CloseHandle( event );
+		return;
+	}
+
+	hr = queue->Signal( fence, value );
+	if ( FAILED( hr ) )
+	{
+		dx12.ri.Printf( PRINT_WARNING, "DX12_WaitForUpload: Signal failed (0x%08lx)\n", hr );
+		fence->Release();
+		CloseHandle( event );
+		return;
+	}
+
+	hr = fence->SetEventOnCompletion( value, event );
+	if ( FAILED( hr ) )
+	{
+		dx12.ri.Printf( PRINT_WARNING, "DX12_WaitForUpload: SetEventOnCompletion failed (0x%08lx)\n", hr );
+		fence->Release();
+		CloseHandle( event );
+		return;
+	}
+
 	WaitForSingleObject( event, INFINITE );
 
 	CloseHandle( event );
@@ -126,7 +157,9 @@ void DX12_WaitForUpload( ID3D12CommandQueue* queue )
  *
  * Creates a D3D12 2D texture, uploads the pixel data via an upload heap,
  * transitions the resource to pixel-shader SRV state, and creates an SRV at
- * the specified heap slot.  Must be called while no frame is open.
+ * the specified heap slot.  Uses dx12.uploadCmdAllocator / dx12.uploadCmdList
+ * (dedicated upload pipeline, independent of the per-frame rendering list),
+ * so it is safe to call while a frame is open.
  */
 dx12Texture_t DX12_CreateTextureFromRGBA(const byte *data, int width, int height, int srvSlot)
 {
@@ -710,25 +743,6 @@ qboolean R_DX12_Init(void)
 		}
 
 		dx12.srvDescriptorSize = dx12.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-	}
-
-	// ----------------------------------------------------------------
-	// Render Target Views
-	// ----------------------------------------------------------------
-	{
-		D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = dx12.rtvHeap->GetCPUDescriptorHandleForHeapStart();
-
-		for (UINT i = 0; i < DX12_FRAME_COUNT; i++)
-		{
-			hr = dx12.swapChain->GetBuffer(i, IID_PPV_ARGS(&dx12.renderTargets[i]));
-			if (FAILED(hr))
-			{
-				dx12.ri.Error(ERR_FATAL, "R_DX12_Init: GetBuffer(%u) failed (0x%08lx)\n", i, hr);
-				return qfalse;
-			}
-			dx12.device->CreateRenderTargetView(dx12.renderTargets[i], NULL, rtvHandle);
-			rtvHandle.ptr += dx12.rtvDescriptorSize;
-		}
 	}
 
 	// ----------------------------------------------------------------

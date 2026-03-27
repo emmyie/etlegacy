@@ -94,6 +94,7 @@ typedef struct
 {
 	qhandle_t materialHandle; ///< DX12_RegisterMaterial() handle
 	int       fogIndex;       ///< BSP fog-volume index (-1 = none)
+	int       lightmapIndex;  ///< Index into dx12World.lightmapHandles[] (-1 = no lightmap)
 	int       firstVertex;    ///< First vertex in the world VB
 	int       numVertices;    ///< Number of vertices
 	int       firstIndex;     ///< First index in the world IB

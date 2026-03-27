@@ -13,9 +13,10 @@
  * the renderer display at least the primary texture of complex multi-stage
  * shaders even though animation and blending are not implemented.
  *
- * @note Texture registration must happen while no frame is open (i.e. before
- *       the first DX12_BeginFrame call or after DX12_EndFrame),
- *       because DX12_CreateTextureFromRGBA resets the main command allocator.
+ * @note DX12_CreateTextureFromRGBA uses the dedicated upload command
+ *       allocator/list (dx12.uploadCmdAllocator / dx12.uploadCmdList), not the
+ *       per-frame rendering allocator.  Registration is therefore safe at any
+ *       time, including while a frame is open.
  */
 
 #include "dx12_shader.h"
@@ -475,13 +476,24 @@ qhandle_t DX12_RegisterTexture(const char *name)
 		return 0;
 	}
 
-	// Guard against registration during an open frame
-	if (dx12.frameOpen)
+	// Virtual '*white' textures: register as a named alias sharing slot 0's
+	// GPU descriptor (resource pointer is left NULL to avoid double-release on
+	// shutdown).  DX12_GetTexture will fall through to the heap-start descriptor
+	// which is always the white fallback.
+	if (name[0] == '*' && !DX12_Stricmp(name + 1, "white"))
 	{
-		dx12.ri.Printf(PRINT_WARNING,
-		               "DX12_RegisterTexture: '%s' registered mid-frame; deferring is not supported\n",
-		               name);
-		return 0;
+		slot = dx12NumShaders;
+		Q_strncpyz(dx12Shaders[slot].name, name, sizeof(dx12Shaders[slot].name));
+		dx12Shaders[slot].width       = 1;
+		dx12Shaders[slot].height      = 1;
+		dx12Shaders[slot].valid       = qtrue;
+		// Share the GPU-visible descriptor of slot 0 (white fallback).
+		// resource is intentionally left NULL so shutdown does not double-release.
+		dx12Shaders[slot].tex.resource  = NULL;
+		dx12Shaders[slot].tex.cpuHandle = dx12Shaders[0].tex.cpuHandle;
+		dx12Shaders[slot].tex.gpuHandle = dx12Shaders[0].tex.gpuHandle;
+		dx12NumShaders++;
+		return (qhandle_t)slot;
 	}
 
 	// Try loading the name directly as an image file
@@ -1075,14 +1087,6 @@ qhandle_t DX12_RegisterMaterial(const char *name)
 	if (dx12NumMaterials >= DX12_MAX_MATERIALS)
 	{
 		dx12.ri.Printf(PRINT_WARNING, "DX12_RegisterMaterial: material cache full\n");
-		return 0;
-	}
-
-	if (dx12.frameOpen)
-	{
-		dx12.ri.Printf(PRINT_WARNING,
-		               "DX12_RegisterMaterial: '%s' registered mid-frame; not supported\n",
-		               name);
 		return 0;
 	}
 
