@@ -57,7 +57,9 @@
 
 #ifdef _WIN32
 
+extern "C" {
 #include "../qcommon/qfiles.h"
+}
 
 #include <string.h>  // memcpy, memset
 #include <stdlib.h>  // malloc, free, qsort

@@ -8,9 +8,8 @@
 
 extern "C" {
 #include "q_shared.h"
-}
-
 #include "../renderercommon/tr_public.h"
+}
 
 #ifdef _WIN32
 

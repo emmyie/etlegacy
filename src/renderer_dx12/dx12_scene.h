@@ -43,7 +43,6 @@
 
 #include "tr_dx12_local.h"
 #include "dx12_world.h"             // dx12WorldVertex_t (used by poly buffer)
-#include "../renderercommon/tr_public.h"
 
 // ---------------------------------------------------------------------------
 // Limits

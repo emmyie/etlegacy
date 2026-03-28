@@ -195,6 +195,7 @@ if(FEATURE_RENDERER_DX12)
 		${CMAKE_SOURCE_DIR}/src/qcommon/q_math.c
 		${CMAKE_SOURCE_DIR}/src/qcommon/puff.c
 		${CMAKE_SOURCE_DIR}/src/qcommon/md4.c
+		${CMAKE_SOURCE_DIR}/src/renderercommon/tr_image_jpg.c
 	)
 
 	add_library(renderer_dx12 ${REND_LIBTYPE} ${RENDERER_DX12_FILES} ${RENDERER_DX12_COMMON_SOURCES})
@@ -207,6 +208,7 @@ if(FEATURE_RENDERER_DX12)
     target_include_directories(renderer_dx12 PRIVATE
         ${CMAKE_SOURCE_DIR}/src/qcommon
         ${CMAKE_SOURCE_DIR}/src/renderer_dx12
+        ${CMAKE_SOURCE_DIR}/src/renderercommon
     )
 
     target_link_libraries(renderer_dx12 PRIVATE
