@@ -782,7 +782,7 @@ dx12Texture_t DX12_CreateTextureFromRGBA(const byte *data, int width, int height
 		mipW[mip] = (mipW[mip - 1] > 1) ? (mipW[mip - 1] >> 1) : 1;
 		mipH[mip] = (mipH[mip - 1] > 1) ? (mipH[mip - 1] >> 1) : 1;
 
-		mipAlloc[mip] = (byte *)malloc((size_t)(mipW[mip] * mipH[mip] * 4));
+		mipAlloc[mip] = (byte *)dx12.ri.Z_Malloc((size_t)(mipW[mip] * mipH[mip] * 4));
 		if (!mipAlloc[mip])
 		{
 			// Fall back to repeating the previous mip level in this slot
@@ -819,7 +819,7 @@ dx12Texture_t DX12_CreateTextureFromRGBA(const byte *data, int width, int height
 	{
 		if (mipAlloc[mip])
 		{
-			free(mipAlloc[mip]);
+			dx12.ri.Free(mipAlloc[mip]);
 			mipAlloc[mip] = NULL;
 		}
 	}

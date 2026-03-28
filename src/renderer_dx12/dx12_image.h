@@ -3,7 +3,7 @@
  * @brief DX12-only image loader – no GL, no renderer_common dependency.
  *
  * Reads raw file bytes via dx12.ri.FS_ReadFile and decodes them to a
- * malloc()-allocated RGBA (4 bytes per pixel, row-major, top-left origin)
+ * dx12.ri.Z_Malloc()-allocated RGBA (4 bytes per pixel, row-major, top-left origin)
  * pixel buffer.  Only TGA (types 2 and 10, 24-bit and 32-bit) is
  * implemented; other formats return NULL.
  */
@@ -19,7 +19,7 @@
  * @brief Load an image to an RGBA pixel buffer.
  * @param[in]  name   Game-path of the image (with or without extension).
  *                    Extensions tried in order: .tga, .jpg, .png.
- * @param[out] pic    Set to a malloc()-allocated buffer on success, NULL
+ * @param[out] pic    Set to a dx12.ri.Z_Malloc()-allocated buffer on success, NULL
  *                    on failure.  Free with DX12_FreeImage().
  * @param[out] width  Image width in pixels.
  * @param[out] height Image height in pixels.

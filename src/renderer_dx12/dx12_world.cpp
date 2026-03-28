@@ -379,43 +379,43 @@ void DX12_ShutdownWorld(void)
 
 	if (dx12World.bspNodes)
 	{
-		free(dx12World.bspNodes);
+		dx12.ri.Free(dx12World.bspNodes);
 		dx12World.bspNodes = NULL;
 	}
 
 	if (dx12World.bspPlanes)
 	{
-		free(dx12World.bspPlanes);
+		dx12.ri.Free(dx12World.bspPlanes);
 		dx12World.bspPlanes = NULL;
 	}
 
 	if (dx12World.vis)
 	{
-		free(dx12World.vis);
+		dx12.ri.Free(dx12World.vis);
 		dx12World.vis = NULL;
 	}
 
 	if (dx12World.novis)
 	{
-		free(dx12World.novis);
+		dx12.ri.Free(dx12World.novis);
 		dx12World.novis = NULL;
 	}
 
 	if (dx12World.lightGridData)
 	{
-		free(dx12World.lightGridData);
+		dx12.ri.Free(dx12World.lightGridData);
 		dx12World.lightGridData = NULL;
 	}
 
 	if (dx12World.cpuVerts)
 	{
-		free(dx12World.cpuVerts);
+		dx12.ri.Free(dx12World.cpuVerts);
 		dx12World.cpuVerts = NULL;
 	}
 
 	if (dx12World.cpuIndexes)
 	{
-		free(dx12World.cpuIndexes);
+		dx12.ri.Free(dx12World.cpuIndexes);
 		dx12World.cpuIndexes = NULL;
 	}
 
@@ -564,7 +564,7 @@ void DX12_LoadWorld(const char *name)
 		if (lump->filelen > 0 && (lump->filelen % (int)sizeof(dplane_t)) == 0)
 		{
 			count = lump->filelen / (int)sizeof(dplane_t);
-			dx12World.bspPlanes = (dplane_t *)malloc((size_t)count * sizeof(dplane_t));
+			dx12World.bspPlanes = (dplane_t *)dx12.ri.Z_Malloc((size_t)count * sizeof(dplane_t));
 			if (dx12World.bspPlanes)
 			{
 				int pi;
@@ -606,7 +606,7 @@ void DX12_LoadWorld(const char *name)
 		{
 			int total = numNodes + numLeafs;
 
-			dx12World.bspNodes = (dx12BspNode_t *)malloc((size_t)total * sizeof(dx12BspNode_t));
+			dx12World.bspNodes = (dx12BspNode_t *)dx12.ri.Z_Malloc((size_t)total * sizeof(dx12BspNode_t));
 			if (dx12World.bspNodes)
 			{
 				dx12BspNode_t *out = dx12World.bspNodes;
@@ -666,7 +666,7 @@ void DX12_LoadWorld(const char *name)
 			               ? ((dx12World.numClusters + 63) & ~63)   // PAD to 64
 			               : 64;
 
-			dx12World.novis = (byte *)malloc((size_t)novisLen);
+			dx12World.novis = (byte *)dx12.ri.Z_Malloc((size_t)novisLen);
 			if (dx12World.novis)
 			{
 				memset(dx12World.novis, 0xFF, (size_t)novisLen);
@@ -682,7 +682,7 @@ void DX12_LoadWorld(const char *name)
 
 			if (numClusters > 0 && clusterBytes > 0 && dataLen > 0)
 			{
-				dx12World.vis = (byte *)malloc((size_t)dataLen);
+				dx12World.vis = (byte *)dx12.ri.Z_Malloc((size_t)dataLen);
 				if (dx12World.vis)
 				{
 					memcpy(dx12World.vis, buf + 8, (size_t)dataLen);
@@ -1188,9 +1188,9 @@ void DX12_LoadWorld(const char *name)
 		int maxStagingVerts   = bspVertCount + patchExtraVerts;
 		int maxStagingIndexes = bspIndexCount + patchExtraIndexes;
 
-		dx12WorldVertex_t *stagingVerts   = (dx12WorldVertex_t *)malloc(
+		dx12WorldVertex_t *stagingVerts   = (dx12WorldVertex_t *)dx12.ri.Z_Malloc(
 			(size_t)maxStagingVerts * sizeof(dx12WorldVertex_t));
-		int               *stagingIndexes = (int *)malloc(
+		int               *stagingIndexes = (int *)dx12.ri.Z_Malloc(
 			(size_t)maxStagingIndexes * sizeof(int));
 
 		if (!stagingVerts || !stagingIndexes)
@@ -1198,11 +1198,11 @@ void DX12_LoadWorld(const char *name)
 			dx12.ri.Printf(PRINT_WARNING, "DX12_LoadWorld: out of memory for staging buffers\n");
 			if (stagingVerts)
 			{
-				free(stagingVerts);
+				dx12.ri.Free(stagingVerts);
 			}
 			if (stagingIndexes)
 			{
-				free(stagingIndexes);
+				dx12.ri.Free(stagingIndexes);
 			}
 			dx12.ri.FS_FreeFile(buffer);
 			return;
@@ -1482,7 +1482,7 @@ patch_overflow:
 			// Build a mapping from BSP surface index → dx12DrawSurf_t index.
 			// Since we may have skipped some surfaces, we pre-compute offsets.
 			// Simple approach: scan bspSurfaces again to build the table.
-			int *surfMap = (int *)malloc((size_t)bspSurfCount * sizeof(int));
+			int *surfMap = (int *)dx12.ri.Z_Malloc((size_t)bspSurfCount * sizeof(int));
 			if (surfMap)
 			{
 				int drawIdx = 0;
@@ -1550,7 +1550,7 @@ patch_overflow:
 					(void)surfBase;
 				}
 
-				free(surfMap);
+				dx12.ri.Free(surfMap);
 			}
 		}
 	}
@@ -1599,7 +1599,7 @@ patch_overflow:
 				int     shift;
 				int     j;
 
-				dx12World.lightGridData = (byte *)malloc((size_t)(numGridPoints * 8));
+				dx12World.lightGridData = (byte *)dx12.ri.Z_Malloc((size_t)(numGridPoints * 8));
 
 				if (dx12World.lightGridData)
 				{

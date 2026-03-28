@@ -6,7 +6,7 @@
  * decoder using the puff() DEFLATE decompressor – no libpng dependency,
  * mirrors the approach of src/renderercommon/tr_image_png.c).
  * Pixel data is loaded via dx12.ri.FS_ReadFile and decoded into a plain
- * malloc()-allocated RGBA buffer.
+ * dx12.ri.Z_Malloc()-allocated RGBA buffer.
  */
 
 #include "dx12_image.h"
@@ -50,7 +50,7 @@ static unsigned short TGA_Read16(const byte *p)
  *
  * @param[in]  buf      Raw file bytes.
  * @param[in]  bufSize  Number of bytes in buf.
- * @param[out] pic      Set to a malloc()-allocated RGBA buffer on success.
+ * @param[out] pic      Set to a dx12.ri.Z_Malloc()-allocated RGBA buffer on success.
  * @param[out] width    Image width in pixels.
  * @param[out] height   Image height in pixels.
  */
@@ -115,7 +115,7 @@ static void DX12_DecodeTGA(const byte *buf, int bufSize,
 
 	bytesPerPixel = pixelDepth / 8;
 	numPixels     = w * h;
-	out           = (byte *)malloc((size_t)numPixels * 4);
+	out           = (byte *)dx12.ri.Z_Malloc((size_t)numPixels * 4);
 	if (!out)
 	{
 		return;
@@ -134,7 +134,7 @@ static void DX12_DecodeTGA(const byte *buf, int bufSize,
 		{
 			if (src + bytesPerPixel > end)
 			{
-				free(out);
+				dx12.ri.Free(out);
 				return;
 			}
 			// TGA stores pixels as BGR(A); convert to RGBA
@@ -164,7 +164,7 @@ static void DX12_DecodeTGA(const byte *buf, int bufSize,
 
 				if (src + bytesPerPixel > end)
 				{
-					free(out);
+					dx12.ri.Free(out);
 					return;
 				}
 				r    = src[2];
@@ -190,7 +190,7 @@ static void DX12_DecodeTGA(const byte *buf, int bufSize,
 				{
 					if (src + bytesPerPixel > end)
 					{
-						free(out);
+						dx12.ri.Free(out);
 						return;
 					}
 					*dst++ = src[2];
@@ -207,7 +207,7 @@ static void DX12_DecodeTGA(const byte *buf, int bufSize,
 	if (!topLeft)
 	{
 		int  rowBytes = w * 4;
-		byte *rowBuf  = (byte *)malloc((size_t)rowBytes);
+		byte *rowBuf  = (byte *)dx12.ri.Z_Malloc((size_t)rowBytes);
 
 		if (rowBuf)
 		{
@@ -221,7 +221,7 @@ static void DX12_DecodeTGA(const byte *buf, int bufSize,
 				memcpy(top, bottom, (size_t)rowBytes);
 				memcpy(bottom, rowBuf, (size_t)rowBytes);
 			}
-			free(rowBuf);
+			dx12.ri.Free(rowBuf);
 		}
 	}
 
@@ -256,7 +256,7 @@ static void DX12_JpegErrorExit(j_common_ptr cinfo)
  *
  * @param[in]  buf      Raw JPEG file bytes.
  * @param[in]  bufSize  Byte count.
- * @param[out] pic      malloc()-allocated RGBA output, or NULL on failure.
+ * @param[out] pic      dx12.ri.Z_Malloc()-allocated RGBA output, or NULL on failure.
  * @param[out] width    Image width.
  * @param[out] height   Image height.
  */
@@ -300,7 +300,7 @@ static void DX12_DecodeJPG(const byte *buf, int bufSize,
 		return;
 	}
 
-	out = (byte *)malloc((size_t)w * (size_t)h * 4);
+	out = (byte *)dx12.ri.Z_Malloc((size_t)w * (size_t)h * 4);
 	if (!out)
 	{
 		jpeg_destroy_decompress(&cinfo);
@@ -445,7 +445,7 @@ static struct DX12_BufferedFile *DX12_OpenBufferedFile(const byte *data, int siz
 		return NULL;
 	}
 
-	BF = (struct DX12_BufferedFile *)malloc(sizeof(struct DX12_BufferedFile));
+	BF = (struct DX12_BufferedFile *)dx12.ri.Z_Malloc(sizeof(struct DX12_BufferedFile));
 	if (!BF)
 	{
 		return NULL;
@@ -463,7 +463,7 @@ static void DX12_CloseBufferedFile(struct DX12_BufferedFile *BF)
 {
 	if (BF)
 	{
-		free(BF);
+		dx12.ri.Free(BF);
 	}
 }
 
@@ -657,7 +657,7 @@ static uint32_t DX12_DecompressIDATs(struct DX12_BufferedFile *BF, uint8_t **Buf
 
 	DX12_BufferedFileRewind(BF, (unsigned)BytesToRewind);
 
-	CompressedData = (uint8_t *)malloc(CompressedDataLength);
+	CompressedData = (uint8_t *)dx12.ri.Z_Malloc(CompressedDataLength);
 	if (!CompressedData)
 	{
 		return 0;
@@ -673,7 +673,7 @@ static uint32_t DX12_DecompressIDATs(struct DX12_BufferedFile *BF, uint8_t **Buf
 		CH = (const struct PNG_ChunkHeader *)DX12_BufferedFileRead(BF, PNG_ChunkHeader_Size);
 		if (!CH)
 		{
-			free(CompressedData);
+			dx12.ri.Free(CompressedData);
 
 			return 0;
 		}
@@ -693,14 +693,14 @@ static uint32_t DX12_DecompressIDATs(struct DX12_BufferedFile *BF, uint8_t **Buf
 			OrigCompressedData = (const uint8_t *)DX12_BufferedFileRead(BF, Length);
 			if (!OrigCompressedData)
 			{
-				free(CompressedData);
+				dx12.ri.Free(CompressedData);
 
 				return 0;
 			}
 
 			if (!DX12_BufferedFileSkip(BF, PNG_ChunkCRC_Size))
 			{
-				free(CompressedData);
+				dx12.ri.Free(CompressedData);
 
 				return 0;
 			}
@@ -720,15 +720,15 @@ static uint32_t DX12_DecompressIDATs(struct DX12_BufferedFile *BF, uint8_t **Buf
 	puffResult = puff(puffDest, &puffDestLen, puffSrc, &puffSrcLen);
 	if (!((puffResult == 0) && (puffDestLen > 0)))
 	{
-		free(CompressedData);
+		dx12.ri.Free(CompressedData);
 
 		return 0;
 	}
 
-	DecompressedData = (uint8_t *)malloc(puffDestLen);
+	DecompressedData = (uint8_t *)dx12.ri.Z_Malloc(puffDestLen);
 	if (!DecompressedData)
 	{
-		free(CompressedData);
+		dx12.ri.Free(CompressedData);
 
 		return 0;
 	}
@@ -740,11 +740,11 @@ static uint32_t DX12_DecompressIDATs(struct DX12_BufferedFile *BF, uint8_t **Buf
 
 	puffResult = puff(puffDest, &puffDestLen, puffSrc, &puffSrcLen);
 
-	free(CompressedData);
+	dx12.ri.Free(CompressedData);
 
 	if (!((puffResult == 0) && (puffDestLen > 0)))
 	{
-		free(DecompressedData);
+		dx12.ri.Free(DecompressedData);
 
 		return 0;
 	}
@@ -1540,7 +1540,7 @@ static qboolean DX12_DecodeInterlaced(struct PNG_Chunk_IHDR *IHDR,
  *
  * @param[in]  buf      Raw PNG file bytes.
  * @param[in]  bufSize  Byte count.
- * @param[out] pic      malloc()-allocated RGBA output, or NULL on failure.
+ * @param[out] pic      dx12.ri.Z_Malloc()-allocated RGBA output, or NULL on failure.
  * @param[out] width    Image width.
  * @param[out] height   Image height.
  */
@@ -1858,10 +1858,10 @@ static void DX12_DecodePNG(const byte *buf, int bufSize,
 	}
 
 	// Allocate output RGBA buffer
-	OutBuffer = (byte *)malloc((size_t)IHDR_Width * (size_t)IHDR_Height * Q3IMAGE_BYTESPERPIXEL);
+	OutBuffer = (byte *)dx12.ri.Z_Malloc((size_t)IHDR_Width * (size_t)IHDR_Height * Q3IMAGE_BYTESPERPIXEL);
 	if (!OutBuffer)
 	{
-		free(DecompressedData);
+		dx12.ri.Free(DecompressedData);
 		DX12_CloseBufferedFile(ThePNG);
 
 		return;
@@ -1874,8 +1874,8 @@ static void DX12_DecodePNG(const byte *buf, int bufSize,
 		if (!DX12_DecodeNonInterlaced(IHDR, OutBuffer, DecompressedData, DecompressedDataLength,
 		                              HasTransparentColour, TransparentColour, OutPal))
 		{
-			free(OutBuffer);
-			free(DecompressedData);
+			dx12.ri.Free(OutBuffer);
+			dx12.ri.Free(DecompressedData);
 			DX12_CloseBufferedFile(ThePNG);
 
 			return;
@@ -1889,8 +1889,8 @@ static void DX12_DecodePNG(const byte *buf, int bufSize,
 		if (!DX12_DecodeInterlaced(IHDR, OutBuffer, DecompressedData, DecompressedDataLength,
 		                           HasTransparentColour, TransparentColour, OutPal))
 		{
-			free(OutBuffer);
-			free(DecompressedData);
+			dx12.ri.Free(OutBuffer);
+			dx12.ri.Free(DecompressedData);
 			DX12_CloseBufferedFile(ThePNG);
 
 			return;
@@ -1901,8 +1901,8 @@ static void DX12_DecodePNG(const byte *buf, int bufSize,
 
 	default:
 	{
-		free(OutBuffer);
-		free(DecompressedData);
+		dx12.ri.Free(OutBuffer);
+		dx12.ri.Free(DecompressedData);
 		DX12_CloseBufferedFile(ThePNG);
 
 		return;
@@ -1913,7 +1913,7 @@ static void DX12_DecodePNG(const byte *buf, int bufSize,
 	*width  = (int)IHDR_Width;
 	*height = (int)IHDR_Height;
 
-	free(DecompressedData);
+	dx12.ri.Free(DecompressedData);
 	DX12_CloseBufferedFile(ThePNG);
 }
 
@@ -1924,7 +1924,7 @@ static void DX12_DecodePNG(const byte *buf, int bufSize,
 /**
  * @brief DX12_LoadImage
  * @param[in]  name   Game-path (with or without extension).
- * @param[out] pic    malloc()-allocated RGBA buffer, or NULL.
+ * @param[out] pic    dx12.ri.Z_Malloc()-allocated RGBA buffer, or NULL.
  * @param[out] width  Image width.
  * @param[out] height Image height.
  *
@@ -1993,7 +1993,7 @@ void DX12_FreeImage(byte *pic)
 {
 	if (pic)
 	{
-		free(pic);
+		dx12.ri.Free(pic);
 	}
 }
 

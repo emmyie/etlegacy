@@ -338,18 +338,18 @@ qboolean DX12_LoadMD3(int slot, const char *name)
 			continue;
 		}
 
-		cpuVerts = (dx12WorldVertex_t *)malloc(numVerts * sizeof(dx12WorldVertex_t));
-		cpuIdx   = (int *)malloc(numTris * 3 * sizeof(int));
+		cpuVerts = (dx12WorldVertex_t *)dx12.ri.Z_Malloc(numVerts * sizeof(dx12WorldVertex_t));
+		cpuIdx   = (int *)dx12.ri.Z_Malloc(numTris * 3 * sizeof(int));
 
 		if (!cpuVerts || !cpuIdx)
 		{
 			if (cpuVerts)
 			{
-				free(cpuVerts);
+				dx12.ri.Free(cpuVerts);
 			}
 			if (cpuIdx)
 			{
-				free(cpuIdx);
+				dx12.ri.Free(cpuIdx);
 			}
 			surf = (md3Surface_t *)((byte *)surf + surf->ofsEnd);
 			continue;
@@ -415,14 +415,14 @@ qboolean DX12_LoadMD3(int slot, const char *name)
 				ms->indexBuffer->Release();
 				ms->indexBuffer = NULL;
 			}
-			free(cpuVerts);
-			free(cpuIdx);
+			dx12.ri.Free(cpuVerts);
+			dx12.ri.Free(cpuIdx);
 			surf = (md3Surface_t *)((byte *)surf + surf->ofsEnd);
 			continue;
 		}
 
-		free(cpuVerts);
-		free(cpuIdx);
+		dx12.ri.Free(cpuVerts);
+		dx12.ri.Free(cpuIdx);
 
 		ms->numVertices = numVerts;
 		ms->numIndices  = numTris * 3;
@@ -456,7 +456,7 @@ qboolean DX12_LoadMD3(int slot, const char *name)
 		// Validate the tag block fits inside the file
 		if (header->ofsTags + (int)tagBytes <= fileLen)
 		{
-			entry->tags = (md3Tag_t *)malloc(tagBytes);
+			entry->tags = (md3Tag_t *)dx12.ri.Z_Malloc(tagBytes);
 			if (entry->tags)
 			{
 				memcpy(entry->tags,
@@ -620,7 +620,7 @@ void DX12_ShutdownModels(void)
 		// Free MD3 tag data
 		if (dx12ModelData[i].tags)
 		{
-			free(dx12ModelData[i].tags);
+			dx12.ri.Free(dx12ModelData[i].tags);
 			dx12ModelData[i].tags     = NULL;
 		}
 		dx12ModelData[i].numTags   = 0;

@@ -1343,7 +1343,7 @@ qboolean DX12_LoadMDS(const char *name, void **outData, int *outSize)
 	}
 
 	// Heap-copy the raw data so we own it independently of the VFS cache
-	*outData = malloc((size_t)len);
+	*outData = dx12.ri.Z_Malloc((size_t)len);
 	if (!*outData)
 	{
 		dx12.ri.FS_FreeFile(buf);
@@ -1391,7 +1391,7 @@ qboolean DX12_LoadMDX(const char *name, void **outData, int *outSize)
 		return qfalse;
 	}
 
-	*outData = malloc((size_t)len);
+	*outData = dx12.ri.Z_Malloc((size_t)len);
 	if (!*outData)
 	{
 		dx12.ri.FS_FreeFile(buf);
@@ -1439,7 +1439,7 @@ qboolean DX12_LoadMDM(const char *name, void **outData, int *outSize)
 		return qfalse;
 	}
 
-	*outData = malloc((size_t)len);
+	*outData = dx12.ri.Z_Malloc((size_t)len);
 	if (!*outData)
 	{
 		dx12.ri.FS_FreeFile(buf);
@@ -1459,7 +1459,7 @@ void DX12_FreeSkeletal(void *data)
 {
 	if (data)
 	{
-		free(data);
+		dx12.ri.Free(data);
 	}
 }
 
