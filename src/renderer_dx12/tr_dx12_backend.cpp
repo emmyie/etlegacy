@@ -716,8 +716,27 @@ dx12Texture_t DX12_CreateTextureFromRGBA(const byte *data, int width, int height
 	uploadBuffer->Unmap(0, NULL);
 
 	// ---- Record upload + transition into the dedicated upload command list ----
-	dx12.uploadCmdAllocator->Reset();
-	dx12.uploadCmdList->Reset(dx12.uploadCmdAllocator, NULL);
+	hr = dx12.uploadCmdAllocator->Reset();
+	if (FAILED(hr))
+	{
+		dx12.ri.Printf(PRINT_WARNING,
+		               "DX12_CreateTextureFromRGBA: uploadCmdAllocator->Reset failed (0x%08lx)\n", hr);
+		uploadBuffer->Release();
+		tex.resource->Release();
+		tex.resource = NULL;
+		return tex;
+	}
+
+	hr = dx12.uploadCmdList->Reset(dx12.uploadCmdAllocator, NULL);
+	if (FAILED(hr))
+	{
+		dx12.ri.Printf(PRINT_WARNING,
+		               "DX12_CreateTextureFromRGBA: uploadCmdList->Reset failed (0x%08lx)\n", hr);
+		uploadBuffer->Release();
+		tex.resource->Release();
+		tex.resource = NULL;
+		return tex;
+	}
 
 	D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
 	srcLoc.pResource       = uploadBuffer;
@@ -1695,6 +1714,17 @@ void R_DX12_Shutdown(qboolean destroyWindow)
 	if (!dx12.initialized)
 	{
 		return;
+	}
+
+	// If a frame is currently open (command list in recording state), close it
+	// before waiting for the GPU.  A recording command list keeps the associated
+	// command allocator "in use" from D3D12's perspective: the next map's
+	// DX12_BeginFrame would fail to Reset() that allocator, leaving the
+	// renderer unable to open new frames.
+	if (dx12.frameOpen && dx12.commandList)
+	{
+		dx12.commandList->Close();
+		dx12.frameOpen = qfalse;
 	}
 
 	// ---- 1.  Wait for the GPU to drain all outstanding work ----------------

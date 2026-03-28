@@ -203,7 +203,16 @@ static void RE_DX12_BeginRegistration(glconfig_t *config)
 		// signature, constant buffer) which was released by DX12_SceneShutdown().
 		// DX12_InitTextures() does NOT need to be called again – the fallback
 		// textures are already in place from the purgeCache call above.
-		DX12_SceneInit();
+		//
+		// Guard against double-init: R_DX12_Init() already calls DX12_SceneInit()
+		// at startup.  If BeginRegistration is called immediately after Init
+		// (first map load), the scene is already initialized and we must not call
+		// DX12_SceneInit() again or the existing resources will be leaked by the
+		// Com_Memset at the top of that function.
+		if (!dx12Scene.initialized)
+		{
+			DX12_SceneInit();
+		}
 	}
 
 	r_mode         = dx12.ri.Cvar_Get("r_mode", "4", 0);
@@ -714,6 +723,12 @@ static qhandle_t RE_DX12_RegisterModel(const char *name)
 	slot = dx12NumModels;
 	Q_strncpyz(dx12ModelNames[slot], name, MAX_QPATH);
 	dx12NumModels++;
+
+	// Zero the model data entry before the loader populates it.  DX12_LoadMD3
+	// calls Com_Memset itself, but the MDS/MDX/MDM paths only set specific
+	// fields – leaving stale data (lodSlots, surfaces[*] indices, numSurfaces)
+	// from a previous map's model at the same slot.
+	Com_Memset(&dx12ModelData[slot], 0, sizeof(dx12ModelData[slot]));
 
 	// Choose loader based on file extension.
 	{
