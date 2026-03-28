@@ -85,8 +85,8 @@ extern "C" void R_FreeImageBuffer(void)
  */
 typedef struct dx12DynShader_s
 {
-	char                   name[MAX_QPATH]; ///< Shader name (cache key)
-	char                  *shadertext;      ///< Heap-allocated shader text
+	char name[MAX_QPATH];                   ///< Shader name (cache key)
+	char *shadertext;                       ///< Heap-allocated shader text
 	struct dx12DynShader_s *next;
 } dx12DynShader_t;
 
@@ -130,12 +130,12 @@ static void DX12_PurgeDynamicShaders(void)
  */
 typedef struct
 {
-	ID3D12Resource              *resource;  ///< GPU texture resource (or NULL)
-	D3D12_CPU_DESCRIPTOR_HANDLE  cpuHandle; ///< SRV CPU handle in the SRV heap
-	D3D12_GPU_DESCRIPTOR_HANDLE  gpuHandle; ///< SRV GPU handle for binding
-	int                          width;     ///< Current texture width in pixels
-	int                          height;    ///< Current texture height in pixels
-	qboolean                     valid;     ///< qtrue once successfully created
+	ID3D12Resource *resource;               ///< GPU texture resource (or NULL)
+	D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle;  ///< SRV CPU handle in the SRV heap
+	D3D12_GPU_DESCRIPTOR_HANDLE gpuHandle;  ///< SRV GPU handle for binding
+	int width;                              ///< Current texture width in pixels
+	int height;                             ///< Current texture height in pixels
+	qboolean valid;                         ///< qtrue once successfully created
 } dx12ScratchTex_t;
 
 static dx12ScratchTex_t dx12ScratchTex[DX12_MAX_SCRATCH_IMAGES];
@@ -169,9 +169,6 @@ void DX12_ShutdownScratchTextures(void)
 // Stub implementations required by refexport_t
 // ---------------------------------------------------------------------------
 
-// Forward declaration – defined later in this file.
-static void RE_DX12_purgeCache(void);
-
 static void RE_DX12_BeginRegistration(glconfig_t *config)
 {
 	cvar_t *r_mode;
@@ -186,21 +183,31 @@ static void RE_DX12_BeginRegistration(glconfig_t *config)
 	Com_Memset(config, 0, sizeof(*config));
 
 	// Make sure core DX12 is initialized before any texture/shader registration
-	if ( !dx12.initialized )
+	if (!dx12.initialized)
 	{
-		R_DX12_Init( );   // creates device, queues, heaps, PSO, VB, textures, etc.
+		// First start or after a hard shutdown (vid_restart / quit): create the
+		// D3D12 device, descriptor heaps, PSO, swap chain and 2D VB from scratch.
+		// R_DX12_Init also calls DX12_InitTextures() and DX12_SceneInit().
+		R_DX12_Init();
 	}
 	else
 	{
-		// Already initialized: flush all per-map GPU/CPU resources so the
-		// incoming map starts with a clean material, texture, model and skin
-		// cache.  Without this, disconnecting and reconnecting accumulates
-		// materials until DX12_RegisterMaterial reports "cache full".
-		RE_DX12_purgeCache();
+		// Soft-reset path: R_DX12_Shutdown(qfalse) was called by CL_ShutdownAll,
+		// which released all per-map content (textures, models, world geometry,
+		// 3D scene pipeline) but kept the D3D12 device and infrastructure alive.
+		// re.purgeCache() (RE_DX12_purgeCache) was also called by CL_ShutdownAll
+		// and has already reinitialised the white/black fallback textures and
+		// zeroed all CPU-side registries.
+		//
+		// All we need to do here is recreate the 3D scene pipeline (PSO, root
+		// signature, constant buffer) which was released by DX12_SceneShutdown().
+		// DX12_InitTextures() does NOT need to be called again – the fallback
+		// textures are already in place from the purgeCache call above.
+		DX12_SceneInit();
 	}
 
-	r_mode        = dx12.ri.Cvar_Get("r_mode", "4", 0);
-	r_customwidth = dx12.ri.Cvar_Get("r_customwidth", "1280", 0);
+	r_mode         = dx12.ri.Cvar_Get("r_mode", "4", 0);
+	r_customwidth  = dx12.ri.Cvar_Get("r_customwidth", "1280", 0);
 	r_customheight = dx12.ri.Cvar_Get("r_customheight", "720", 0);
 
 	// Pick a sensible default resolution
@@ -222,11 +229,11 @@ static void RE_DX12_BeginRegistration(glconfig_t *config)
 	Q_strncpyz(config->vendor_string, "Microsoft", sizeof(config->vendor_string));
 	Q_strncpyz(config->version_string, "12.0", sizeof(config->version_string));
 
-	config->colorBits    = 32;
-	config->depthBits    = 24;
-	config->stencilBits  = 8;
-	config->isFullscreen = qfalse;
-	config->windowAspect = (float)config->vidWidth / (float)config->vidHeight;
+	config->colorBits     = 32;
+	config->depthBits     = 24;
+	config->stencilBits   = 8;
+	config->isFullscreen  = qfalse;
+	config->windowAspect  = (float)config->vidWidth / (float)config->vidHeight;
 	config->displayAspect = config->windowAspect;
 
 	dx12.vidWidth  = config->vidWidth;
@@ -278,23 +285,23 @@ static void RE_DX12_SetColor(const float *rgba)
 }
 
 static void RE_DX12_DrawStretchPic(float x, float y, float w, float h,
-                                    float s1, float t1, float s2, float t2,
-                                    qhandle_t hShader)
+                                   float s1, float t1, float s2, float t2,
+                                   qhandle_t hShader)
 {
 	DX12_DrawStretchPic(x, y, w, h, s1, t1, s2, t2, hShader);
 }
 
 static void RE_DX12_DrawRotatedPic(float x, float y, float w, float h,
-                                    float s1, float t1, float s2, float t2,
-                                    qhandle_t hShader, float angle)
+                                   float s1, float t1, float s2, float t2,
+                                   qhandle_t hShader, float angle)
 {
 	DX12_DrawRotatedPic(x, y, w, h, s1, t1, s2, t2, hShader, angle);
 }
 
 static void RE_DX12_DrawStretchPicGradient(float x, float y, float w, float h,
-                                            float s1, float t1, float s2, float t2,
-                                            qhandle_t hShader, const float *gradientColor,
-                                            int gradientType)
+                                           float s1, float t1, float s2, float t2,
+                                           qhandle_t hShader, const float *gradientColor,
+                                           int gradientType)
 {
 	DX12_DrawStretchPicGradient(x, y, w, h, s1, t1, s2, t2,
 	                            hShader, gradientColor, gradientType);
@@ -306,11 +313,11 @@ static void RE_DX12_Add2dPolys(polyVert_t *polys, int numverts, qhandle_t hShade
 }
 
 static void RE_DX12_UploadCinematic(int w, int h, int cols, int rows,
-                                     const byte *data, int client, qboolean dirty)
+                                    const byte *data, int client, qboolean dirty)
 {
 	dx12ScratchTex_t *scratch;
-	int               srvSlot;
-	dx12Texture_t     tex;
+	int              srvSlot;
+	dx12Texture_t    tex;
 
 	(void)w; (void)h; // w/h are display dimensions, not texture size; use cols/rows
 
@@ -368,12 +375,12 @@ static void RE_DX12_UploadCinematic(int w, int h, int cols, int rows,
 }
 
 static void RE_DX12_DrawStretchRaw(int x, int y, int w, int h, int cols, int rows,
-                                    const byte *data, int client, qboolean dirty)
+                                   const byte *data, int client, qboolean dirty)
 {
 	dx12ScratchTex_t *scratch;
-	float             nx1, ny1, nx2, ny2;
-	float             r, g, b, a;
-	dx12QuadVertex_t  corners[4];
+	float            nx1, ny1, nx2, ny2;
+	float            r, g, b, a;
+	dx12QuadVertex_t corners[4];
 
 	RE_DX12_UploadCinematic(w, h, cols, rows, data, client, dirty);
 
@@ -405,26 +412,26 @@ static void RE_DX12_DrawStretchRaw(int x, int y, int w, int h, int cols, int row
 	a = dx12.color2D[3];
 
 	// TL (top-left)
-	corners[0].pos[0] = nx1; corners[0].pos[1] = ny1;
-	corners[0].uv[0]  = 0.0f; corners[0].uv[1] = 0.0f;
+	corners[0].pos[0]   = nx1; corners[0].pos[1] = ny1;
+	corners[0].uv[0]    = 0.0f; corners[0].uv[1] = 0.0f;
 	corners[0].color[0] = r; corners[0].color[1] = g;
 	corners[0].color[2] = b; corners[0].color[3] = a;
 
 	// TR (top-right)
-	corners[1].pos[0] = nx2; corners[1].pos[1] = ny1;
-	corners[1].uv[0]  = 1.0f; corners[1].uv[1] = 0.0f;
+	corners[1].pos[0]   = nx2; corners[1].pos[1] = ny1;
+	corners[1].uv[0]    = 1.0f; corners[1].uv[1] = 0.0f;
 	corners[1].color[0] = r; corners[1].color[1] = g;
 	corners[1].color[2] = b; corners[1].color[3] = a;
 
 	// BL (bottom-left)
-	corners[2].pos[0] = nx1; corners[2].pos[1] = ny2;
-	corners[2].uv[0]  = 0.0f; corners[2].uv[1] = 1.0f;
+	corners[2].pos[0]   = nx1; corners[2].pos[1] = ny2;
+	corners[2].uv[0]    = 0.0f; corners[2].uv[1] = 1.0f;
 	corners[2].color[0] = r; corners[2].color[1] = g;
 	corners[2].color[2] = b; corners[2].color[3] = a;
 
 	// BR (bottom-right)
-	corners[3].pos[0] = nx2; corners[3].pos[1] = ny2;
-	corners[3].uv[0]  = 1.0f; corners[3].uv[1] = 1.0f;
+	corners[3].pos[0]   = nx2; corners[3].pos[1] = ny2;
+	corners[3].uv[0]    = 1.0f; corners[3].uv[1] = 1.0f;
 	corners[3].color[0] = r; corners[3].color[1] = g;
 	corners[3].color[2] = b; corners[3].color[3] = a;
 
@@ -472,8 +479,8 @@ static void RE_DX12_EndFrame(int *frontEndMsec, int *backEndMsec)
  */
 typedef struct
 {
-	char      name[MAX_QPATH];  ///< Surface name (lower-cased)
-	int       hash;             ///< Pre-computed hash of name
+	char name[MAX_QPATH];       ///< Surface name (lower-cased)
+	int hash;                   ///< Pre-computed hash of name
 	qhandle_t matHandle;        ///< DX12 material / texture handle
 } dx12SkinSurface_t;
 
@@ -485,7 +492,7 @@ typedef struct
 {
 	char type[MAX_QPATH];   ///< e.g. "md3_lower"
 	char model[MAX_QPATH];  ///< e.g. "models/players/soldier/lower.md3"
-	int  hash;
+	int hash;
 } dx12SkinModel_t;
 
 /**
@@ -494,11 +501,11 @@ typedef struct
  */
 typedef struct
 {
-	char              name[MAX_QPATH];
-	int               numSurfaces;
-	int               numModels;
+	char name[MAX_QPATH];
+	int numSurfaces;
+	int numModels;
 	dx12SkinSurface_t surfaces[DX12_MAX_SKIN_SURFACES];
-	dx12SkinModel_t   models[DX12_MAX_PART_MODELS];
+	dx12SkinModel_t models[DX12_MAX_PART_MODELS];
 } dx12Skin_t;
 
 static dx12Skin_t dx12Skins[DX12_MAX_SKINS];
@@ -536,9 +543,9 @@ static int DX12_HashKey(char *string, int maxlen)
  */
 static char *DX12_CommaParse(char **data_p)
 {
-	int         c   = 0;
-	int         len = 0;
-	char       *data = *data_p;
+	int         c     = 0;
+	int         len   = 0;
+	char        *data = *data_p;
 	static char com_token[MAX_TOKEN_CHARS];
 
 	com_token[0] = '\0';
@@ -644,6 +651,30 @@ static char *DX12_CommaParse(char **data_p)
 static char dx12ModelNames[DX12_MAX_MOD_KNOWN][MAX_QPATH];
 static int  dx12NumModels = 0;
 
+// ---------------------------------------------------------------------------
+// DX12_ClearPerSessionState
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief DX12_ClearPerSessionState
+ *
+ * Resets all CPU-side per-session registries: the model-name lookup table
+ * and the skin table.  GPU model resources must have been released already
+ * by DX12_ShutdownModels() before this is called.
+ *
+ * Called by R_DX12_Shutdown(qfalse) (soft reset, between map loads) so that
+ * the next map load starts with completely clean registries.  Also called by
+ * RE_DX12_purgeCache() for consistency.
+ */
+void DX12_ClearPerSessionState(void)
+{
+	Com_Memset(dx12ModelNames, 0, sizeof(dx12ModelNames));
+	dx12NumModels = 0;
+
+	Com_Memset(dx12Skins, 0, sizeof(dx12Skins));
+	dx12NumSkins = 0;
+}
+
 /**
  * @brief RE_DX12_RegisterModel
  *
@@ -693,8 +724,8 @@ static qhandle_t RE_DX12_RegisterModel(const char *name)
 			{
 				// MDS: mesh + embedded animation (player bodies).
 				// Store raw data for bone-based tag lookup.
-				void    *rawData  = NULL;
-				int      rawSize  = 0;
+				void *rawData = NULL;
+				int  rawSize  = 0;
 				if (DX12_LoadMDS(name, &rawData, &rawSize))
 				{
 					dx12ModelData[slot].rawData     = rawData;
@@ -712,8 +743,8 @@ static qhandle_t RE_DX12_RegisterModel(const char *name)
 			else if (!Q_stricmp(ext, ".mdx"))
 			{
 				// MDX: pure animation companion for MDM models.
-				void    *rawData = NULL;
-				int      rawSize = 0;
+				void *rawData = NULL;
+				int  rawSize  = 0;
 				if (DX12_LoadMDX(name, &rawData, &rawSize))
 				{
 					dx12ModelData[slot].rawData     = rawData;
@@ -725,8 +756,8 @@ static qhandle_t RE_DX12_RegisterModel(const char *name)
 			else if (!Q_stricmp(ext, ".mdm"))
 			{
 				// MDM: skeletal mesh without embedded animation.
-				void    *rawData = NULL;
-				int      rawSize = 0;
+				void *rawData = NULL;
+				int  rawSize  = 0;
 				if (DX12_LoadMDM(name, &rawData, &rawSize))
 				{
 					dx12ModelData[slot].rawData     = rawData;
@@ -776,7 +807,7 @@ static qhandle_t RE_DX12_RegisterModelAllLODs(const char *name)
 	qhandle_t lodHandle;
 	char      lodName[MAX_QPATH];
 	char      suffix[32];
-	char     *dot;
+	char      *dot;
 	int       workSlots[MD3_MAX_LODS];
 
 	if (!name || !name[0])
@@ -878,8 +909,8 @@ static qhandle_t RE_DX12_RegisterSkin(const char *name)
 	void       *text_v = NULL;
 	char       *text_p;
 	char       *token;
-	char        surfName[MAX_QPATH];
-	int         totalSurfaces = 0;
+	char       surfName[MAX_QPATH];
+	int        totalSurfaces = 0;
 
 	if (!name || !name[0])
 	{
@@ -1001,7 +1032,7 @@ static qhandle_t RE_DX12_RegisterSkin(const char *name)
 static qhandle_t RE_DX12_RegisterShader(const char *name)
 {
 	const char *resolvedName;
-	qhandle_t   h;
+	qhandle_t  h;
 
 	if (!name || !name[0])
 	{
@@ -1026,7 +1057,7 @@ static qhandle_t RE_DX12_RegisterShader(const char *name)
 
 static qhandle_t RE_DX12_RegisterShaderNoMip(const char *name)
 {
-	const char    *resolvedName;
+	const char     *resolvedName;
 	qhandle_t      h;
 	dx12Material_t *mat;
 
@@ -1083,9 +1114,9 @@ static float DX12_ReadFloat32(const unsigned char **p)
 
 static void RE_DX12_RegisterFont(const char *fontName, int pointSize, void *font, qboolean extended)
 {
-	fontInfo_t         *fi   = (fontInfo_t *)font;
+	fontInfo_t          *fi = (fontInfo_t *)font;
 	char                datName[MAX_QPATH];
-	void               *faceData  = NULL;
+	void                *faceData = NULL;
 	int                 len;
 	const unsigned char *p;
 	int                 i;
@@ -1278,9 +1309,9 @@ static int RE_DX12_LightForPoint(vec3_t point, vec3_t ambientLight, vec3_t direc
 
 	if (!dx12World.lightGridData || !dx12World.loaded)
 	{
-		VectorSet(ambientLight,  0.0f, 0.0f, 0.0f);
+		VectorSet(ambientLight, 0.0f, 0.0f, 0.0f);
 		VectorSet(directedLight, 0.0f, 0.0f, 0.0f);
-		VectorSet(lightDir,      0.0f, 0.0f, 1.0f);
+		VectorSet(lightDir, 0.0f, 0.0f, 1.0f);
 		return qfalse;
 	}
 
@@ -1343,9 +1374,9 @@ static int RE_DX12_LightForPoint(vec3_t point, vec3_t ambientLight, vec3_t direc
 		}
 		totalFactor += factor;
 
-		ambientLight[0]  += factor * data[0];
-		ambientLight[1]  += factor * data[1];
-		ambientLight[2]  += factor * data[2];
+		ambientLight[0] += factor * data[0];
+		ambientLight[1] += factor * data[1];
+		ambientLight[2] += factor * data[2];
 
 		directedLight[0] += factor * data[3];
 		directedLight[1] += factor * data[4];
@@ -1373,16 +1404,16 @@ static int RE_DX12_LightForPoint(vec3_t point, vec3_t ambientLight, vec3_t direc
 	if (totalFactor > 0.0f && totalFactor < 0.99f)
 	{
 		totalFactor = 1.0f / totalFactor;
-		VectorScale(ambientLight,  totalFactor, ambientLight);
+		VectorScale(ambientLight, totalFactor, ambientLight);
 		VectorScale(directedLight, totalFactor, directedLight);
 	}
 
-	r_ambientScale  = dx12.ri.Cvar_Get("r_ambientScale",  "0.5", CVAR_CHEAT);
-	r_directedScale = dx12.ri.Cvar_Get("r_directedScale", "1",   CVAR_CHEAT);
+	r_ambientScale  = dx12.ri.Cvar_Get("r_ambientScale", "0.5", CVAR_CHEAT);
+	r_directedScale = dx12.ri.Cvar_Get("r_directedScale", "1", CVAR_CHEAT);
 
 	if (r_ambientScale)
 	{
-		VectorScale(ambientLight,  r_ambientScale->value,  ambientLight);
+		VectorScale(ambientLight, r_ambientScale->value, ambientLight);
 	}
 	if (r_directedScale)
 	{
@@ -1410,7 +1441,7 @@ static void RE_DX12_AddPolysToScene(qhandle_t hShader, int numVerts, const polyV
 }
 
 static void RE_DX12_AddLightToScene(const vec3_t org, float radius, float intensity,
-                                     float r, float g, float b, qhandle_t hShader, int flags)
+                                    float r, float g, float b, qhandle_t hShader, int flags)
 {
 	dx12DLight_t *dl;
 	cvar_t       *r_dynamicLight;
@@ -1461,7 +1492,7 @@ static void RE_DX12_AddLightToScene(const vec3_t org, float radius, float intens
 }
 
 static void RE_DX12_AddCoronaToScene(const vec3_t org, float r, float g, float b,
-                                      float scale, int id, qboolean visible)
+                                     float scale, int id, qboolean visible)
 {
 	dx12Corona_t *cor;
 
@@ -1478,7 +1509,7 @@ static void RE_DX12_AddCoronaToScene(const vec3_t org, float r, float g, float b
 		return;
 	}
 
-	cor           = &dx12Scene.coronas[dx12Scene.numCoronas++];
+	cor = &dx12Scene.coronas[dx12Scene.numCoronas++];
 	VectorCopy(org, cor->origin);
 	cor->color[0] = r;
 	cor->color[1] = g;
@@ -1505,7 +1536,7 @@ static void RE_DX12_AddCoronaToScene(const vec3_t org, float r, float g, float b
 #endif
 
 /// Per-fog-slot settings table, matching GL's glfogsettings[NUM_FOGS].
-static glfog_t     dx12FogSettings[NUM_FOGS];
+static glfog_t dx12FogSettings[NUM_FOGS];
 /// Currently active fog slot (matches GL's glfogNum).
 static glfogType_t dx12FogNum = FOG_NONE;
 
@@ -1599,8 +1630,8 @@ static void RE_DX12_SetFog(int fogvar, int var1, int var2, float r, float g, flo
  *   writing surviving vertices to outPoints.
  */
 static void DX12_ChopPolyBehindPlane(int numInPoints, vec3_t inPoints[DX12_MAX_VERTS_ON_POLY],
-                                      int *numOutPoints, vec3_t outPoints[DX12_MAX_VERTS_ON_POLY],
-                                      vec3_t normal, float dist, float epsilon)
+                                     int *numOutPoints, vec3_t outPoints[DX12_MAX_VERTS_ON_POLY],
+                                     vec3_t normal, float dist, float epsilon)
 {
 	float dists[DX12_MAX_VERTS_ON_POLY + 4];
 	int   sides[DX12_MAX_VERTS_ON_POLY + 4];
@@ -1677,8 +1708,8 @@ static void DX12_ChopPolyBehindPlane(int numInPoints, vec3_t inPoints[DX12_MAX_V
 			continue;
 		}
 
-		p2 = inPoints[(i + 1) % numInPoints];
-		d  = dists[i] - dists[i + 1];
+		p2  = inPoints[(i + 1) % numInPoints];
+		d   = dists[i] - dists[i + 1];
 		dot = (d == 0.0f) ? 0.0f : dists[i] / d;
 
 		for (j = 0; j < 3; j++)
@@ -1696,10 +1727,10 @@ static void DX12_ChopPolyBehindPlane(int numInPoints, vec3_t inPoints[DX12_MAX_V
  *   appends it to fragmentBuffer.
  */
 static void DX12_AddMarkFragments(int numClipPoints, vec3_t clipPoints[2][DX12_MAX_VERTS_ON_POLY],
-                                   int numPlanes, vec3_t *normals, float *dists,
-                                   int maxPoints, vec3_t pointBuffer,
-                                   int maxFragments, markFragment_t *fragmentBuffer,
-                                   int *returnedPoints, int *returnedFragments)
+                                  int numPlanes, vec3_t *normals, float *dists,
+                                  int maxPoints, vec3_t pointBuffer,
+                                  int maxFragments, markFragment_t *fragmentBuffer,
+                                  int *returnedPoints, int *returnedFragments)
 {
 	int            pingPong = 0, i;
 	markFragment_t *mf;
@@ -1740,8 +1771,8 @@ static void DX12_AddMarkFragments(int numClipPoints, vec3_t clipPoints[2][DX12_M
 }
 
 static int RE_DX12_MarkFragments(int numPoints, const vec3_t *points, const vec3_t projection,
-                                  int maxPoints, vec3_t pointBuffer, int maxFragments,
-                                  markFragment_t *fragmentBuffer)
+                                 int maxPoints, vec3_t pointBuffer, int maxFragments,
+                                 markFragment_t *fragmentBuffer)
 {
 	int      i, j, k;
 	int      numPlanes;
@@ -1849,7 +1880,7 @@ static int RE_DX12_MarkFragments(int numPoints, const vec3_t *points, const vec3
 					const dx12WorldVertex_t *va = &dx12World.cpuVerts[dx12World.cpuIndexes[ds->firstIndex]];
 					const dx12WorldVertex_t *vb = &dx12World.cpuVerts[dx12World.cpuIndexes[ds->firstIndex + 1]];
 					const dx12WorldVertex_t *vc = &dx12World.cpuVerts[dx12World.cpuIndexes[ds->firstIndex + 2]];
-					vec3_t ea, eb;
+					vec3_t                  ea, eb;
 
 					VectorSubtract(vb->xyz, va->xyz, ea);
 					VectorSubtract(vc->xyz, va->xyz, eb);
@@ -1915,7 +1946,7 @@ static int RE_DX12_MarkFragments(int numPoints, const vec3_t *points, const vec3
 					for (j = 0; j < 3; j++)
 					{
 						const dx12WorldVertex_t *vtx =
-						    &dx12World.cpuVerts[dx12World.cpuIndexes[ds->firstIndex + k + j]];
+							&dx12World.cpuVerts[dx12World.cpuIndexes[ds->firstIndex + k + j]];
 						VectorCopy(vtx->xyz, clipPoints[0][j]);
 					}
 
@@ -1937,9 +1968,9 @@ static int RE_DX12_MarkFragments(int numPoints, const vec3_t *points, const vec3
 							VectorSubtract((float *)pointBuffer + 5 * (oldNumPoints + j),
 							               newCenter, delta);
 							*((float *)pointBuffer + 5 * (oldNumPoints + j) + 3) =
-							    0.5f + DotProduct(delta, axis[1]) * texCoordScale;
+								0.5f + DotProduct(delta, axis[1]) * texCoordScale;
 							*((float *)pointBuffer + 5 * (oldNumPoints + j) + 4) =
-							    0.5f + DotProduct(delta, axis[2]) * texCoordScale;
+								0.5f + DotProduct(delta, axis[2]) * texCoordScale;
 						}
 					}
 
@@ -1958,7 +1989,7 @@ static int RE_DX12_MarkFragments(int numPoints, const vec3_t *points, const vec3
 					for (j = 0; j < 3; j++)
 					{
 						const dx12WorldVertex_t *vtx =
-						    &dx12World.cpuVerts[dx12World.cpuIndexes[ds->firstIndex + k + j]];
+							&dx12World.cpuVerts[dx12World.cpuIndexes[ds->firstIndex + k + j]];
 						VectorCopy(vtx->xyz, clipPoints[0][j]);
 					}
 
@@ -1981,7 +2012,7 @@ static int RE_DX12_MarkFragments(int numPoints, const vec3_t *points, const vec3
 }
 
 static void RE_DX12_ProjectDecal(qhandle_t hShader, int numPoints, vec3_t *points,
-                                  vec4_t projection, vec4_t color, int lifeTime, int fadeTime)
+                                 vec4_t projection, vec4_t color, int lifeTime, int fadeTime)
 {
 	// ---------------------------------------------------------------------------
 	// Port of GL RE_ProjectDecal (renderer/tr_decals.c) adapted to use
@@ -1993,23 +2024,23 @@ static void RE_DX12_ProjectDecal(qhandle_t hShader, int numPoints, vec3_t *point
 	typedef struct
 	{
 		vec3_t xyz;
-		float  st[2];
+		float st[2];
 	} dx12DeclVert_t;
 
-	dx12DeclVert_t  dv[4];
-	vec4_t          texMat[2];
-	vec4_t          proj;             // working copy of projection
-	int             numDvPoints;
-	int             now, fadeStartTime, fadeEndTime;
+	dx12DeclVert_t dv[4];
+	vec4_t         texMat[2];
+	vec4_t         proj;              // working copy of projection
+	int            numDvPoints;
+	int            now, fadeStartTime, fadeEndTime;
 
 	// Buffers for RE_DX12_MarkFragments output
 #define DX12_PROJ_MAX_POINTS    512
 #define DX12_PROJ_MAX_FRAGS     128
-	vec3_t          markPoints[DX12_PROJ_MAX_POINTS];
-	markFragment_t  markFrags[DX12_PROJ_MAX_FRAGS];
-	vec3_t          scaledProj;
-	int             numFrags;
-	int             f, p;
+	vec3_t         markPoints[DX12_PROJ_MAX_POINTS];
+	markFragment_t markFrags[DX12_PROJ_MAX_FRAGS];
+	vec3_t         scaledProj;
+	int            numFrags;
+	int            f, p;
 
 	// ---- Input validation (matches GL RE_ProjectDecal) ----------------------
 	if (numPoints != 1 && numPoints != 3 && numPoints != 4)
@@ -2056,8 +2087,8 @@ static void RE_DX12_ProjectDecal(qhandle_t hShader, int numPoints, vec3_t *point
 	// ---- Omnidirectional vs directional (matches GL) ------------------------
 	if (numPoints == 1)
 	{
-		float   radius, iDist;
-		vec3_t  corner;
+		float  radius, iDist;
+		vec3_t corner;
 
 		radius = projection[3];
 		iDist  = 1.0f / (radius * 2.0f);
@@ -2080,7 +2111,7 @@ static void RE_DX12_ProjectDecal(qhandle_t hShader, int numPoints, vec3_t *point
 	}
 	else
 	{
-		int i, j;
+		int    i, j;
 		float  bb, s, t, d;
 		vec3_t pa, pb, pc;
 		vec3_t bary, origin, xyz;
@@ -2117,32 +2148,32 @@ static void RE_DX12_ProjectDecal(qhandle_t hShader, int numPoints, vec3_t *point
 		}
 
 		// Texture origin (s=0, t=0)
-		s = 0.0f; t = 0.0f;
-		bary[0] = ((dv[1].st[0] - s) * (dv[2].st[1] - t) - (dv[2].st[0] - s) * (dv[1].st[1] - t)) / bb;
-		bary[1] = ((dv[2].st[0] - s) * (dv[0].st[1] - t) - (dv[0].st[0] - s) * (dv[2].st[1] - t)) / bb;
-		bary[2] = ((dv[0].st[0] - s) * (dv[1].st[1] - t) - (dv[1].st[0] - s) * (dv[0].st[1] - t)) / bb;
+		s         = 0.0f; t = 0.0f;
+		bary[0]   = ((dv[1].st[0] - s) * (dv[2].st[1] - t) - (dv[2].st[0] - s) * (dv[1].st[1] - t)) / bb;
+		bary[1]   = ((dv[2].st[0] - s) * (dv[0].st[1] - t) - (dv[0].st[0] - s) * (dv[2].st[1] - t)) / bb;
+		bary[2]   = ((dv[0].st[0] - s) * (dv[1].st[1] - t) - (dv[1].st[0] - s) * (dv[0].st[1] - t)) / bb;
 		origin[0] = bary[0] * pa[0] + bary[1] * pb[0] + bary[2] * pc[0];
 		origin[1] = bary[0] * pa[1] + bary[1] * pb[1] + bary[2] * pc[1];
 		origin[2] = bary[0] * pa[2] + bary[1] * pb[2] + bary[2] * pc[2];
 
 		// S direction (s=1, t=0)
-		s = 1.0f; t = 0.0f;
+		s       = 1.0f; t = 0.0f;
 		bary[0] = ((dv[1].st[0] - s) * (dv[2].st[1] - t) - (dv[2].st[0] - s) * (dv[1].st[1] - t)) / bb;
 		bary[1] = ((dv[2].st[0] - s) * (dv[0].st[1] - t) - (dv[0].st[0] - s) * (dv[2].st[1] - t)) / bb;
 		bary[2] = ((dv[0].st[0] - s) * (dv[1].st[1] - t) - (dv[1].st[0] - s) * (dv[0].st[1] - t)) / bb;
-		xyz[0] = bary[0] * pa[0] + bary[1] * pb[0] + bary[2] * pc[0];
-		xyz[1] = bary[0] * pa[1] + bary[1] * pb[1] + bary[2] * pc[1];
-		xyz[2] = bary[0] * pa[2] + bary[1] * pb[2] + bary[2] * pc[2];
+		xyz[0]  = bary[0] * pa[0] + bary[1] * pb[0] + bary[2] * pc[0];
+		xyz[1]  = bary[0] * pa[1] + bary[1] * pb[1] + bary[2] * pc[1];
+		xyz[2]  = bary[0] * pa[2] + bary[1] * pb[2] + bary[2] * pc[2];
 		VectorSubtract(xyz, origin, vecs[0]);
 
 		// T direction (s=0, t=1)
-		s = 0.0f; t = 1.0f;
+		s       = 0.0f; t = 1.0f;
 		bary[0] = ((dv[1].st[0] - s) * (dv[2].st[1] - t) - (dv[2].st[0] - s) * (dv[1].st[1] - t)) / bb;
 		bary[1] = ((dv[2].st[0] - s) * (dv[0].st[1] - t) - (dv[0].st[0] - s) * (dv[2].st[1] - t)) / bb;
 		bary[2] = ((dv[0].st[0] - s) * (dv[1].st[1] - t) - (dv[1].st[0] - s) * (dv[0].st[1] - t)) / bb;
-		xyz[0] = bary[0] * pa[0] + bary[1] * pb[0] + bary[2] * pc[0];
-		xyz[1] = bary[0] * pa[1] + bary[1] * pb[1] + bary[2] * pc[1];
-		xyz[2] = bary[0] * pa[2] + bary[1] * pb[2] + bary[2] * pc[2];
+		xyz[0]  = bary[0] * pa[0] + bary[1] * pb[0] + bary[2] * pc[0];
+		xyz[1]  = bary[0] * pa[1] + bary[1] * pb[1] + bary[2] * pc[1];
+		xyz[2]  = bary[0] * pa[2] + bary[1] * pb[2] + bary[2] * pc[2];
 		VectorSubtract(xyz, origin, vecs[1]);
 
 		// Projection (R) direction
@@ -2180,9 +2211,9 @@ static void RE_DX12_ProjectDecal(qhandle_t hShader, int numPoints, vec3_t *point
 		dvXyz[3][0] = dv[3].xyz[0]; dvXyz[3][1] = dv[3].xyz[1]; dvXyz[3][2] = dv[3].xyz[2];
 
 		numFrags = RE_DX12_MarkFragments(numDvPoints, (const vec3_t *)dvXyz,
-		                                  scaledProj,
-		                                  DX12_PROJ_MAX_POINTS, markPoints[0],
-		                                  DX12_PROJ_MAX_FRAGS,  markFrags);
+		                                 scaledProj,
+		                                 DX12_PROJ_MAX_POINTS, markPoints[0],
+		                                 DX12_PROJ_MAX_FRAGS, markFrags);
 	}
 
 	if (numFrags == 0)
@@ -2194,8 +2225,8 @@ static void RE_DX12_ProjectDecal(qhandle_t hShader, int numPoints, vec3_t *point
 	for (f = 0; f < numFrags; f++)
 	{
 		markFragment_t *mf = &markFrags[f];
-		polyVert_t      verts[DX12_MAX_DECAL_VERTS];
-		int             numV;
+		polyVert_t     verts[DX12_MAX_DECAL_VERTS];
+		int            numV;
 
 		if (mf->numPoints < 3)
 		{
@@ -2236,7 +2267,7 @@ static void RE_DX12_ClearDecals(void)
 }
 
 static int RE_DX12_LerpTag(orientation_t *tag, const refEntity_t *refent,
-                            const char *tagName, int startIndex)
+                           const char *tagName, int startIndex)
 {
 	return DX12_LerpTag(tag, refent, tagName, startIndex);
 }
@@ -2298,7 +2329,7 @@ static void RE_DX12_DrawDebugPolygon(int color, int numpoints, float *points)
 }
 
 static void RE_DX12_DrawDebugText(const vec3_t org, float r, float g, float b,
-                                   const char *text, qboolean neverOcclude)
+                                  const char *text, qboolean neverOcclude)
 {
 	// Mirrors the GL renderer which is also unimplemented (prints a TODO).
 	(void)org; (void)r; (void)g; (void)b; (void)neverOcclude;
@@ -2308,7 +2339,7 @@ static void RE_DX12_DrawDebugText(const vec3_t org, float r, float g, float b,
 
 static qboolean RE_DX12_GetEntityToken(char *buffer, size_t size)
 {
-	auto s = COM_Parse((char** ) & dx12World.entityParsePoint );
+	auto s = COM_Parse((char ** ) &dx12World.entityParsePoint);
 	Q_strncpyz(buffer, s, size);
 
 	if (!dx12World.entityParsePoint || !s[0])
@@ -2323,8 +2354,8 @@ static qboolean RE_DX12_GetEntityToken(char *buffer, size_t size)
 
 static void RE_DX12_AddPolyBufferToScene(polyBuffer_t *pPolyBuffer)
 {
-	int          i;
-	polyVert_t   tri[3];
+	int        i;
+	polyVert_t tri[3];
 
 	if (!pPolyBuffer || pPolyBuffer->numIndicies < 3)
 	{
@@ -2347,35 +2378,35 @@ static void RE_DX12_AddPolyBufferToScene(polyBuffer_t *pPolyBuffer)
 			continue;
 		}
 
-		tri[0].xyz[0]       = pPolyBuffer->xyz[i0][0];
-		tri[0].xyz[1]       = pPolyBuffer->xyz[i0][1];
-		tri[0].xyz[2]       = pPolyBuffer->xyz[i0][2];
-		tri[0].st[0]        = pPolyBuffer->st[i0][0];
-		tri[0].st[1]        = pPolyBuffer->st[i0][1];
-		tri[0].modulate[0]  = pPolyBuffer->color[i0][0];
-		tri[0].modulate[1]  = pPolyBuffer->color[i0][1];
-		tri[0].modulate[2]  = pPolyBuffer->color[i0][2];
-		tri[0].modulate[3]  = pPolyBuffer->color[i0][3];
+		tri[0].xyz[0]      = pPolyBuffer->xyz[i0][0];
+		tri[0].xyz[1]      = pPolyBuffer->xyz[i0][1];
+		tri[0].xyz[2]      = pPolyBuffer->xyz[i0][2];
+		tri[0].st[0]       = pPolyBuffer->st[i0][0];
+		tri[0].st[1]       = pPolyBuffer->st[i0][1];
+		tri[0].modulate[0] = pPolyBuffer->color[i0][0];
+		tri[0].modulate[1] = pPolyBuffer->color[i0][1];
+		tri[0].modulate[2] = pPolyBuffer->color[i0][2];
+		tri[0].modulate[3] = pPolyBuffer->color[i0][3];
 
-		tri[1].xyz[0]       = pPolyBuffer->xyz[i1][0];
-		tri[1].xyz[1]       = pPolyBuffer->xyz[i1][1];
-		tri[1].xyz[2]       = pPolyBuffer->xyz[i1][2];
-		tri[1].st[0]        = pPolyBuffer->st[i1][0];
-		tri[1].st[1]        = pPolyBuffer->st[i1][1];
-		tri[1].modulate[0]  = pPolyBuffer->color[i1][0];
-		tri[1].modulate[1]  = pPolyBuffer->color[i1][1];
-		tri[1].modulate[2]  = pPolyBuffer->color[i1][2];
-		tri[1].modulate[3]  = pPolyBuffer->color[i1][3];
+		tri[1].xyz[0]      = pPolyBuffer->xyz[i1][0];
+		tri[1].xyz[1]      = pPolyBuffer->xyz[i1][1];
+		tri[1].xyz[2]      = pPolyBuffer->xyz[i1][2];
+		tri[1].st[0]       = pPolyBuffer->st[i1][0];
+		tri[1].st[1]       = pPolyBuffer->st[i1][1];
+		tri[1].modulate[0] = pPolyBuffer->color[i1][0];
+		tri[1].modulate[1] = pPolyBuffer->color[i1][1];
+		tri[1].modulate[2] = pPolyBuffer->color[i1][2];
+		tri[1].modulate[3] = pPolyBuffer->color[i1][3];
 
-		tri[2].xyz[0]       = pPolyBuffer->xyz[i2][0];
-		tri[2].xyz[1]       = pPolyBuffer->xyz[i2][1];
-		tri[2].xyz[2]       = pPolyBuffer->xyz[i2][2];
-		tri[2].st[0]        = pPolyBuffer->st[i2][0];
-		tri[2].st[1]        = pPolyBuffer->st[i2][1];
-		tri[2].modulate[0]  = pPolyBuffer->color[i2][0];
-		tri[2].modulate[1]  = pPolyBuffer->color[i2][1];
-		tri[2].modulate[2]  = pPolyBuffer->color[i2][2];
-		tri[2].modulate[3]  = pPolyBuffer->color[i2][3];
+		tri[2].xyz[0]      = pPolyBuffer->xyz[i2][0];
+		tri[2].xyz[1]      = pPolyBuffer->xyz[i2][1];
+		tri[2].xyz[2]      = pPolyBuffer->xyz[i2][2];
+		tri[2].st[0]       = pPolyBuffer->st[i2][0];
+		tri[2].st[1]       = pPolyBuffer->st[i2][1];
+		tri[2].modulate[0] = pPolyBuffer->color[i2][0];
+		tri[2].modulate[1] = pPolyBuffer->color[i2][1];
+		tri[2].modulate[2] = pPolyBuffer->color[i2][2];
+		tri[2].modulate[3] = pPolyBuffer->color[i2][3];
 
 		DX12_AddScenePoly(pPolyBuffer->shader, 3, tri);
 	}
@@ -2465,8 +2496,6 @@ static qboolean RE_DX12_inPVS(const vec3_t p1, const vec3_t p2)
 
 static void RE_DX12_purgeCache(void)
 {
-	int i;
-
 	if (!dx12.initialized)
 	{
 		return;
@@ -2477,46 +2506,30 @@ static void RE_DX12_purgeCache(void)
 	// (textures, model vertex/index buffers) to avoid device removal.
 	DX12_FlushGpu();
 
-	// ---- 2. Purge dynamic shader scripts (CPU-only) ------------------------
+	// ---- 2. Shut down the 3D scene pipeline --------------------------------
+	// Release the 3D PSO, root signature, constant buffer and poly VB so that
+	// they can be recreated cleanly by DX12_SceneInit() on the next map load.
+	DX12_SceneShutdown();
+
+	// ---- 3. Purge dynamic shader scripts (CPU-only) ------------------------
 	DX12_PurgeDynamicShaders();
 
-	// ---- 3. Release all texture GPU resources and clear material table -----
-	// Clear materials first (they hold only CPU texture-handle indices).
-	Com_Memset(dx12Materials, 0, sizeof(dx12Materials));
-	dx12NumMaterials = 0;
-
-	// Release D3D12 texture resources, then wipe the registry.
-	// Slots 0 and 1 are the white/black fallback textures; release them too
-	// since DX12_InitTextures() will re-create them below.
-	for (i = 0; i < dx12NumShaders; i++)
-	{
-		if (dx12Shaders[i].valid && dx12Shaders[i].tex.resource)
-		{
-			dx12Shaders[i].tex.resource->Release();
-			dx12Shaders[i].tex.resource = NULL;
-		}
-		dx12Shaders[i].valid = qfalse;
-	}
-	dx12NumShaders = 0;
+	// ---- 4. Release all texture GPU resources and clear material table -----
+	// DX12_ShutdownTextures resets dx12NumShaders and dx12NumMaterials to 0.
+	DX12_ShutdownTextures();
 
 	// Rebuild the two mandatory fallback entries (white / black).
 	DX12_InitTextures();
 
-	// ---- 4. Release model GPU resources and reset lookup tables ------------
+	// ---- 5. Release model GPU resources and reset all CPU lookup tables ----
 	DX12_ShutdownModels();
-
-	Com_Memset(dx12ModelNames, 0, sizeof(dx12ModelNames));
-	dx12NumModels = 0;
-
-	// ---- 5. Clear the skin table (CPU-only) --------------------------------
-	Com_Memset(dx12Skins, 0, sizeof(dx12Skins));
-	dx12NumSkins = 0;
+	DX12_ClearPerSessionState();
 }
 
 static qboolean RE_DX12_LoadDynamicShader(const char *shadername, const char *shadertext)
 {
 	dx12DynShader_t *cur, *prev, *node;
-	size_t           textLen;
+	size_t          textLen;
 
 	// NULL name + NULL text → purge all dynamic shaders (mirrors GL RE_LoadDynamicShader)
 	if (!shadername && !shadertext)
@@ -2583,10 +2596,10 @@ static qboolean RE_DX12_LoadDynamicShader(const char *shadername, const char *sh
 	node = (dx12DynShader_t *)dx12.ri.Z_Malloc(sizeof(*node));
 	Q_strncpyz(node->name, shadername, sizeof(node->name));
 
-	textLen         = strlen(shadertext);
+	textLen          = strlen(shadertext);
 	node->shadertext = (char *)dx12.ri.Z_Malloc((int)textLen + 1);
 	Q_strncpyz(node->shadertext, shadertext, (int)textLen + 1);
-	node->next = s_dynShaderHead;
+	node->next      = s_dynShaderHead;
 	s_dynShaderHead = node;
 
 	// Eagerly register the material so callers can immediately use it.
@@ -2674,9 +2687,9 @@ extern "C" size_t RE_SaveJPGToBuffer(byte *buffer, size_t bufSize, int quality,
 static void RE_DX12_TakeVideoFrame(int h, int w, byte *captureBuffer, byte *encodeBuffer, qboolean motionJpeg)
 {
 	// tr_public.h prototype: TakeVideoFrame(int h, int w, ...) – h is height, w is width.
-	int    width   = w;
-	int    height  = h;
-	byte  *cBuf    = captureBuffer;
+	int    width  = w;
+	int    height = h;
+	byte   *cBuf  = captureBuffer;
 	size_t linelen;
 	int    padwidth;
 	int    avipadwidth;
@@ -2695,9 +2708,9 @@ static void RE_DX12_TakeVideoFrame(int h, int w, byte *captureBuffer, byte *enco
 		return;
 	}
 
-	linelen    = (size_t)width * 3;
-	padwidth   = ((int)linelen + 3) & ~3;   // PAD(linelen, 4)
-	padlen     = padwidth - (int)linelen;
+	linelen     = (size_t)width * 3;
+	padwidth    = ((int)linelen + 3) & ~3;  // PAD(linelen, 4)
+	padlen      = padwidth - (int)linelen;
 	avipadwidth = ((int)linelen + AVI_LINE_PADDING - 1) & ~(AVI_LINE_PADDING - 1);
 	avipadlen   = avipadwidth - (int)linelen;
 
@@ -2740,12 +2753,12 @@ static void RE_DX12_TakeVideoFrame(int h, int w, byte *captureBuffer, byte *enco
 
 static void RE_DX12_InitOpenGL(void)
 {
-	R_DX12_Init( );
+	R_DX12_Init();
 }
 
 static int RE_DX12_InitOpenGLSubSystem(void)
 {
-	DX12_InitSwapchain( );
+	DX12_InitSwapchain();
 	return qtrue;
 }
 
@@ -2784,18 +2797,18 @@ refexport_t *GetRefAPI(int apiVersion, refimport_t *rimp)
 
 	re.Shutdown = R_DX12_Shutdown;
 
-	re.BeginRegistration = RE_DX12_BeginRegistration;
-	re.RegisterModel     = RE_DX12_RegisterModel;
+	re.BeginRegistration    = RE_DX12_BeginRegistration;
+	re.RegisterModel        = RE_DX12_RegisterModel;
 	re.RegisterModelAllLODs = RE_DX12_RegisterModelAllLODs;
-	re.RegisterSkin      = RE_DX12_RegisterSkin;
-	re.RegisterShader    = RE_DX12_RegisterShader;
-	re.RegisterShaderNoMip = RE_DX12_RegisterShaderNoMip;
-	re.RegisterFont      = RE_DX12_RegisterFont;
-	re.LoadWorld         = RE_DX12_LoadWorld;
-	re.GetSkinModel      = RE_DX12_GetSkinModel;
-	re.GetShaderFromModel = RE_DX12_GetShaderFromModel;
-	re.SetWorldVisData   = RE_DX12_SetWorldVisData;
-	re.EndRegistration   = RE_DX12_EndRegistration;
+	re.RegisterSkin         = RE_DX12_RegisterSkin;
+	re.RegisterShader       = RE_DX12_RegisterShader;
+	re.RegisterShaderNoMip  = RE_DX12_RegisterShaderNoMip;
+	re.RegisterFont         = RE_DX12_RegisterFont;
+	re.LoadWorld            = RE_DX12_LoadWorld;
+	re.GetSkinModel         = RE_DX12_GetSkinModel;
+	re.GetShaderFromModel   = RE_DX12_GetShaderFromModel;
+	re.SetWorldVisData      = RE_DX12_SetWorldVisData;
+	re.EndRegistration      = RE_DX12_EndRegistration;
 
 	re.ClearScene          = RE_DX12_ClearScene;
 	re.AddRefEntityToScene = RE_DX12_AddRefEntityToScene;
@@ -2822,13 +2835,13 @@ refexport_t *GetRefAPI(int apiVersion, refimport_t *rimp)
 	re.ProjectDecal  = RE_DX12_ProjectDecal;
 	re.ClearDecals   = RE_DX12_ClearDecals;
 
-	re.LerpTag    = RE_DX12_LerpTag;
+	re.LerpTag     = RE_DX12_LerpTag;
 	re.ModelBounds = RE_DX12_ModelBounds;
 
-	re.RemapShader     = RE_DX12_RemapShader;
+	re.RemapShader      = RE_DX12_RemapShader;
 	re.DrawDebugPolygon = RE_DX12_DrawDebugPolygon;
-	re.DrawDebugText   = RE_DX12_DrawDebugText;
-	re.GetEntityToken  = RE_DX12_GetEntityToken;
+	re.DrawDebugText    = RE_DX12_DrawDebugText;
+	re.GetEntityToken   = RE_DX12_GetEntityToken;
 
 	re.AddPolyBufferToScene = RE_DX12_AddPolyBufferToScene;
 	re.SetGlobalFog         = RE_DX12_SetGlobalFog;
@@ -2842,7 +2855,7 @@ refexport_t *GetRefAPI(int apiVersion, refimport_t *rimp)
 	re.InitOpenGL           = RE_DX12_InitOpenGL;
 	re.InitOpenGLSubSystem  = RE_DX12_InitOpenGLSubSystem;
 
-	R_DX12_Init( );
+	R_DX12_Init();
 
 	return &re;
 }

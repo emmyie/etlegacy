@@ -22,7 +22,7 @@ extern "C" {
 #include <d3dcompiler.h>
 
 #define DX12_FRAME_COUNT    2
-#define DX12_MAX_TEXTURES   1024  ///< Max simultaneously loaded textures
+#define DX12_MAX_TEXTURES   2048  ///< Max simultaneously loaded textures
 /// Per-frame 2D vertex budget.  Strip quads need 4 verts each; fan-expanded
 /// polygons need (numverts-2)*3 verts.  24576 comfortably fits ~4000 UI calls.
 #define DX12_MAX_2D_VERTS   24576
@@ -44,9 +44,9 @@ typedef struct
  */
 typedef struct
 {
-	ID3D12Resource              *resource;
-	D3D12_CPU_DESCRIPTOR_HANDLE  cpuHandle;
-	D3D12_GPU_DESCRIPTOR_HANDLE  gpuHandle;
+	ID3D12Resource *resource;
+	D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle;
+	D3D12_GPU_DESCRIPTOR_HANDLE gpuHandle;
 } dx12Texture_t;
 
 // ---------------------------------------------------------------------------
@@ -60,7 +60,7 @@ typedef struct
 /** Maximum rendering stages per material. */
 #define DX12_MAX_MATERIAL_STAGES 8
 /** Maximum simultaneously cached materials. */
-#define DX12_MAX_MATERIALS       1024
+#define DX12_MAX_MATERIALS       2048
 /**
  * Material handles occupy [DX12_MATERIAL_HANDLE_BASE, …).
  * DX12_GetTexture() transparently maps a material handle to its
@@ -74,7 +74,7 @@ typedef struct
  */
 typedef enum
 {
-	DX12_TMOD_NONE    = 0,
+	DX12_TMOD_NONE = 0,
 	DX12_TMOD_SCROLL,
 	DX12_TMOD_ROTATE,
 	DX12_TMOD_STRETCH,
@@ -86,7 +86,7 @@ typedef enum
  */
 typedef enum
 {
-	DX12_WAVE_SIN               = 0,
+	DX12_WAVE_SIN = 0,
 	DX12_WAVE_SQUARE,
 	DX12_WAVE_TRIANGLE,
 	DX12_WAVE_SAWTOOTH,
@@ -100,10 +100,10 @@ typedef enum
 typedef struct
 {
 	dx12WaveFunc_t func;       ///< Wave function type
-	float          base;       ///< DC offset
-	float          amplitude;  ///< Peak amplitude
-	float          phase;      ///< Phase shift in [0, 1]
-	float          frequency;  ///< Cycles per second
+	float base;                ///< DC offset
+	float amplitude;           ///< Peak amplitude
+	float phase;               ///< Phase shift in [0, 1]
+	float frequency;           ///< Cycles per second
 } dx12Wave_t;
 
 /**
@@ -113,9 +113,9 @@ typedef struct
 typedef struct
 {
 	dx12TcModType_t type;
-	float           scroll[2];   ///< DX12_TMOD_SCROLL: UV scroll rates (units/s)
-	float           rotateSpeed; ///< DX12_TMOD_ROTATE: degrees per second (+ = CCW)
-	dx12Wave_t      stretch;     ///< DX12_TMOD_STRETCH: wave envelope
+	float scroll[2];             ///< DX12_TMOD_SCROLL: UV scroll rates (units/s)
+	float rotateSpeed;           ///< DX12_TMOD_ROTATE: degrees per second (+ = CCW)
+	dx12Wave_t stretch;          ///< DX12_TMOD_STRETCH: wave envelope
 } dx12TcMod_t;
 
 /**
@@ -124,15 +124,15 @@ typedef struct
  */
 typedef struct
 {
-	qboolean    active;                            ///< qtrue when this slot is in use
-	qhandle_t   texHandle;                         ///< Primary texture (from DX12_RegisterTexture)
+	qboolean active;                               ///< qtrue when this slot is in use
+	qhandle_t texHandle;                           ///< Primary texture (from DX12_RegisterTexture)
 	D3D12_BLEND srcBlend;                          ///< Source blend factor
 	D3D12_BLEND dstBlend;                          ///< Destination blend factor
 	dx12TcMod_t tcMods[DX12_MAX_TCMODS];           ///< Texture-coordinate modifiers
-	int         numTcMods;                         ///< Number of active tcMod entries
-	qhandle_t   animFrames[DX12_MAX_ANIM_FRAMES];  ///< Per-frame texture handles (animMap)
-	int         animNumFrames;                     ///< Number of animation frames
-	float       animFps;                           ///< Animation playback rate (frames/s)
+	int numTcMods;                                 ///< Number of active tcMod entries
+	qhandle_t animFrames[DX12_MAX_ANIM_FRAMES];    ///< Per-frame texture handles (animMap)
+	int animNumFrames;                             ///< Number of animation frames
+	float animFps;                                 ///< Animation playback rate (frames/s)
 } dx12MaterialStage_t;
 
 /**
@@ -144,15 +144,15 @@ typedef struct
  */
 typedef struct
 {
-	char                name[MAX_QPATH];                          ///< Shader name (cache key)
+	char name[MAX_QPATH];                                         ///< Shader name (cache key)
 	dx12MaterialStage_t stages[DX12_MAX_MATERIAL_STAGES];        ///< Rendering stages
-	int                 numStages;                               ///< Number of active stages
-	qboolean            isSky;         ///< surfaceparm sky
-	qboolean            isFog;         ///< surfaceparm fog
-	qboolean            isTranslucent; ///< surfaceparm trans
-	qboolean            isNodraw;      ///< surfaceparm nodraw
-	qboolean            noMip;         ///< qtrue when mipmaps should be suppressed (RegisterShaderNoMip)
-	qboolean            valid;         ///< qtrue once successfully built
+	int numStages;                                               ///< Number of active stages
+	qboolean isSky;                    ///< surfaceparm sky
+	qboolean isFog;                    ///< surfaceparm fog
+	qboolean isTranslucent;            ///< surfaceparm trans
+	qboolean isNodraw;                 ///< surfaceparm nodraw
+	qboolean noMip;                    ///< qtrue when mipmaps should be suppressed (RegisterShaderNoMip)
+	qboolean valid;                    ///< qtrue once successfully built
 } dx12Material_t;
 
 /**
@@ -164,53 +164,53 @@ typedef struct
 	refimport_t ri;
 
 	HWND hWnd;
-	int  vidWidth;
-	int  vidHeight;
+	int vidWidth;
+	int vidHeight;
 
 	// Core DX12 objects
-	ID3D12Device              *device;
-	IDXGISwapChain3           *swapChain;
-	ID3D12CommandQueue        *commandQueue;
-	ID3D12CommandAllocator    *commandAllocators[DX12_FRAME_COUNT];
+	ID3D12Device *device;
+	IDXGISwapChain3 *swapChain;
+	ID3D12CommandQueue *commandQueue;
+	ID3D12CommandAllocator *commandAllocators[DX12_FRAME_COUNT];
 	ID3D12GraphicsCommandList *commandList;
 
 	// Dedicated upload command objects – used exclusively by *UploadBuffer()
 	// helpers so that resource uploads never touch the per-frame rendering
 	// command allocator/list (which may already be open/recording).
-	ID3D12CommandAllocator    *uploadCmdAllocator;
+	ID3D12CommandAllocator *uploadCmdAllocator;
 	ID3D12GraphicsCommandList *uploadCmdList;
 
 	// Render target heap + targets
 	ID3D12DescriptorHeap *rtvHeap;
-	ID3D12Resource       *renderTargets[DX12_FRAME_COUNT];
-	UINT                 rtvDescriptorSize;
+	ID3D12Resource *renderTargets[DX12_FRAME_COUNT];
+	UINT rtvDescriptorSize;
 
 	// Depth stencil heap + per-frame depth buffers (D32_FLOAT)
 	ID3D12DescriptorHeap *dsvHeap;
-	UINT                  dsvDescriptorSize;
-	ID3D12Resource       *depthStencil[DX12_FRAME_COUNT];
+	UINT dsvDescriptorSize;
+	ID3D12Resource *depthStencil[DX12_FRAME_COUNT];
 
 	// SRV descriptor heap (shader-visible, for textures)
 	ID3D12DescriptorHeap *srvHeap;
-	UINT                  srvDescriptorSize;
+	UINT srvDescriptorSize;
 
 	// Synchronization
 	ID3D12Fence *fence;
-	UINT64       fenceValues[DX12_FRAME_COUNT];
-	HANDLE       fenceEvent;
-	UINT64       nextFenceValue;                                            ///< Monotonically increasing fence counter
+	UINT64 fenceValues[DX12_FRAME_COUNT];
+	HANDLE fenceEvent;
+	UINT64 nextFenceValue;                                                  ///< Monotonically increasing fence counter
 
 	// Root signature + PSO
-	ID3D12RootSignature  *rootSignature;
-	ID3D12PipelineState  *pipelineState;
+	ID3D12RootSignature *rootSignature;
+	ID3D12PipelineState *pipelineState;
 
 	// 2D vertex ring-buffer (upload heap, persistently mapped)
 	ID3D12Resource *quadVertexBuffer;   ///< DX12_MAX_2D_VERTS * sizeof(dx12QuadVertex_t) bytes
-	UINT8          *quadVBMapped;       ///< Persistently-mapped CPU pointer
-	UINT            quadVBOffset;       ///< Next free vertex index (reset each frame)
+	UINT8 *quadVBMapped;                ///< Persistently-mapped CPU pointer
+	UINT quadVBOffset;                  ///< Next free vertex index (reset each frame)
 
 	// Per-frame state
-	float    color2D[4];    ///< Current 2D modulate color set by RE_DX12_SetColor
+	float color2D[4];       ///< Current 2D modulate color set by RE_DX12_SetColor
 	qboolean frameOpen;     ///< qtrue between DX12_BeginFrame and DX12_EndFrame
 
 	// Active scissor rectangle for new draw calls (full-screen by default)
@@ -218,17 +218,17 @@ typedef struct
 
 	// 2D draw batch – accumulates consecutive draws with same texture/topology/scissor
 	D3D12_GPU_DESCRIPTOR_HANDLE batch2DTexHandle; ///< GPU texture handle for current batch
-	D3D12_PRIMITIVE_TOPOLOGY    batch2DTopology;  ///< Primitive topology for current batch
-	D3D12_RECT                  batch2DScissor;   ///< Scissor rect captured when batch started
-	UINT                        batch2DStart;     ///< Ring-buffer vertex index where batch begins
-	UINT                        batch2DCount;     ///< Number of vertices in current batch
+	D3D12_PRIMITIVE_TOPOLOGY batch2DTopology;     ///< Primitive topology for current batch
+	D3D12_RECT batch2DScissor;                    ///< Scissor rect captured when batch started
+	UINT batch2DStart;                            ///< Ring-buffer vertex index where batch begins
+	UINT batch2DCount;                            ///< Number of vertices in current batch
 
 	// Frame state
-	UINT          frameIndex;
+	UINT frameIndex;
 
 	// Viewport and scissor
 	D3D12_VIEWPORT viewport;
-	D3D12_RECT     scissorRect;
+	D3D12_RECT scissorRect;
 
 	qboolean initialized;
 } dx12Globals_t;
@@ -260,7 +260,7 @@ typedef enum
 } dx12RenderCommand_t;
 
 // Function declarations – backend (tr_dx12_backend.cpp)
-void DX12_InitSwapchain( void );
+void DX12_InitSwapchain(void);
 qboolean      R_DX12_Init(void);
 void          R_DX12_Shutdown(qboolean destroyWindow);
 void          R_DX12_RenderCommandList(const void *data);
@@ -311,9 +311,15 @@ void     DX12_RenderScene(const refdef_t *fd);
 // Function declarations – scratch textures for cinematics (tr_dx12_main.cpp)
 void DX12_ShutdownScratchTextures(void);
 
+// Function declarations – per-session CPU registry reset (tr_dx12_main.cpp)
+// Resets model name table, model count, skin table and skin count so that a
+// new map load starts with a clean slate.  Must be called while the GPU is
+// idle (after DX12_WaitForGpu / DX12_FlushGpu).
+void DX12_ClearPerSessionState(void);
 
-void DX12_StripExtension( const char* in, char* out, int size );
-int DX12_Stricmp( const char* s1, const char* s2 );
+
+void DX12_StripExtension(const char *in, char *out, int size);
+int DX12_Stricmp(const char *s1, const char *s2);
 
 
 #endif // _WIN32

@@ -119,17 +119,17 @@ void DX12_FlushGpu(void)
 void DX12_CopyRenderTargetToTexture(dx12ShaderEntry_t *entry, int srvSlot,
                                     int x, int y, int w, int h)
 {
-	D3D12_RESOURCE_BARRIER barriers[2];
-	D3D12_TEXTURE_COPY_LOCATION srcLoc;
-	D3D12_TEXTURE_COPY_LOCATION dstLoc;
-	D3D12_BOX                   srcBox;
-	D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle;
-	D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle;
+	D3D12_RESOURCE_BARRIER          barriers[2];
+	D3D12_TEXTURE_COPY_LOCATION     srcLoc;
+	D3D12_TEXTURE_COPY_LOCATION     dstLoc;
+	D3D12_BOX                       srcBox;
+	D3D12_CPU_DESCRIPTOR_HANDLE     rtvHandle;
+	D3D12_CPU_DESCRIPTOR_HANDLE     dsvHandle;
 	D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc;
-	D3D12_HEAP_PROPERTIES       defaultHeap;
-	D3D12_RESOURCE_DESC         texDesc;
-	HRESULT                     hr;
-	qboolean                    hasDsv;
+	D3D12_HEAP_PROPERTIES           defaultHeap;
+	D3D12_RESOURCE_DESC             texDesc;
+	HRESULT                         hr;
+	qboolean                        hasDsv;
 
 	if (!dx12.initialized || !dx12.frameOpen)
 	{
@@ -322,20 +322,20 @@ qboolean DX12_ReadbackRenderTarget(byte *rgbOut, int width, int height)
 	UINT                               numRows;
 	UINT64                             rowSizeBytes;
 	UINT64                             totalBytes;
-	ID3D12Resource                    *readbackBuf;
+	ID3D12Resource                     *readbackBuf;
 	D3D12_RESOURCE_BARRIER             barriers[2];
 	D3D12_TEXTURE_COPY_LOCATION        srcLoc;
 	D3D12_TEXTURE_COPY_LOCATION        dstLoc;
 	D3D12_CPU_DESCRIPTOR_HANDLE        rtvHandle;
-	ID3D12DescriptorHeap              *heaps[1];
+	ID3D12DescriptorHeap               *heaps[1];
 	HRESULT                            hr;
 	UINT64                             readbackRowPitch;
 	int                                row;
 	int                                linelen;
 	int                                padwidth;
-	void                              *mapped;
-	const byte                        *src;
-	byte                              *dst;
+	void                               *mapped;
+	const byte                         *src;
+	byte                               *dst;
 	int                                col;
 	qboolean                           success;
 
@@ -366,9 +366,9 @@ qboolean DX12_ReadbackRenderTarget(byte *rgbOut, int width, int height)
 	readbackHeap.Type = D3D12_HEAP_TYPE_READBACK;
 
 	Com_Memset(&bufDesc, 0, sizeof(bufDesc));
-	bufDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-	bufDesc.Width     = totalBytes;
-	bufDesc.Height    = 1;
+	bufDesc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+	bufDesc.Width            = totalBytes;
+	bufDesc.Height           = 1;
 	bufDesc.DepthOrArraySize = 1;
 	bufDesc.MipLevels        = 1;
 	bufDesc.Format           = DXGI_FORMAT_UNKNOWN;
@@ -377,7 +377,7 @@ qboolean DX12_ReadbackRenderTarget(byte *rgbOut, int width, int height)
 	bufDesc.Flags            = D3D12_RESOURCE_FLAG_NONE;
 
 	readbackBuf = NULL;
-	hr = dx12.device->CreateCommittedResource(
+	hr          = dx12.device->CreateCommittedResource(
 		&readbackHeap,
 		D3D12_HEAP_FLAG_NONE,
 		&bufDesc,
@@ -407,9 +407,9 @@ qboolean DX12_ReadbackRenderTarget(byte *rgbOut, int width, int height)
 	srcLoc.SubresourceIndex = 0;
 
 	Com_Memset(&dstLoc, 0, sizeof(dstLoc));
-	dstLoc.pResource                          = readbackBuf;
-	dstLoc.Type                               = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-	dstLoc.PlacedFootprint                    = footprint;
+	dstLoc.pResource       = readbackBuf;
+	dstLoc.Type            = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+	dstLoc.PlacedFootprint = footprint;
 
 	dx12.commandList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, NULL);
 
@@ -459,7 +459,7 @@ qboolean DX12_ReadbackRenderTarget(byte *rgbOut, int width, int height)
 		               "DX12_ReadbackRenderTarget: Map failed (0x%08lx)\n", hr);
 		readbackBuf->Release();
 		readbackBuf = NULL;
-		success = qfalse;
+		success     = qfalse;
 		// Still need to re-open the command list before returning.
 		goto reopen;
 	}
@@ -528,15 +528,15 @@ reopen:
 /**
  * @brief Advance to the next frame, waiting for the GPU if necessary
  */
-static void DX12_MoveToNextFrame( void )
+static void DX12_MoveToNextFrame(void)
 {
-	HRESULT hr;
+	HRESULT      hr;
 	const UINT64 signalValue = ++dx12.nextFenceValue;
 
-	hr = dx12.commandQueue->Signal( dx12.fence, signalValue );
-	if ( FAILED( hr ) )
+	hr = dx12.commandQueue->Signal(dx12.fence, signalValue);
+	if (FAILED(hr))
 	{
-		dx12.ri.Printf( PRINT_WARNING, "R_DX12: MoveToNextFrame Signal failed (0x%08lx)\n", hr );
+		dx12.ri.Printf(PRINT_WARNING, "R_DX12: MoveToNextFrame Signal failed (0x%08lx)\n", hr);
 		return;
 	}
 
@@ -544,18 +544,18 @@ static void DX12_MoveToNextFrame( void )
 	dx12.fenceValues[dx12.frameIndex] = signalValue;
 
 	// Advance to the next back-buffer
-	dx12.frameIndex = dx12.swapChain->GetCurrentBackBufferIndex( );
+	dx12.frameIndex = dx12.swapChain->GetCurrentBackBufferIndex();
 
 	// Wait only if the GPU has not yet finished with the new frame's allocator
-	if ( dx12.fence->GetCompletedValue( ) < dx12.fenceValues[dx12.frameIndex] )
+	if (dx12.fence->GetCompletedValue() < dx12.fenceValues[dx12.frameIndex])
 	{
-		hr = dx12.fence->SetEventOnCompletion( dx12.fenceValues[dx12.frameIndex], dx12.fenceEvent );
-		if ( FAILED( hr ) )
+		hr = dx12.fence->SetEventOnCompletion(dx12.fenceValues[dx12.frameIndex], dx12.fenceEvent);
+		if (FAILED(hr))
 		{
-			dx12.ri.Printf( PRINT_WARNING, "R_DX12: MoveToNextFrame SetEventOnCompletion failed (0x%08lx)\n", hr );
+			dx12.ri.Printf(PRINT_WARNING, "R_DX12: MoveToNextFrame SetEventOnCompletion failed (0x%08lx)\n", hr);
 			return;
 		}
-		WaitForSingleObjectEx( dx12.fenceEvent, INFINITE, FALSE );
+		WaitForSingleObjectEx(dx12.fenceEvent, INFINITE, FALSE);
 	}
 }
 
@@ -572,35 +572,35 @@ static void DX12_MoveToNextFrame( void )
  * @p queue must be dx12.commandQueue; the parameter is kept for API
  * compatibility with existing call sites.
  */
-void DX12_WaitForUpload( ID3D12CommandQueue* queue )
+void DX12_WaitForUpload(ID3D12CommandQueue *queue)
 {
 	HRESULT      hr;
 	const UINT64 signalValue = ++dx12.nextFenceValue;
 
 	// Require shared fence and event (both are created during R_DX12_Init,
 	// before any upload call is made).
-	if ( !dx12.fence || !dx12.fenceEvent )
+	if (!dx12.fence || !dx12.fenceEvent)
 	{
-		dx12.ri.Printf( PRINT_WARNING, "DX12_WaitForUpload: fence/event not initialized\n" );
+		dx12.ri.Printf(PRINT_WARNING, "DX12_WaitForUpload: fence/event not initialized\n");
 		return;
 	}
 
-	hr = queue->Signal( dx12.fence, signalValue );
-	if ( FAILED( hr ) )
+	hr = queue->Signal(dx12.fence, signalValue);
+	if (FAILED(hr))
 	{
-		dx12.ri.Printf( PRINT_WARNING, "DX12_WaitForUpload: Signal failed (0x%08lx)\n", hr );
+		dx12.ri.Printf(PRINT_WARNING, "DX12_WaitForUpload: Signal failed (0x%08lx)\n", hr);
 		return;
 	}
 
-	if ( dx12.fence->GetCompletedValue() < signalValue )
+	if (dx12.fence->GetCompletedValue() < signalValue)
 	{
-		hr = dx12.fence->SetEventOnCompletion( signalValue, dx12.fenceEvent );
-		if ( FAILED( hr ) )
+		hr = dx12.fence->SetEventOnCompletion(signalValue, dx12.fenceEvent);
+		if (FAILED(hr))
 		{
-			dx12.ri.Printf( PRINT_WARNING, "DX12_WaitForUpload: SetEventOnCompletion failed (0x%08lx)\n", hr );
+			dx12.ri.Printf(PRINT_WARNING, "DX12_WaitForUpload: SetEventOnCompletion failed (0x%08lx)\n", hr);
 			return;
 		}
-		WaitForSingleObjectEx( dx12.fenceEvent, INFINITE, FALSE );
+		WaitForSingleObjectEx(dx12.fenceEvent, INFINITE, FALSE);
 	}
 }
 
@@ -702,7 +702,7 @@ dx12Texture_t DX12_CreateTextureFromRGBA(const byte *data, int width, int height
 	}
 
 	// ---- Copy pixel rows into the upload buffer ----
-	UINT8      *pMapped   = NULL;
+	UINT8       *pMapped  = NULL;
 	D3D12_RANGE readRange = { 0, 0 };
 	uploadBuffer->Map(0, &readRange, (void **)&pMapped);
 	for (UINT row = 0; row < numRows; row++)
@@ -720,9 +720,9 @@ dx12Texture_t DX12_CreateTextureFromRGBA(const byte *data, int width, int height
 	dx12.uploadCmdList->Reset(dx12.uploadCmdAllocator, NULL);
 
 	D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
-	srcLoc.pResource        = uploadBuffer;
-	srcLoc.Type             = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-	srcLoc.PlacedFootprint  = footprint;
+	srcLoc.pResource       = uploadBuffer;
+	srcLoc.Type            = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+	srcLoc.PlacedFootprint = footprint;
 
 	D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
 	dstLoc.pResource        = tex.resource;
@@ -746,7 +746,7 @@ dx12Texture_t DX12_CreateTextureFromRGBA(const byte *data, int width, int height
 	dx12.commandQueue->ExecuteCommandLists(1, ppCmdLists);
 
 	// Wait for upload to finish before releasing the staging buffer
-	DX12_WaitForUpload( dx12.commandQueue );
+	DX12_WaitForUpload(dx12.commandQueue);
 	uploadBuffer->Release();
 
 	// ---- Create SRV in the requested slot of the SRV heap ----
@@ -781,11 +781,11 @@ dx12Texture_t DX12_CreateTextureFromRGBA(const byte *data, int width, int height
  */
 void DX12_BeginFrame(void)
 {
-	HRESULT hr;
-	D3D12_RESOURCE_BARRIER        barrierToRT;
-	D3D12_CPU_DESCRIPTOR_HANDLE   rtvHandle;
-	const float                   clearColor[] = { 0.05f, 0.05f, 0.15f, 1.0f };
-	ID3D12DescriptorHeap         *heaps[1];
+	HRESULT                     hr;
+	D3D12_RESOURCE_BARRIER      barrierToRT;
+	D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle;
+	const float                 clearColor[] = { 0.05f, 0.05f, 0.15f, 1.0f };
+	ID3D12DescriptorHeap        *heaps[1];
 
 	if (!dx12.initialized)
 	{
@@ -856,10 +856,10 @@ void DX12_BeginFrame(void)
 
 	// Reset the 2D batch state for the new frame; slot 0 of the SRV heap is
 	// always the white fallback texture, so it is safe to use as the default.
-	dx12.batch2DCount     = 0;
-	dx12.batch2DStart     = 0;
-	dx12.batch2DScissor   = dx12.currentScissor;
-	dx12.batch2DTopology  = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+	dx12.batch2DCount    = 0;
+	dx12.batch2DStart    = 0;
+	dx12.batch2DScissor  = dx12.currentScissor;
+	dx12.batch2DTopology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	if (dx12.srvHeap)
 	{
 		dx12.batch2DTexHandle = dx12.srvHeap->GetGPUDescriptorHandleForHeapStart();
@@ -868,128 +868,128 @@ void DX12_BeginFrame(void)
 	dx12.frameOpen = qtrue;
 }
 
-void DX12_InitSwapchain( void )
+void DX12_InitSwapchain(void)
 {
 	HRESULT hr;
 
 	// Get window handle and size
-	void* hwndVoid = dx12.ri.GetHWND( );
-	HWND  hwnd = ( HWND )hwndVoid;
-	if ( !hwnd )
+	void *hwndVoid = dx12.ri.GetHWND();
+	HWND hwnd      = ( HWND )hwndVoid;
+	if (!hwnd)
 	{
-		dx12.ri.Error( ERR_FATAL, "DX12_InitSwapchain: GetHWND returned NULL\n" );
+		dx12.ri.Error(ERR_FATAL, "DX12_InitSwapchain: GetHWND returned NULL\n");
 	}
 
 	RECT rc;
-	GetClientRect( hwnd, &rc );
-	UINT width = rc.right - rc.left;
+	GetClientRect(hwnd, &rc);
+	UINT width  = rc.right - rc.left;
 	UINT height = rc.bottom - rc.top;
-	if ( width == 0 || height == 0 )
+	if (width == 0 || height == 0)
 	{
-		width = 640;
+		width  = 640;
 		height = 480;
 	}
 
-	dx12.hWnd = hwnd;
-	dx12.vidWidth = ( int )width;
+	dx12.hWnd      = hwnd;
+	dx12.vidWidth  = ( int )width;
 	dx12.vidHeight = ( int )height;
 
 	// Release old swapchain/render targets/depth buffers if any
 	for ( int i = 0; i < DX12_FRAME_COUNT; i++ )
 	{
-		if ( dx12.depthStencil[ i ] )
+		if (dx12.depthStencil[i])
 		{
-			dx12.depthStencil[ i ]->Release( );
-			dx12.depthStencil[ i ] = nullptr;
+			dx12.depthStencil[i]->Release();
+			dx12.depthStencil[i] = nullptr;
 		}
-		if ( dx12.renderTargets[ i ] )
+		if (dx12.renderTargets[i])
 		{
-			dx12.renderTargets[ i ]->Release( );
-			dx12.renderTargets[ i ] = nullptr;
+			dx12.renderTargets[i]->Release();
+			dx12.renderTargets[i] = nullptr;
 		}
 	}
-	if ( dx12.swapChain )
+	if (dx12.swapChain)
 	{
-		dx12.swapChain->Release( );
+		dx12.swapChain->Release();
 		dx12.swapChain = nullptr;
 	}
 
 	// Create a local factory (you don't store one in dx12Globals_t)
-	IDXGIFactory4* factory = nullptr;
-	hr = CreateDXGIFactory1( IID_PPV_ARGS( &factory ) );
-	if ( FAILED( hr ) )
+	IDXGIFactory4 *factory = nullptr;
+	hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+	if (FAILED(hr))
 	{
-		dx12.ri.Error( ERR_FATAL, "DX12_InitSwapchain: CreateDXGIFactory1 failed (0x%08lx)\n", hr );
+		dx12.ri.Error(ERR_FATAL, "DX12_InitSwapchain: CreateDXGIFactory1 failed (0x%08lx)\n", hr);
 	}
 
 	// Describe swapchain
 	DXGI_SWAP_CHAIN_DESC1 scDesc = {};
-	scDesc.Width = width;
-	scDesc.Height = height;
-	scDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	scDesc.Width            = width;
+	scDesc.Height           = height;
+	scDesc.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
 	scDesc.SampleDesc.Count = 1;
-	scDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-	scDesc.BufferCount = DX12_FRAME_COUNT;
-	scDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-	scDesc.Scaling = DXGI_SCALING_STRETCH;
-	scDesc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+	scDesc.BufferUsage      = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+	scDesc.BufferCount      = DX12_FRAME_COUNT;
+	scDesc.SwapEffect       = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+	scDesc.Scaling          = DXGI_SCALING_STRETCH;
+	scDesc.AlphaMode        = DXGI_ALPHA_MODE_IGNORE;
 
-	IDXGISwapChain1* swapChain1 = nullptr;
+	IDXGISwapChain1 *swapChain1 = nullptr;
 	hr = factory->CreateSwapChainForHwnd(
 		dx12.commandQueue,
 		hwnd,
 		&scDesc,
 		nullptr,
 		nullptr,
-		&swapChain1 );
-	factory->Release( );
+		&swapChain1);
+	factory->Release();
 
-	if ( FAILED( hr ) )
+	if (FAILED(hr))
 	{
-		dx12.ri.Error( ERR_FATAL, "DX12_InitSwapchain: CreateSwapChainForHwnd failed (0x%08lx)\n", hr );
+		dx12.ri.Error(ERR_FATAL, "DX12_InitSwapchain: CreateSwapChainForHwnd failed (0x%08lx)\n", hr);
 	}
 
-	hr = swapChain1->QueryInterface( IID_PPV_ARGS( &dx12.swapChain ) );
-	swapChain1->Release( );
-	if ( FAILED( hr ) )
+	hr = swapChain1->QueryInterface(IID_PPV_ARGS(&dx12.swapChain));
+	swapChain1->Release();
+	if (FAILED(hr))
 	{
-		dx12.ri.Error( ERR_FATAL, "DX12_InitSwapchain: QueryInterface IDXGISwapChain3 failed (0x%08lx)\n", hr );
+		dx12.ri.Error(ERR_FATAL, "DX12_InitSwapchain: QueryInterface IDXGISwapChain3 failed (0x%08lx)\n", hr);
 	}
 
-	dx12.frameIndex = dx12.swapChain->GetCurrentBackBufferIndex( );
+	dx12.frameIndex = dx12.swapChain->GetCurrentBackBufferIndex();
 
 	// Create RTVs for each backbuffer
 	D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle =
-		dx12.rtvHeap->GetCPUDescriptorHandleForHeapStart( );
+		dx12.rtvHeap->GetCPUDescriptorHandleForHeapStart();
 	for ( UINT i = 0; i < DX12_FRAME_COUNT; i++ )
 	{
-		hr = dx12.swapChain->GetBuffer( i, IID_PPV_ARGS( &dx12.renderTargets[ i ] ) );
-		if ( FAILED( hr ) )
+		hr = dx12.swapChain->GetBuffer(i, IID_PPV_ARGS(&dx12.renderTargets[i]));
+		if (FAILED(hr))
 		{
-			dx12.ri.Error( ERR_FATAL, "DX12_InitSwapchain: GetBuffer[%u] failed (0x%08lx)\n", i, hr );
+			dx12.ri.Error(ERR_FATAL, "DX12_InitSwapchain: GetBuffer[%u] failed (0x%08lx)\n", i, hr);
 		}
 
-		dx12.device->CreateRenderTargetView( dx12.renderTargets[ i ], nullptr, rtvHandle );
+		dx12.device->CreateRenderTargetView(dx12.renderTargets[i], nullptr, rtvHandle);
 		rtvHandle.ptr += dx12.rtvDescriptorSize;
 	}
 
 	// Set viewport + scissor
 	dx12.viewport.TopLeftX = 0.0f;
 	dx12.viewport.TopLeftY = 0.0f;
-	dx12.viewport.Width = ( float )width;
-	dx12.viewport.Height = ( float )height;
+	dx12.viewport.Width    = ( float )width;
+	dx12.viewport.Height   = ( float )height;
 	dx12.viewport.MinDepth = 0.0f;
 	dx12.viewport.MaxDepth = 1.0f;
 
-	dx12.scissorRect.left = 0;
-	dx12.scissorRect.top = 0;
-	dx12.scissorRect.right = ( LONG )width;
+	dx12.scissorRect.left   = 0;
+	dx12.scissorRect.top    = 0;
+	dx12.scissorRect.right  = ( LONG )width;
 	dx12.scissorRect.bottom = ( LONG )height;
 
 	dx12.currentScissor = dx12.scissorRect;
 
 	// Create per-frame depth stencil textures (D32_FLOAT) if DSV heap is ready
-	if ( dx12.dsvHeap )
+	if (dx12.dsvHeap)
 	{
 		D3D12_HEAP_PROPERTIES dsHeapProps = {};
 		dsHeapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -1026,16 +1026,16 @@ void DX12_InitSwapchain( void )
 				&dsDesc,
 				D3D12_RESOURCE_STATE_DEPTH_WRITE,
 				&dsClear,
-				IID_PPV_ARGS( &dx12.depthStencil[ i ] ) );
+				IID_PPV_ARGS(&dx12.depthStencil[i]));
 
-			if ( FAILED( hr ) )
+			if (FAILED(hr))
 			{
-				dx12.ri.Error( ERR_FATAL,
-				               "DX12_InitSwapchain: CreateCommittedResource (depth[%u]) failed (0x%08lx)\n",
-				               i, hr );
+				dx12.ri.Error(ERR_FATAL,
+				              "DX12_InitSwapchain: CreateCommittedResource (depth[%u]) failed (0x%08lx)\n",
+				              i, hr);
 			}
 
-			dx12.device->CreateDepthStencilView( dx12.depthStencil[ i ], &dsvDesc, dsvHandle );
+			dx12.device->CreateDepthStencilView(dx12.depthStencil[i], &dsvDesc, dsvHandle);
 			dsvHandle.ptr += dx12.dsvDescriptorSize;
 		}
 	}
@@ -1050,8 +1050,8 @@ void DX12_InitSwapchain( void )
  */
 qboolean R_DX12_Init(void)
 {
-	HRESULT hr;
-	char    glConfigString[1024];
+	HRESULT    hr;
+	char       glConfigString[1024];
 	glconfig_t glConfig;
 
 	dx12.ri.Printf(PRINT_ALL, "---- R_DX12_Init ----\n");
@@ -1153,17 +1153,17 @@ qboolean R_DX12_Init(void)
 	{
 		D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc = {};
 		rtvHeapDesc.NumDescriptors = DX12_FRAME_COUNT;
-		rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-		rtvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+		rtvHeapDesc.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+		rtvHeapDesc.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
 
-		hr = dx12.device->CreateDescriptorHeap( &rtvHeapDesc, IID_PPV_ARGS( &dx12.rtvHeap ) );
-		if ( FAILED( hr ) )
+		hr = dx12.device->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&dx12.rtvHeap));
+		if (FAILED(hr))
 		{
-			dx12.ri.Error( ERR_FATAL, "R_DX12_Init: CreateDescriptorHeap failed (0x%08lx)\n", hr );
+			dx12.ri.Error(ERR_FATAL, "R_DX12_Init: CreateDescriptorHeap failed (0x%08lx)\n", hr);
 			return qfalse;
 		}
 
-		dx12.rtvDescriptorSize = dx12.device->GetDescriptorHandleIncrementSize( D3D12_DESCRIPTOR_HEAP_TYPE_RTV );
+		dx12.rtvDescriptorSize = dx12.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 	}
 
 	// ----------------------------------------------------------------
@@ -1334,7 +1334,7 @@ qboolean R_DX12_Init(void)
 		ID3DBlob *vertexShader = NULL;
 		ID3DBlob *pixelShader  = NULL;
 		ID3DBlob *errorBlob    = NULL;
-		UINT      compileFlags = 0;
+		UINT     compileFlags  = 0;
 
 #ifdef _DEBUG
 		compileFlags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
@@ -1355,7 +1355,10 @@ qboolean R_DX12_Init(void)
 			dx12.ri.Error(ERR_FATAL, "R_DX12_Init: vertex shader compile failed (0x%08lx)\n", hr);
 			return qfalse;
 		}
-		if (errorBlob) { errorBlob->Release(); errorBlob = NULL; }
+		if (errorBlob)
+		{
+			errorBlob->Release(); errorBlob = NULL;
+		}
 
 		hr = D3DCompile(g_shaderSource, srcLen, "tr_dx12_shaders", NULL, NULL,
 		                "PSMain", "ps_5_0", compileFlags, 0, &pixelShader, &errorBlob);
@@ -1371,21 +1374,24 @@ qboolean R_DX12_Init(void)
 			dx12.ri.Error(ERR_FATAL, "R_DX12_Init: pixel shader compile failed (0x%08lx)\n", hr);
 			return qfalse;
 		}
-		if (errorBlob) { errorBlob->Release(); errorBlob = NULL; }
+		if (errorBlob)
+		{
+			errorBlob->Release(); errorBlob = NULL;
+		}
 
 		// Input layout matching dx12QuadVertex_t: float2 pos + float2 uv + float4 color
 		D3D12_INPUT_ELEMENT_DESC inputElementDescs[] =
 		{
-			{ "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT,         0,  0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-			{ "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,         0,  8, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-			{ "COLOR",    0, DXGI_FORMAT_R32G32B32A32_FLOAT,   0, 16, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+			{ "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT,       0, 0,  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+			{ "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,       0, 8,  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+			{ "COLOR",    0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 16, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
 		};
 
 		D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
 		psoDesc.InputLayout    = { inputElementDescs, 3 };
 		psoDesc.pRootSignature = dx12.rootSignature;
 		psoDesc.VS             = { vertexShader->GetBufferPointer(), vertexShader->GetBufferSize() };
-		psoDesc.PS             = { pixelShader->GetBufferPointer(),  pixelShader->GetBufferSize() };
+		psoDesc.PS             = { pixelShader->GetBufferPointer(), pixelShader->GetBufferSize() };
 		// Rasterizer: no back-face culling (correct for 2D TRIANGLESTRIP quads)
 		{
 			D3D12_RASTERIZER_DESC &rs = psoDesc.RasterizerState;
@@ -1404,9 +1410,9 @@ qboolean R_DX12_Init(void)
 
 		// Alpha blending: SRC_ALPHA × src + (1 − SRC_ALPHA) × dst
 		{
-			D3D12_BLEND_DESC &bd         = psoDesc.BlendState;
-			bd.AlphaToCoverageEnable     = FALSE;
-			bd.IndependentBlendEnable    = FALSE;
+			D3D12_BLEND_DESC &bd = psoDesc.BlendState;
+			bd.AlphaToCoverageEnable  = FALSE;
+			bd.IndependentBlendEnable = FALSE;
 			{
 				D3D12_RENDER_TARGET_BLEND_DESC &rt = bd.RenderTarget[0];
 				rt.BlendEnable           = TRUE;
@@ -1421,14 +1427,14 @@ qboolean R_DX12_Init(void)
 				rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
 			}
 		}
-		psoDesc.DepthStencilState.DepthEnable      = FALSE;
-		psoDesc.DepthStencilState.StencilEnable    = FALSE;
-		psoDesc.SampleMask                         = UINT_MAX;
-		psoDesc.PrimitiveTopologyType              = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-		psoDesc.NumRenderTargets                   = 1;
-		psoDesc.RTVFormats[0]                      = DXGI_FORMAT_R8G8B8A8_UNORM;
-		psoDesc.DSVFormat                          = DXGI_FORMAT_D32_FLOAT;
-		psoDesc.SampleDesc.Count                   = 1;
+		psoDesc.DepthStencilState.DepthEnable   = FALSE;
+		psoDesc.DepthStencilState.StencilEnable = FALSE;
+		psoDesc.SampleMask                      = UINT_MAX;
+		psoDesc.PrimitiveTopologyType           = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+		psoDesc.NumRenderTargets                = 1;
+		psoDesc.RTVFormats[0]                   = DXGI_FORMAT_R8G8B8A8_UNORM;
+		psoDesc.DSVFormat                       = DXGI_FORMAT_D32_FLOAT;
+		psoDesc.SampleDesc.Count                = 1;
 
 		hr = dx12.device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&dx12.pipelineState));
 		vertexShader->Release();
@@ -1575,7 +1581,7 @@ void DX12_EndFrame(void)
 {
 	HRESULT                hr;
 	D3D12_RESOURCE_BARRIER barrierToPresent;
-	ID3D12CommandList     *ppCommandLists[1];
+	ID3D12CommandList      *ppCommandLists[1];
 
 	if (!dx12.initialized || !dx12.frameOpen)
 	{
@@ -1666,8 +1672,21 @@ void R_DX12_RenderCommandList(const void *data)
  * @brief R_DX12_Shutdown
  * @param[in] destroyWindow  Whether to also tear down the SDL window
  *
- * Waits for the GPU to finish, then releases all DX12 resources in reverse
- * creation order.
+ * Two-mode shutdown:
+ *
+ *   destroyWindow == qfalse (soft reset, called between map loads):
+ *     Waits for the GPU, releases all per-map content resources (world,
+ *     models, scene, scratch textures, textures) and resets all CPU-side
+ *     registries via DX12_ClearPerSessionState().  The D3D12 device,
+ *     command queues, descriptor heaps, PSO and swap chain are kept alive
+ *     so that re.purgeCache() and the next re.BeginRegistration() can run
+ *     without a costly full device recreation.  dx12.initialized remains
+ *     qtrue after a soft reset.
+ *
+ *   destroyWindow == qtrue (hard shutdown, called on vid_restart / quit):
+ *     Performs the soft reset first, then additionally releases all device-
+ *     level D3D12 infrastructure, sets dx12.initialized = qfalse and
+ *     destroys the SDL window.
  */
 void R_DX12_Shutdown(qboolean destroyWindow)
 {
@@ -1678,8 +1697,33 @@ void R_DX12_Shutdown(qboolean destroyWindow)
 		return;
 	}
 
-	// Wait for GPU to finish outstanding work
+	// ---- 1.  Wait for the GPU to drain all outstanding work ----------------
 	DX12_WaitForGpu();
+
+	// ---- 2.  Release per-map content (world geometry, 3D scene pipeline,
+	//          model GPU buffers, scratch textures, material/texture cache) --
+	DX12_SceneShutdown();
+	DX12_ShutdownModels();
+	DX12_ShutdownWorld();
+	DX12_ShutdownScratchTextures();
+	DX12_ShutdownTextures();
+
+	// Reset the per-session CPU-side registries (model names, skins).
+	// DX12_ShutdownTextures already zeroed dx12NumShaders / dx12NumMaterials.
+	DX12_ClearPerSessionState();
+
+	// ---- Soft reset: keep D3D12 device and infrastructure alive -----------
+	// re.purgeCache() will be called immediately afterwards by CL_ShutdownAll
+	// while dx12.initialized is still qtrue, allowing it to reinitialise the
+	// fallback textures.  The next re.BeginRegistration() then uses the else
+	// branch (device already alive) to reinit textures and the 3D scene
+	// pipeline rather than recreating the entire device.
+	if (!destroyWindow)
+	{
+		return;
+	}
+
+	// ---- Hard shutdown: release all D3D12 infrastructure ------------------
 
 	if (dx12.fenceEvent)
 	{
@@ -1692,17 +1736,6 @@ void R_DX12_Shutdown(qboolean destroyWindow)
 		dx12.fence->Release();
 		dx12.fence = NULL;
 	}
-
-	// Release world geometry first (before texture registry and GPU objects)
-	DX12_SceneShutdown();
-	DX12_ShutdownModels();
-	DX12_ShutdownWorld();
-
-	// Release cinematic scratch textures
-	DX12_ShutdownScratchTextures();
-
-	// Release all D3D12 texture resources
-	DX12_ShutdownTextures();
 
 	if (dx12.quadVertexBuffer)
 	{
@@ -1808,10 +1841,7 @@ void R_DX12_Shutdown(qboolean destroyWindow)
 
 	dx12.initialized = qfalse;
 
-	if (destroyWindow)
-	{
-		dx12.ri.GLimp_Shutdown();
-	}
+	dx12.ri.GLimp_Shutdown();
 }
 
 #endif // _WIN32
