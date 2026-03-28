@@ -454,15 +454,17 @@ static void WLD_BezierEval(const dx12WorldVertex_t grid[9],
  */
 static int WLD_SurfCategory(const dx12DrawSurf_t *s)
 {
-	if (s->isTranslucent)
+	const dx12Material_t *mat = DX12_GetMaterial(s->materialHandle);
+
+	if (mat && mat->isTranslucent)
 	{
 		return 3;
 	}
-	if (s->isSky)
+	if (mat && mat->isSky)
 	{
 		return 2;
 	}
-	if (s->isFog)
+	if (mat && mat->isFog)
 	{
 		return 1;
 	}

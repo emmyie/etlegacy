@@ -1526,9 +1526,10 @@ void DX12_RenderScene(const refdef_t *fd)
 
 			for (i = 0; i < dx12World.numDrawSurfs; i++)
 			{
-				const dx12DrawSurf_t *ds = &dx12World.drawSurfs[i];
+				const dx12DrawSurf_t  *ds  = &dx12World.drawSurfs[i];
+				const dx12Material_t  *mat = DX12_GetMaterial(ds->materialHandle);
 
-				if (!ds->isSky && !ds->isTranslucent && !ds->isFog)
+				if (!mat || (!mat->isSky && !mat->isTranslucent && !mat->isFog))
 				{
 					SCN_DrawSurface(ds, cbBaseGpuVA);
 				}
@@ -1543,9 +1544,10 @@ void DX12_RenderScene(const refdef_t *fd)
 
 			for (i = 0; i < dx12World.numDrawSurfs; i++)
 			{
-				const dx12DrawSurf_t *ds = &dx12World.drawSurfs[i];
+				const dx12DrawSurf_t  *ds  = &dx12World.drawSurfs[i];
+				const dx12Material_t  *mat = DX12_GetMaterial(ds->materialHandle);
 
-				if (ds->isFog)
+				if (mat && mat->isFog)
 				{
 					SCN_DrawSurface(ds, cbBaseGpuVA);
 				}
@@ -1819,9 +1821,10 @@ void DX12_RenderScene(const refdef_t *fd)
 
 		for (i = dx12World.numDrawSurfs - 1; i >= 0; i--)
 		{
-			const dx12DrawSurf_t *ds = &dx12World.drawSurfs[i];
+			const dx12DrawSurf_t  *ds  = &dx12World.drawSurfs[i];
+			const dx12Material_t  *mat = DX12_GetMaterial(ds->materialHandle);
 
-			if (ds->isTranslucent)
+			if (mat && mat->isTranslucent)
 			{
 				SCN_DrawSurface(ds, cbBaseGpuVA);
 			}
