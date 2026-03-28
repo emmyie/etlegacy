@@ -22,6 +22,9 @@
 
 dx12Globals_t dx12;
 
+// Global refimport_t required by shared renderercommon files (tr_image_jpg.c, etc.)
+refimport_t ri;
+
 /* Minimal image buffer helpers (copied from the GL renderer). */
 #define R_IMAGE_BUFFER_SIZE (512 * 512 * 4)
 
@@ -2757,6 +2760,7 @@ refexport_t *GetRefAPI(int apiVersion, refimport_t *rimp)
 	static refexport_t re;
 
 	dx12.ri = *rimp;
+	ri      = *rimp;
 
 	Com_Memset(&re, 0, sizeof(re));
 
