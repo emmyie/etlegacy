@@ -177,25 +177,42 @@ typedef struct
 
 /**
  * @struct dx12PerSurfConstants_t
- * @brief Inline root constants (4×DWORD) for per-draw-surface variation.
+ * @brief Inline root constants (8×DWORD) for per-draw-surface variation.
  *
  * Passed via SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF, …)
  * so the values are embedded directly in the command list and are correct for
  * every individual draw call even with deferred GPU execution.
+ *
+ * The UV transform applies a 2×3 affine matrix to the diffuse UV coordinates:
+ *   u' = uvM00 * u + uvM01 * v + uvOffsetU
+ *   v' = uvM10 * u + uvM11 * v + uvOffsetV
+ *
+ * Identity: uvM00=1, uvM01=0, uvOffsetU=0, uvM10=0, uvM11=1, uvOffsetV=0.
+ * Scroll:   uvOffsetU = scrollX * timeSec, uvOffsetV = scrollY * timeSec.
+ * Rotate:   uvM00=cos(a), uvM01=-sin(a), uvM10=sin(a), uvM11=cos(a),
+ *           offsets set so rotation is centred at (0.5, 0.5).
+ * Stretch:  uvM00=uvM11=1/scale, offsets = 0.5*(1-1/scale).
  */
 typedef struct
 {
-	float uvOffsetU;           ///< Diffuse UV scroll offset X (tcMod scroll)
-	float uvOffsetV;           ///< Diffuse UV scroll offset Y (tcMod scroll)
+	float uvM00;               ///< UV matrix row 0 col 0 (scale X / cos for rotate)
+	float uvM01;               ///< UV matrix row 0 col 1 (skew / -sin for rotate)
+	float uvOffsetU;           ///< UV matrix row 0 col 2 (translation X)
+	float uvM10;               ///< UV matrix row 1 col 0 (skew / +sin for rotate)
+	float uvM11;               ///< UV matrix row 1 col 1 (scale Y / cos for rotate)
+	float uvOffsetV;           ///< UV matrix row 1 col 2 (translation Y)
 	float alphaTestThreshold;  ///< PS clip threshold (0 = off, +0.5 = GE128, -0.5 = LT128)
 	float isEntity;            ///< 1.0 = use entity ambient/directed light, 0.0 = use lightmap
 } dx12PerSurfConstants_t;
+
+/** Number of 32-bit root constants for dx12PerSurfConstants_t. */
+#define DX12_SCENE_PERSURF_DWORDS  8
 
 /** Root signature parameter indices for the 3D pipeline. */
 #define DX12_SCENE_ROOT_PARAM_CB        0  ///< Root CBV at b0 (dx12SceneConstants_t)
 #define DX12_SCENE_ROOT_PARAM_DIFFUSE   1  ///< Descriptor table t0 (diffuse SRV)
 #define DX12_SCENE_ROOT_PARAM_LIGHTMAP  2  ///< Descriptor table t1 (lightmap SRV)
-#define DX12_SCENE_ROOT_PARAM_PERSURF   3  ///< Root constants b1 (dx12PerSurfConstants_t)
+#define DX12_SCENE_ROOT_PARAM_PERSURF   3  ///< Root constants b1 (dx12PerSurfConstants_t, 8 DWORDs)
 
 // ---------------------------------------------------------------------------
 // Per-entity scene entry
@@ -248,6 +265,8 @@ typedef struct
 	ID3D12PipelineState  *pso3D;           ///< PSO for dx12WorldVertex_t input – opaque
 	ID3D12PipelineState  *pso3DTranslucent; ///< Same layout but with alpha blending + no depth write
 	ID3D12PipelineState  *pso3DSky;         ///< Sky PSO: no depth write, depth always passes, no back-face cull
+	ID3D12PipelineState  *pso3DAdditive;    ///< Multi-stage additive layer (ONE/ONE, no depth write)
+	ID3D12PipelineState  *pso3DModulate;    ///< Multi-stage modulate layer (DST_COLOR/ZERO, no depth write)
 
 	// Per-frame constant buffer (upload heap, persistently mapped, CBV_SIZE aligned)
 	ID3D12Resource *constantBuffer;       ///< Holds DX12_FRAME_COUNT * DX12_MAX_CB_SLOTS_PER_FRAME slots

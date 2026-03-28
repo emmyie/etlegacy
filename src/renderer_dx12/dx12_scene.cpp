@@ -108,7 +108,11 @@ static const char g_worldShaderSource[] =
 	// Per-draw-surface inline root constants (set via SetGraphicsRoot32BitConstants)
 	"cbuffer PerSurface : register(b1)\n"
 	"{\n"
+	"    float uvM00;\n"
+	"    float uvM01;\n"
 	"    float uvOffsetU;\n"
+	"    float uvM10;\n"
+	"    float uvM11;\n"
 	"    float uvOffsetV;\n"
 	"    float alphaTestThreshold;\n"
 	"    float isEntity;\n"
@@ -142,7 +146,9 @@ static const char g_worldShaderSource[] =
 	"    PSInput o;\n"
 	"    float4 worldPos4 = mul(modelMatrix, float4(input.pos, 1.0));\n"
 	"    o.pos      = mul(viewProj, worldPos4);\n"
-	"    o.uv       = input.uv + float2(uvOffsetU, uvOffsetV);\n"
+	"    // Apply 2x3 affine UV transform: u' = M00*u + M01*v + offsetU\n"
+	"    o.uv       = float2(uvM00 * input.uv.x + uvM01 * input.uv.y + uvOffsetU,\n"
+	"                        uvM10 * input.uv.x + uvM11 * input.uv.y + uvOffsetV);\n"
 	"    o.lm       = input.lm;\n"
 	"    o.color    = input.color;\n"
 	"    o.worldPos = worldPos4.xyz;\n"
@@ -301,7 +307,11 @@ static const char g_skyShaderSource[] =
 	"};\n"
 	"cbuffer PerSurfConstants : register(b1)\n"
 	"{\n"
+	"    float uvM00;\n"
+	"    float uvM01;\n"
 	"    float uvOffsetU;\n"
+	"    float uvM10;\n"
+	"    float uvM11;\n"
 	"    float uvOffsetV;\n"
 	"    float alphaTestThreshold;\n"
 	"    float isEntity;\n"
@@ -333,7 +343,8 @@ static const char g_skyShaderSource[] =
 	"    float4 clipPos = mul(float4(vin.pos, 1.0f), vpNoTrans);\n"
 	"    // Force depth to far plane (NDC depth = 1.0) by setting w = z.\n"
 	"    vout.pos = clipPos.xyww;\n"
-	"    vout.st  = float2(vin.st.x + uvOffsetU, vin.st.y + uvOffsetV);\n"
+	"    vout.st  = float2(uvM00 * vin.st.x + uvM01 * vin.st.y + uvOffsetU,\n"
+	"                      uvM10 * vin.st.x + uvM11 * vin.st.y + uvOffsetV);\n"
 	"    return vout;\n"
 	"}\n"
 	"float4 PSMain(VSOut pin) : SV_TARGET\n"
@@ -464,22 +475,232 @@ static void SCN_UpdateCB(UINT slot, const dx12SceneConstants_t *cb)
 }
 
 // ---------------------------------------------------------------------------
+// Per-stage helper: evaluate tcMod chain into dx12PerSurfConstants_t UV matrix
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Evaluate the tcMod chain for a material stage and write the resulting
+ *        2×3 affine UV transform into @p psc.
+ *
+ * Supported modifiers (applied in order):
+ *   DX12_TMOD_SCROLL  – translate UV by rate * timeSec
+ *   DX12_TMOD_ROTATE  – rotate UV by (rotateSpeed * timeSec) degrees,
+ *                       centred at (0.5, 0.5)
+ *   DX12_TMOD_STRETCH – scale UV from centre by a waveform envelope
+ *
+ * The identity matrix is set first so that a stage with no tcMods performs an
+ * identity mapping.  Each supported modifier post-multiplies the current matrix
+ * so they compose correctly when stacked.
+ *
+ * @param[out] psc      Per-surface constants to fill in (uvM00 … uvOffsetV).
+ * @param[in]  st       Material stage containing the tcMod list.
+ * @param[in]  timeSec  Scene time in seconds.
+ */
+static void SCN_BuildUVMatrix(dx12PerSurfConstants_t *psc, const dx12MaterialStage_t *st, float timeSec)
+{
+	// Working 2×3 matrix stored as [row0col0, row0col1, row0col2, row1col0, row1col1, row1col2]
+	// where the transform is: u' = m[0]*u + m[1]*v + m[2], v' = m[3]*u + m[4]*v + m[5]
+	float m[6];
+	int   t;
+
+	// Identity
+	m[0] = 1.0f; m[1] = 0.0f; m[2] = 0.0f;
+	m[3] = 0.0f; m[4] = 1.0f; m[5] = 0.0f;
+
+	for (t = 0; t < st->numTcMods; t++)
+	{
+		const dx12TcMod_t *mod = &st->tcMods[t];
+
+		switch (mod->type)
+		{
+		case DX12_TMOD_SCROLL:
+		{
+			// Post-multiply by translation T:
+			// m' = T * m  →  only the offset columns change
+			m[2] += mod->scroll[0] * timeSec;
+			m[5] += mod->scroll[1] * timeSec;
+			break;
+		}
+		case DX12_TMOD_ROTATE:
+		{
+			// Rotation about UV centre (0.5, 0.5) by angleDeg degrees (CCW).
+			float angleDeg = mod->rotateSpeed * timeSec;
+			float angleRad = angleDeg * (float)(M_PI / 180.0);
+			float cosA     = cosf(angleRad);
+			float sinA     = sinf(angleRad);
+
+			// Build R_centred: translate to origin, rotate, translate back.
+			// Pre-multiply the current matrix by this rotation:
+			//   new_m = R_centred * old_m
+			// R_centred row-major:
+			//   [  cosA  -sinA   0.5*(1 - cosA + sinA) ]
+			//   [  sinA   cosA   0.5*(1 - sinA - cosA) ]
+			float tx = 0.5f * (1.0f - cosA + sinA);
+			float ty = 0.5f * (1.0f - sinA - cosA);
+
+			float n[6];
+			n[0] = cosA * m[0] + (-sinA) * m[3];
+			n[1] = cosA * m[1] + (-sinA) * m[4];
+			n[2] = cosA * m[2] + (-sinA) * m[5] + tx;
+			n[3] = sinA * m[0] + cosA * m[3];
+			n[4] = sinA * m[1] + cosA * m[4];
+			n[5] = sinA * m[2] + cosA * m[5] + ty;
+			m[0] = n[0]; m[1] = n[1]; m[2] = n[2];
+			m[3] = n[3]; m[4] = n[4]; m[5] = n[5];
+			break;
+		}
+		case DX12_TMOD_STRETCH:
+		{
+			// Evaluate wave function to get a scale value.
+			const dx12Wave_t *w = &mod->stretch;
+			float             phase = w->phase + timeSec * w->frequency;
+			float             wave  = 0.0f;
+
+			// Reduce phase to [0, 1)
+			phase = phase - (float)(int)phase;
+			if (phase < 0.0f)
+			{
+				phase += 1.0f;
+			}
+
+			switch (w->func)
+			{
+			case DX12_WAVE_SIN:
+				wave = sinf(phase * 2.0f * (float)M_PI);
+				break;
+			case DX12_WAVE_SQUARE:
+				wave = (phase < 0.5f) ? 1.0f : -1.0f;
+				break;
+			case DX12_WAVE_TRIANGLE:
+				wave = (phase < 0.5f) ? (4.0f * phase - 1.0f) : (3.0f - 4.0f * phase);
+				break;
+			case DX12_WAVE_SAWTOOTH:
+				wave = 2.0f * phase - 1.0f;
+				break;
+			case DX12_WAVE_INVERSE_SAWTOOTH:
+				wave = 1.0f - 2.0f * phase;
+				break;
+			default:
+				break;
+			}
+
+			float scaleVal = w->base + w->amplitude * wave;
+
+			if (scaleVal == 0.0f)
+			{
+				scaleVal = 1.0f; // avoid divide-by-zero
+			}
+
+			float invScale = 1.0f / scaleVal;
+			float offset   = 0.5f * (1.0f - invScale);
+
+			// Pre-multiply current matrix by scale-from-centre S:
+			//   S = [ 1/scale   0       0.5*(1-1/scale) ]
+			//       [ 0         1/scale 0.5*(1-1/scale) ]
+			float n[6];
+			n[0] = invScale * m[0];
+			n[1] = invScale * m[1];
+			n[2] = invScale * m[2] + offset;
+			n[3] = invScale * m[3];
+			n[4] = invScale * m[4];
+			n[5] = invScale * m[5] + offset;
+			m[0] = n[0]; m[1] = n[1]; m[2] = n[2];
+			m[3] = n[3]; m[4] = n[4]; m[5] = n[5];
+			break;
+		}
+		default:
+			break;
+		}
+	}
+
+	psc->uvM00     = m[0];
+	psc->uvM01     = m[1];
+	psc->uvOffsetU = m[2];
+	psc->uvM10     = m[3];
+	psc->uvM11     = m[4];
+	psc->uvOffsetV = m[5];
+}
+
+// ---------------------------------------------------------------------------
+// Per-stage helper: select PSO based on material stage blend mode
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Select the appropriate PSO for a material stage based on its blend factors.
+ *
+ * For the first active stage (@p isFirstStage == qtrue), depth writes are enabled
+ * (uses pso3D for opaque, pso3DTranslucent for blended).  For subsequent stages
+ * (where depth has already been written by the first pass), a no-depth-write PSO
+ * is chosen:
+ *   ONE / ONE        → pso3DAdditive
+ *   DST_COLOR / ZERO → pso3DModulate
+ *   all others       → pso3DTranslucent (SRC_ALPHA/INV_SRC_ALPHA, no depth write)
+ *
+ * Falls back to pso3D when the preferred PSO has not been created.
+ *
+ * @param[in] srcBlend     D3D12 source blend factor from dx12MaterialStage_t.
+ * @param[in] dstBlend     D3D12 destination blend factor.
+ * @param[in] isFirstStage qtrue when this is the first drawn stage of the surface.
+ * @return Pointer to the selected ID3D12PipelineState.
+ */
+static ID3D12PipelineState *SCN_SelectStagePSO(D3D12_BLEND srcBlend, D3D12_BLEND dstBlend,
+                                               qboolean isFirstStage)
+{
+	qboolean isOpaque = (srcBlend == D3D12_BLEND_ONE && dstBlend == D3D12_BLEND_ZERO);
+
+	if (isFirstStage)
+	{
+		if (isOpaque)
+		{
+			return dx12Scene.pso3D;
+		}
+
+		// First stage but with blending: use the translucent PSO (depth-write disabled)
+		return dx12Scene.pso3DTranslucent ? dx12Scene.pso3DTranslucent : dx12Scene.pso3D;
+	}
+
+	// Subsequent stages: never write depth
+	if (srcBlend == D3D12_BLEND_ONE && dstBlend == D3D12_BLEND_ONE)
+	{
+		// Additive
+		if (dx12Scene.pso3DAdditive)
+		{
+			return dx12Scene.pso3DAdditive;
+		}
+	}
+	else if (srcBlend == D3D12_BLEND_DEST_COLOR && dstBlend == D3D12_BLEND_ZERO)
+	{
+		// Modulate / multiply
+		if (dx12Scene.pso3DModulate)
+		{
+			return dx12Scene.pso3DModulate;
+		}
+	}
+
+	// Default fallback for subsequent stages: translucent (SRC_ALPHA / INV_SRC_ALPHA)
+	return dx12Scene.pso3DTranslucent ? dx12Scene.pso3DTranslucent : dx12Scene.pso3D;
+}
+
+// ---------------------------------------------------------------------------
 // Surface draw helper
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Bind SRVs, per-surface root constants, and issue a DrawIndexedInstanced.
+ * @brief Bind SRVs, per-surface root constants, and issue DrawIndexedInstanced
+ *        for every active stage of the surface's material.
  *
- * Per-surface variables (uvOffset, alphaTestThreshold, isEntity) are passed as
- * inline root 32-bit constants (DX12_SCENE_ROOT_PARAM_PERSURF) recorded inline
- * in the command list.  This is the correct DX12 approach for per-draw-call
- * variation: unlike CB writes to a shared upload-heap slot, root constants are
- * embedded in the command stream and are guaranteed correct for each draw call
- * even under deferred GPU execution.
+ * Loops over all active dx12MaterialStage_t entries in the material:
+ *   - Computes a 2×3 UV affine transform from the stage's tcMod chain
+ *     (scroll, rotate, stretch).
+ *   - Selects the PSO that matches the stage's blend mode (opaque, additive,
+ *     modulate, alpha-blend).  For the first stage, depth write is enabled;
+ *     for subsequent stages it is always disabled so the first stage's depth
+ *     value governs visibility.
+ *   - Binds the diffuse SRV for this stage (animMap frame resolved).
+ *   - Uploads the per-surface root constants and issues the draw.
  *
  * Also handles:
  *   - animMap: selects the current animation frame via g_sceneTimeMs.
- *   - tcMod scroll: accumulates UV offsets from SCROLL entries.
  *   - alphaFunc: passes the stage's alphaTestThreshold as a root constant.
  *
  * @param[in] ds      World draw surface descriptor.
@@ -487,11 +708,10 @@ static void SCN_UpdateCB(UINT slot, const dx12SceneConstants_t *cb)
  */
 static void SCN_DrawSurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDRESS cbGpuVA)
 {
-	dx12Material_t         *mat      = NULL;
-	dx12Texture_t          *diffTex  = NULL;
-	dx12Texture_t          *lmTex    = NULL;
-	qhandle_t               diffHandle = 0;
-	dx12PerSurfConstants_t  psc      = {};
+	dx12Material_t *mat       = NULL;
+	dx12Texture_t  *lmTex     = NULL;
+	qboolean        firstDraw = qtrue;
+	int             si;
 
 	if (ds->numIndexes <= 0 || ds->numVertices <= 0)
 	{
@@ -532,70 +752,13 @@ static void SCN_DrawSurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDRESS 
 		return;
 	}
 
-	// --- Resolve textures; build per-surface root constants ---
 	mat = DX12_GetMaterial(ds->materialHandle);
 
-	if (mat && mat->numStages > 0 && mat->stages[0].active)
-	{
-		const dx12MaterialStage_t *st = &mat->stages[0];
-		int t;
-
-		// animMap: select the animation frame for the current scene time
-		if (st->animNumFrames > 0 && st->animFps > 0.0f)
-		{
-			int frameIdx = (int)((float)g_sceneTimeMs * st->animFps / 1000.0f);
-
-			frameIdx = ((frameIdx % st->animNumFrames) + st->animNumFrames) % st->animNumFrames;
-			diffHandle = st->animFrames[frameIdx];
-		}
-		else
-		{
-			diffHandle = st->texHandle;
-		}
-
-		// tcMod scroll: accumulate UV offset from SCROLL entries
-		for (t = 0; t < st->numTcMods; t++)
-		{
-			if (st->tcMods[t].type == DX12_TMOD_SCROLL)
-			{
-				float timeSec = (float)g_sceneTimeMs / 1000.0f;
-
-				psc.uvOffsetU += st->tcMods[t].scroll[0] * timeSec;
-				psc.uvOffsetV += st->tcMods[t].scroll[1] * timeSec;
-			}
-		}
-
-		// alphaFunc → inline root constant (correct per draw call)
-		psc.alphaTestThreshold = st->alphaTestThreshold;
-	}
-
-	// isEntity = 0 for world surfaces; entity draws override this before calling
-	psc.isEntity = 0.0f;
-
-	diffTex = DX12_GetTexture(diffHandle);
-
-	// --- Bind constant buffer and per-surface root constants ---
+	// Bind the constant buffer once – it is shared across all stages of this surface.
 	dx12.commandList->SetGraphicsRootConstantBufferView(DX12_SCENE_ROOT_PARAM_CB, cbGpuVA);
-	dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
-	                                                4, &psc, 0);
 
-	// --- Bind SRV descriptor tables ---
+	// Lightmap handle is the same for all stages – resolve it once here.
 	{
-		D3D12_GPU_DESCRIPTOR_HANDLE srvHandle = {};
-
-		if (diffTex && diffTex->resource)
-		{
-			srvHandle = diffTex->gpuHandle;
-		}
-		else
-		{
-			srvHandle = dx12.srvHeap->GetGPUDescriptorHandleForHeapStart();
-		}
-
-		dx12.commandList->SetGraphicsRootDescriptorTable(DX12_SCENE_ROOT_PARAM_DIFFUSE,
-		                                                 srvHandle);
-
-		// Lightmap: BSP slot or white fallback for vertex-lit surfaces
 		D3D12_GPU_DESCRIPTOR_HANDLE lmHandle = dx12.srvHeap->GetGPUDescriptorHandleForHeapStart();
 
 		if (ds->lightmapIndex >= 0 && ds->lightmapIndex < dx12World.numLightmaps)
@@ -609,19 +772,100 @@ static void SCN_DrawSurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDRESS 
 			}
 		}
 
-		dx12.commandList->SetGraphicsRootDescriptorTable(DX12_SCENE_ROOT_PARAM_LIGHTMAP,
-		                                                 lmHandle);
+		dx12.commandList->SetGraphicsRootDescriptorTable(DX12_SCENE_ROOT_PARAM_LIGHTMAP, lmHandle);
 	}
 
-	// --- Issue draw call ---
-	// Indices are absolute (rebased in dx12_world.cpp loader), so BaseVertexLocation = 0.
-	dx12.commandList->DrawIndexedInstanced(
-		(UINT)ds->numIndexes,
-		1,
-		(UINT)ds->firstIndex,
-		0,
-		0
-		);
+	// --- Loop over all active material stages ---
+	if (mat && mat->numStages > 0)
+	{
+		float timeSec = (float)g_sceneTimeMs / 1000.0f;
+
+		for (si = 0; si < mat->numStages; si++)
+		{
+			const dx12MaterialStage_t *st = &mat->stages[si];
+			dx12PerSurfConstants_t     psc;
+			qhandle_t                  diffHandle = 0;
+			dx12Texture_t             *diffTex    = NULL;
+			D3D12_GPU_DESCRIPTOR_HANDLE srvHandle;
+			ID3D12PipelineState        *stagePso   = NULL;
+
+			if (!st->active)
+			{
+				continue;
+			}
+
+			// animMap: select animation frame for current scene time
+			if (st->animNumFrames > 0 && st->animFps > 0.0f)
+			{
+				int frameIdx = (int)(timeSec * st->animFps);
+
+				frameIdx = ((frameIdx % st->animNumFrames) + st->animNumFrames) % st->animNumFrames;
+				diffHandle = st->animFrames[frameIdx];
+			}
+			else
+			{
+				diffHandle = st->texHandle;
+			}
+
+			// Build the 2x3 UV affine matrix from the tcMod chain
+			Com_Memset(&psc, 0, sizeof(psc));
+			SCN_BuildUVMatrix(&psc, st, timeSec);
+
+			psc.alphaTestThreshold = st->alphaTestThreshold;
+			psc.isEntity           = 0.0f; // world surface; entity draws set this to 1.0
+
+			// Select PSO based on blend mode and stage index
+			stagePso = SCN_SelectStagePSO(st->srcBlend, st->dstBlend, firstDraw);
+			dx12.commandList->SetPipelineState(stagePso);
+
+			// Per-surface root constants (8 DWORDs)
+			dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
+			                                                DX12_SCENE_PERSURF_DWORDS, &psc, 0);
+
+			// Bind diffuse SRV for this stage
+			diffTex   = DX12_GetTexture(diffHandle);
+			srvHandle = (diffTex && diffTex->resource)
+			            ? diffTex->gpuHandle
+			            : dx12.srvHeap->GetGPUDescriptorHandleForHeapStart();
+
+			dx12.commandList->SetGraphicsRootDescriptorTable(DX12_SCENE_ROOT_PARAM_DIFFUSE, srvHandle);
+
+			// --- Issue draw call ---
+			// Indices are absolute (rebased in dx12_world.cpp loader), so BaseVertexLocation = 0.
+			dx12.commandList->DrawIndexedInstanced(
+				(UINT)ds->numIndexes,
+				1,
+				(UINT)ds->firstIndex,
+				0,
+				0
+				);
+
+			firstDraw = qfalse;
+		}
+	}
+	else
+	{
+		// No material / no stages: draw with identity UV and the opaque PSO using the
+		// heap-start (white) texture so geometry is at least visible.
+		dx12PerSurfConstants_t psc;
+
+		Com_Memset(&psc, 0, sizeof(psc));
+		psc.uvM00 = 1.0f;
+		psc.uvM11 = 1.0f;
+
+		dx12.commandList->SetPipelineState(dx12Scene.pso3D);
+		dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
+		                                                DX12_SCENE_PERSURF_DWORDS, &psc, 0);
+		dx12.commandList->SetGraphicsRootDescriptorTable(DX12_SCENE_ROOT_PARAM_DIFFUSE,
+		                                                 dx12.srvHeap->GetGPUDescriptorHandleForHeapStart());
+		dx12.commandList->DrawIndexedInstanced((UINT)ds->numIndexes, 1, (UINT)ds->firstIndex, 0, 0);
+	}
+
+	// Restore the opaque PSO for subsequent non-multi-stage calls
+	if (!firstDraw)
+	{
+		dx12.commandList->SetPipelineState(dx12Scene.pso3D);
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -640,10 +884,8 @@ static void SCN_DrawSurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDRESS 
  */
 static void DX12_DrawSkySurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDRESS cbGpuVA)
 {
-	dx12Material_t         *mat     = NULL;
-	dx12Texture_t          *diffTex = NULL;
-	qhandle_t               diffHandle = 0;
-	dx12PerSurfConstants_t  psc     = {};
+	dx12Material_t        *mat = NULL;
+	int                    si;
 
 	if (ds->numIndexes <= 0 || ds->numVertices <= 0)
 	{
@@ -659,71 +901,78 @@ static void DX12_DrawSkySurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDR
 
 	mat = DX12_GetMaterial(ds->materialHandle);
 
-	if (mat && mat->numStages > 0 && mat->stages[0].active)
-	{
-		const dx12MaterialStage_t *st = &mat->stages[0];
-		int t;
-
-		if (st->animNumFrames > 0 && st->animFps > 0.0f)
-		{
-			int frameIdx = (int)((float)g_sceneTimeMs * st->animFps / 1000.0f);
-
-			frameIdx = ((frameIdx % st->animNumFrames) + st->animNumFrames) % st->animNumFrames;
-			diffHandle = st->animFrames[frameIdx];
-		}
-		else
-		{
-			diffHandle = st->texHandle;
-		}
-
-		for (t = 0; t < st->numTcMods; t++)
-		{
-			if (st->tcMods[t].type == DX12_TMOD_SCROLL)
-			{
-				float timeSec = (float)g_sceneTimeMs / 1000.0f;
-
-				psc.uvOffsetU += st->tcMods[t].scroll[0] * timeSec;
-				psc.uvOffsetV += st->tcMods[t].scroll[1] * timeSec;
-			}
-		}
-
-		psc.alphaTestThreshold = st->alphaTestThreshold;
-	}
-
-	psc.isEntity = 0.0f;
-
-	diffTex = DX12_GetTexture(diffHandle);
-
-	// Switch to sky PSO (no depth write, view-translation stripped)
+	// Sky PSO applies to all stages of this surface
 	if (dx12Scene.pso3DSky)
 	{
 		dx12.commandList->SetPipelineState(dx12Scene.pso3DSky);
 	}
 
 	dx12.commandList->SetGraphicsRootConstantBufferView(DX12_SCENE_ROOT_PARAM_CB, cbGpuVA);
-	dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF, 4, &psc, 0);
+	// Sky has no lightmap – bind heap-start as a dummy for all stages
+	dx12.commandList->SetGraphicsRootDescriptorTable(DX12_SCENE_ROOT_PARAM_LIGHTMAP,
+	                                                 dx12.srvHeap->GetGPUDescriptorHandleForHeapStart());
 
+	if (mat && mat->numStages > 0)
 	{
-		D3D12_GPU_DESCRIPTOR_HANDLE srvHandle = dx12.srvHeap->GetGPUDescriptorHandleForHeapStart();
+		float timeSec = (float)g_sceneTimeMs / 1000.0f;
 
-		if (diffTex && diffTex->resource)
+		for (si = 0; si < mat->numStages; si++)
 		{
-			srvHandle = diffTex->gpuHandle;
+			const dx12MaterialStage_t *st = &mat->stages[si];
+			dx12PerSurfConstants_t     psc;
+			qhandle_t                  diffHandle = 0;
+			dx12Texture_t             *diffTex    = NULL;
+			D3D12_GPU_DESCRIPTOR_HANDLE srvHandle;
+
+			if (!st->active)
+			{
+				continue;
+			}
+
+			// animMap frame selection
+			if (st->animNumFrames > 0 && st->animFps > 0.0f)
+			{
+				int frameIdx = (int)(timeSec * st->animFps);
+
+				frameIdx = ((frameIdx % st->animNumFrames) + st->animNumFrames) % st->animNumFrames;
+				diffHandle = st->animFrames[frameIdx];
+			}
+			else
+			{
+				diffHandle = st->texHandle;
+			}
+
+			Com_Memset(&psc, 0, sizeof(psc));
+			SCN_BuildUVMatrix(&psc, st, timeSec);
+			psc.alphaTestThreshold = st->alphaTestThreshold;
+			psc.isEntity           = 0.0f;
+
+			dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
+			                                                DX12_SCENE_PERSURF_DWORDS, &psc, 0);
+
+			diffTex  = DX12_GetTexture(diffHandle);
+			srvHandle = (diffTex && diffTex->resource)
+			            ? diffTex->gpuHandle
+			            : dx12.srvHeap->GetGPUDescriptorHandleForHeapStart();
+
+			dx12.commandList->SetGraphicsRootDescriptorTable(DX12_SCENE_ROOT_PARAM_DIFFUSE, srvHandle);
+			dx12.commandList->DrawIndexedInstanced((UINT)ds->numIndexes, 1, (UINT)ds->firstIndex, 0, 0);
 		}
-
-		dx12.commandList->SetGraphicsRootDescriptorTable(DX12_SCENE_ROOT_PARAM_DIFFUSE, srvHandle);
-		// Sky does not use a lightmap; bind the heap start as a dummy
-		dx12.commandList->SetGraphicsRootDescriptorTable(DX12_SCENE_ROOT_PARAM_LIGHTMAP,
-		                                                 dx12.srvHeap->GetGPUDescriptorHandleForHeapStart());
 	}
+	else
+	{
+		// No material: draw with identity UV
+		dx12PerSurfConstants_t psc;
 
-	dx12.commandList->DrawIndexedInstanced(
-		(UINT)ds->numIndexes,
-		1,
-		(UINT)ds->firstIndex,
-		0,
-		0
-		);
+		Com_Memset(&psc, 0, sizeof(psc));
+		psc.uvM00 = 1.0f;
+		psc.uvM11 = 1.0f;
+		dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
+		                                                DX12_SCENE_PERSURF_DWORDS, &psc, 0);
+		dx12.commandList->SetGraphicsRootDescriptorTable(DX12_SCENE_ROOT_PARAM_DIFFUSE,
+		                                                 dx12.srvHeap->GetGPUDescriptorHandleForHeapStart());
+		dx12.commandList->DrawIndexedInstanced((UINT)ds->numIndexes, 1, (UINT)ds->firstIndex, 0, 0);
+	}
 
 	// Restore opaque PSO for subsequent draws
 	dx12.commandList->SetPipelineState(dx12Scene.pso3D);
@@ -760,8 +1009,8 @@ qboolean DX12_SceneInit(void)
 	//   Param 0 (DX12_SCENE_ROOT_PARAM_CB):       Root CBV at b0  (VS + PS)
 	//   Param 1 (DX12_SCENE_ROOT_PARAM_DIFFUSE):  Descriptor table – 1 SRV at t0
 	//   Param 2 (DX12_SCENE_ROOT_PARAM_LIGHTMAP): Descriptor table – 1 SRV at t1
-	//   Param 3 (DX12_SCENE_ROOT_PARAM_PERSURF):  32-bit constants at b1 (4 DWORDs)
-	//     uvOffsetU, uvOffsetV, alphaTestThreshold, isEntity
+	//   Param 3 (DX12_SCENE_ROOT_PARAM_PERSURF):  32-bit constants at b1 (8 DWORDs)
+	//     uvM00, uvM01, uvOffsetU, uvM10, uvM11, uvOffsetV, alphaTestThreshold, isEntity
 	//   Static sampler at s0: linear-wrap
 	// ----------------------------------------------------------------
 	{
@@ -799,13 +1048,13 @@ qboolean DX12_SceneInit(void)
 		params[DX12_SCENE_ROOT_PARAM_LIGHTMAP].DescriptorTable.pDescriptorRanges   = &srvRange1;
 		params[DX12_SCENE_ROOT_PARAM_LIGHTMAP].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_PIXEL;
 
-		// Param 3: per-surface inline root constants (b1) – 4 DWORDs
-		// uvOffsetU, uvOffsetV, alphaTestThreshold, isEntity
+		// Param 3: per-surface inline root constants (b1) – 8 DWORDs
+		// uvM00, uvM01, uvOffsetU, uvM10, uvM11, uvOffsetV, alphaTestThreshold, isEntity
 		// Recorded inline in the command list – correct per draw call.
 		params[DX12_SCENE_ROOT_PARAM_PERSURF].ParameterType                         = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 		params[DX12_SCENE_ROOT_PARAM_PERSURF].Constants.ShaderRegister              = 1; // b1
 		params[DX12_SCENE_ROOT_PARAM_PERSURF].Constants.RegisterSpace               = 0;
-		params[DX12_SCENE_ROOT_PARAM_PERSURF].Constants.Num32BitValues              = 4;
+		params[DX12_SCENE_ROOT_PARAM_PERSURF].Constants.Num32BitValues              = DX12_SCENE_PERSURF_DWORDS;
 		params[DX12_SCENE_ROOT_PARAM_PERSURF].ShaderVisibility                      = D3D12_SHADER_VISIBILITY_ALL;
 
 		D3D12_STATIC_SAMPLER_DESC sampler = {};
@@ -1215,6 +1464,212 @@ qboolean DX12_SceneInit(void)
 	}
 
 	// ----------------------------------------------------------------
+	// Additive multi-stage PSO – ONE/ONE, no depth write.
+	// Used for subsequent material stages with GL_ONE/GL_ONE blend.
+	// ----------------------------------------------------------------
+	{
+		ID3DBlob *vs      = NULL;
+		ID3DBlob *ps      = NULL;
+		ID3DBlob *errBlob = NULL;
+		UINT      flags   = 0;
+
+#ifdef _DEBUG
+		flags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+#endif
+
+		SIZE_T addLen = strlen(g_worldShaderSource);
+
+		hr = D3DCompile(g_worldShaderSource, addLen, "dx12_world_shader_additive", NULL, NULL,
+		                "VSMain", "vs_5_0", flags, 0, &vs, &errBlob);
+		if (SUCCEEDED(hr))
+		{
+			if (errBlob) { errBlob->Release(); errBlob = NULL; }
+			hr = D3DCompile(g_worldShaderSource, addLen, "dx12_world_shader_additive", NULL, NULL,
+			                "PSMain", "ps_5_0", flags, 0, &ps, &errBlob);
+		}
+
+		if (FAILED(hr) || !vs || !ps)
+		{
+			if (errBlob) { errBlob->Release(); }
+			if (vs)      { vs->Release(); }
+			if (ps)      { ps->Release(); }
+			dx12Scene.pso3DAdditive = NULL;
+			dx12.ri.Printf(PRINT_DEVELOPER, "DX12_SceneInit: additive PSO shader compile failed\n");
+		}
+		else
+		{
+			if (errBlob) { errBlob->Release(); errBlob = NULL; }
+
+			D3D12_INPUT_ELEMENT_DESC addElems[] =
+			{
+				{ "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT,    0,  0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+				{ "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,       0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+				{ "TEXCOORD", 1, DXGI_FORMAT_R32G32_FLOAT,       0, 20, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+				{ "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT,    0, 28, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+				{ "COLOR",    0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 40, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+			};
+
+			D3D12_GRAPHICS_PIPELINE_STATE_DESC psoAdd = {};
+			psoAdd.InputLayout.pInputElementDescs = addElems;
+			psoAdd.InputLayout.NumElements        = 5;
+			psoAdd.pRootSignature                 = dx12Scene.rootSignature3D;
+			psoAdd.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+			psoAdd.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+
+			psoAdd.RasterizerState.FillMode              = D3D12_FILL_MODE_SOLID;
+			psoAdd.RasterizerState.CullMode              = D3D12_CULL_MODE_NONE;
+			psoAdd.RasterizerState.FrontCounterClockwise = TRUE;
+			psoAdd.RasterizerState.DepthBias             = D3D12_DEFAULT_DEPTH_BIAS;
+			psoAdd.RasterizerState.DepthBiasClamp        = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
+			psoAdd.RasterizerState.SlopeScaledDepthBias  = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
+			psoAdd.RasterizerState.DepthClipEnable       = TRUE;
+
+			// Additive blending: dst.rgb += src.rgb
+			psoAdd.BlendState.AlphaToCoverageEnable  = FALSE;
+			psoAdd.BlendState.IndependentBlendEnable = FALSE;
+			{
+				D3D12_RENDER_TARGET_BLEND_DESC &rt = psoAdd.BlendState.RenderTarget[0];
+				rt.BlendEnable           = TRUE;
+				rt.LogicOpEnable         = FALSE;
+				rt.SrcBlend              = D3D12_BLEND_ONE;
+				rt.DestBlend             = D3D12_BLEND_ONE;
+				rt.BlendOp               = D3D12_BLEND_OP_ADD;
+				rt.SrcBlendAlpha         = D3D12_BLEND_ONE;
+				rt.DestBlendAlpha        = D3D12_BLEND_ONE;
+				rt.BlendOpAlpha          = D3D12_BLEND_OP_ADD;
+				rt.LogicOp               = D3D12_LOGIC_OP_NOOP;
+				rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+			}
+
+			// Subsequent stage: read depth but don't write
+			psoAdd.DepthStencilState.DepthEnable    = TRUE;
+			psoAdd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+			psoAdd.DepthStencilState.DepthFunc      = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+			psoAdd.DepthStencilState.StencilEnable  = FALSE;
+			psoAdd.SampleMask              = UINT_MAX;
+			psoAdd.PrimitiveTopologyType   = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+			psoAdd.NumRenderTargets        = 1;
+			psoAdd.RTVFormats[0]           = DXGI_FORMAT_R8G8B8A8_UNORM;
+			psoAdd.DSVFormat               = DXGI_FORMAT_D32_FLOAT;
+			psoAdd.SampleDesc.Count        = 1;
+
+			hr = dx12.device->CreateGraphicsPipelineState(&psoAdd, IID_PPV_ARGS(&dx12Scene.pso3DAdditive));
+			vs->Release();
+			ps->Release();
+
+			if (FAILED(hr))
+			{
+				dx12.ri.Printf(PRINT_DEVELOPER,
+				               "DX12_SceneInit: CreateGraphicsPipelineState (additive) failed (0x%08lx)\n", hr);
+				dx12Scene.pso3DAdditive = NULL;
+			}
+		}
+	}
+
+	// ----------------------------------------------------------------
+	// Modulate multi-stage PSO – DST_COLOR/ZERO (multiply), no depth write.
+	// Used for material stages with GL_DST_COLOR/GL_ZERO blend.
+	// ----------------------------------------------------------------
+	{
+		ID3DBlob *vs      = NULL;
+		ID3DBlob *ps      = NULL;
+		ID3DBlob *errBlob = NULL;
+		UINT      flags   = 0;
+
+#ifdef _DEBUG
+		flags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+#endif
+
+		SIZE_T modLen = strlen(g_worldShaderSource);
+
+		hr = D3DCompile(g_worldShaderSource, modLen, "dx12_world_shader_modulate", NULL, NULL,
+		                "VSMain", "vs_5_0", flags, 0, &vs, &errBlob);
+		if (SUCCEEDED(hr))
+		{
+			if (errBlob) { errBlob->Release(); errBlob = NULL; }
+			hr = D3DCompile(g_worldShaderSource, modLen, "dx12_world_shader_modulate", NULL, NULL,
+			                "PSMain", "ps_5_0", flags, 0, &ps, &errBlob);
+		}
+
+		if (FAILED(hr) || !vs || !ps)
+		{
+			if (errBlob) { errBlob->Release(); }
+			if (vs)      { vs->Release(); }
+			if (ps)      { ps->Release(); }
+			dx12Scene.pso3DModulate = NULL;
+			dx12.ri.Printf(PRINT_DEVELOPER, "DX12_SceneInit: modulate PSO shader compile failed\n");
+		}
+		else
+		{
+			if (errBlob) { errBlob->Release(); errBlob = NULL; }
+
+			D3D12_INPUT_ELEMENT_DESC modElems[] =
+			{
+				{ "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT,    0,  0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+				{ "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,       0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+				{ "TEXCOORD", 1, DXGI_FORMAT_R32G32_FLOAT,       0, 20, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+				{ "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT,    0, 28, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+				{ "COLOR",    0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 40, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+			};
+
+			D3D12_GRAPHICS_PIPELINE_STATE_DESC psoMod = {};
+			psoMod.InputLayout.pInputElementDescs = modElems;
+			psoMod.InputLayout.NumElements        = 5;
+			psoMod.pRootSignature                 = dx12Scene.rootSignature3D;
+			psoMod.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+			psoMod.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+
+			psoMod.RasterizerState.FillMode              = D3D12_FILL_MODE_SOLID;
+			psoMod.RasterizerState.CullMode              = D3D12_CULL_MODE_NONE;
+			psoMod.RasterizerState.FrontCounterClockwise = TRUE;
+			psoMod.RasterizerState.DepthBias             = D3D12_DEFAULT_DEPTH_BIAS;
+			psoMod.RasterizerState.DepthBiasClamp        = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
+			psoMod.RasterizerState.SlopeScaledDepthBias  = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
+			psoMod.RasterizerState.DepthClipEnable       = TRUE;
+
+			// Modulate blending: dst.rgb *= src.rgb  (GL_DST_COLOR / GL_ZERO)
+			psoMod.BlendState.AlphaToCoverageEnable  = FALSE;
+			psoMod.BlendState.IndependentBlendEnable = FALSE;
+			{
+				D3D12_RENDER_TARGET_BLEND_DESC &rt = psoMod.BlendState.RenderTarget[0];
+				rt.BlendEnable           = TRUE;
+				rt.LogicOpEnable         = FALSE;
+				rt.SrcBlend              = D3D12_BLEND_DEST_COLOR;
+				rt.DestBlend             = D3D12_BLEND_ZERO;
+				rt.BlendOp               = D3D12_BLEND_OP_ADD;
+				rt.SrcBlendAlpha         = D3D12_BLEND_ONE;
+				rt.DestBlendAlpha        = D3D12_BLEND_ZERO;
+				rt.BlendOpAlpha          = D3D12_BLEND_OP_ADD;
+				rt.LogicOp               = D3D12_LOGIC_OP_NOOP;
+				rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+			}
+
+			// Subsequent stage: read depth but don't write
+			psoMod.DepthStencilState.DepthEnable    = TRUE;
+			psoMod.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+			psoMod.DepthStencilState.DepthFunc      = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+			psoMod.DepthStencilState.StencilEnable  = FALSE;
+			psoMod.SampleMask              = UINT_MAX;
+			psoMod.PrimitiveTopologyType   = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+			psoMod.NumRenderTargets        = 1;
+			psoMod.RTVFormats[0]           = DXGI_FORMAT_R8G8B8A8_UNORM;
+			psoMod.DSVFormat               = DXGI_FORMAT_D32_FLOAT;
+			psoMod.SampleDesc.Count        = 1;
+
+			hr = dx12.device->CreateGraphicsPipelineState(&psoMod, IID_PPV_ARGS(&dx12Scene.pso3DModulate));
+			vs->Release();
+			ps->Release();
+
+			if (FAILED(hr))
+			{
+				dx12.ri.Printf(PRINT_DEVELOPER,
+				               "DX12_SceneInit: CreateGraphicsPipelineState (modulate) failed (0x%08lx)\n", hr);
+				dx12Scene.pso3DModulate = NULL;
+			}
+		}
+	}
+
+	// ----------------------------------------------------------------
 	// Per-frame constant buffer
 	// Each frame reserves DX12_MAX_CB_SLOTS_PER_FRAME slots:
 	//   slot 0        – world / identity model matrix
@@ -1369,6 +1824,18 @@ void DX12_SceneShutdown(void)
 	{
 		dx12Scene.pso3DSky->Release();
 		dx12Scene.pso3DSky = NULL;
+	}
+
+	if (dx12Scene.pso3DAdditive)
+	{
+		dx12Scene.pso3DAdditive->Release();
+		dx12Scene.pso3DAdditive = NULL;
+	}
+
+	if (dx12Scene.pso3DModulate)
+	{
+		dx12Scene.pso3DModulate->Release();
+		dx12Scene.pso3DModulate = NULL;
 	}
 
 	if (dx12Scene.rootSignature3D)
@@ -1779,8 +2246,11 @@ void DX12_RenderScene(const refdef_t *fd)
 	{
 		dx12PerSurfConstants_t pscDefault = {};
 
+		// Identity UV transform
+		pscDefault.uvM00 = 1.0f;
+		pscDefault.uvM11 = 1.0f;
 		dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
-		                                                4, &pscDefault, 0);
+		                                                DX12_SCENE_PERSURF_DWORDS, &pscDefault, 0);
 	}
 
 	// ----------------------------------------------------------------
@@ -1944,15 +2414,14 @@ void DX12_RenderScene(const refdef_t *fd)
 			// Write to the entity's dedicated slot
 			SCN_UpdateCB(entSlot, &entCB);
 
-			// Per-surface root constants for entity: isEntity=1, no UV offset,
-			// no alpha test (entity models rarely use alphaFunc)
-			entPsc.uvOffsetU          = 0.0f;
-			entPsc.uvOffsetV          = 0.0f;
+			// Per-surface root constants for entity: isEntity=1, identity UV transform
+			entPsc.uvM00              = 1.0f;
+			entPsc.uvM11              = 1.0f;
 			entPsc.alphaTestThreshold = 0.0f;
 			entPsc.isEntity           = 1.0f;
 
 			dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
-			                                                4, &entPsc, 0);
+			                                                DX12_SCENE_PERSURF_DWORDS, &entPsc, 0);
 
 			// Draw the entity's model surfaces
 			DX12_DrawEntity(ent, entCBGpuVA);
@@ -1962,8 +2431,10 @@ void DX12_RenderScene(const refdef_t *fd)
 		{
 			dx12PerSurfConstants_t pscWorld = {};
 
+			pscWorld.uvM00 = 1.0f;
+			pscWorld.uvM11 = 1.0f;
 			dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
-			                                                4, &pscWorld, 0);
+			                                                DX12_SCENE_PERSURF_DWORDS, &pscWorld, 0);
 		}
 	}
 
