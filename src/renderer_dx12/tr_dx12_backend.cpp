@@ -11,6 +11,8 @@
 
 #ifdef _WIN32
 
+#include <stdlib.h>  // malloc, free
+
 // ---------------------------------------------------------------------------
 // HLSL shader source (inlined to avoid file-system dependency at startup)
 // ---------------------------------------------------------------------------
@@ -608,6 +610,50 @@ void DX12_WaitForUpload(ID3D12CommandQueue *queue)
 // DX12_CreateTextureFromRGBA
 // ---------------------------------------------------------------------------
 
+/** Maximum mip levels generated per texture (covers up to 32768 × 32768). */
+#define DX12_MAX_MIP_LEVELS 16
+
+/**
+ * @brief DX12_BuildMipLevel
+ * @details CPU 2×2 box-filter downscale.  Produces a half-width, half-height
+ *          image by averaging each 2×2 block of RGBA8 pixels.  Both @p srcW and
+ *          @p srcH must be at least 1; a 1-pixel dimension is clamped so that
+ *          the neighbour sample stays in-bounds.
+ *
+ * @param[out] dst    Output image (ceil(srcW/2) × ceil(srcH/2) × 4 bytes)
+ * @param[in]  src    Source RGBA8 image (srcW × srcH × 4 bytes)
+ * @param[in]  srcW   Source width in pixels
+ * @param[in]  srcH   Source height in pixels
+ */
+static void DX12_BuildMipLevel(byte *dst, const byte *src, int srcW, int srcH)
+{
+	int dstW = (srcW > 1) ? (srcW >> 1) : 1;
+	int dstH = (srcH > 1) ? (srcH >> 1) : 1;
+	int x, y, c;
+
+	for (y = 0; y < dstH; y++)
+	{
+		int y0 = (y * 2);
+		int y1 = (srcH > 1) ? (y0 + 1) : y0;
+		for (x = 0; x < dstW; x++)
+		{
+			int x0 = (x * 2);
+			int x1 = (srcW > 1) ? (x0 + 1) : x0;
+
+			const byte *s00 = src + (y0 * srcW + x0) * 4;
+			const byte *s10 = src + (y0 * srcW + x1) * 4;
+			const byte *s01 = src + (y1 * srcW + x0) * 4;
+			const byte *s11 = src + (y1 * srcW + x1) * 4;
+			byte       *d   = dst + (y  * dstW + x) * 4;
+
+			for (c = 0; c < 4; c++)
+			{
+				d[c] = (byte)(((int)s00[c] + s10[c] + s01[c] + s11[c] + 2) >> 2);
+			}
+		}
+	}
+}
+
 /**
  * @brief DX12_CreateTextureFromRGBA
  * @param[in] data     RGBA pixel data (width * height * 4 bytes)
@@ -616,16 +662,19 @@ void DX12_WaitForUpload(ID3D12CommandQueue *queue)
  * @param[in] srvSlot  Index in dx12.srvHeap at which to create the SRV
  * @return             Populated dx12Texture_t; resource is NULL on failure
  *
- * Creates a D3D12 2D texture, uploads the pixel data via an upload heap,
- * transitions the resource to pixel-shader SRV state, and creates an SRV at
- * the specified heap slot.  Uses dx12.uploadCmdAllocator / dx12.uploadCmdList
- * (dedicated upload pipeline, independent of the per-frame rendering list),
- * so it is safe to call while a frame is open.
+ * Creates a D3D12 2D texture with a full mip chain (via CPU 2×2 box filter),
+ * uploads all levels via an upload heap, transitions the resource to
+ * pixel-shader SRV state, and creates an SRV at the specified heap slot.
+ * Uses dx12.uploadCmdAllocator / dx12.uploadCmdList (dedicated upload
+ * pipeline, independent of the per-frame rendering list), so it is safe to
+ * call while a frame is open.
  */
 dx12Texture_t DX12_CreateTextureFromRGBA(const byte *data, int width, int height, int srvSlot)
 {
 	dx12Texture_t tex;
 	HRESULT       hr;
+	UINT16        mipLevels;
+	int           mip;
 
 	Com_Memset(&tex, 0, sizeof(tex));
 
@@ -633,6 +682,18 @@ dx12Texture_t DX12_CreateTextureFromRGBA(const byte *data, int width, int height
 	{
 		dx12.ri.Printf(PRINT_WARNING, "DX12_CreateTextureFromRGBA: invalid srvSlot %d\n", srvSlot);
 		return tex;
+	}
+
+	// ---- Compute mip chain depth -------------------------------------------
+	// floor(log2(max(w, h))) + 1, capped at DX12_MAX_MIP_LEVELS.
+	{
+		int n = (width > height) ? width : height;
+		mipLevels = 1;
+		while (n > 1 && mipLevels < DX12_MAX_MIP_LEVELS)
+		{
+			n >>= 1;
+			mipLevels++;
+		}
 	}
 
 	// ---- Default-heap texture resource ----
@@ -644,7 +705,7 @@ dx12Texture_t DX12_CreateTextureFromRGBA(const byte *data, int width, int height
 	texDesc.Width            = (UINT)width;
 	texDesc.Height           = (UINT)height;
 	texDesc.DepthOrArraySize = 1;
-	texDesc.MipLevels        = 1;
+	texDesc.MipLevels        = mipLevels;
 	texDesc.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
 	texDesc.SampleDesc.Count = 1;
 	texDesc.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
@@ -664,12 +725,14 @@ dx12Texture_t DX12_CreateTextureFromRGBA(const byte *data, int width, int height
 		return tex;
 	}
 
-	// ---- Upload heap buffer ----
-	D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
-	UINT                               numRows;
-	UINT64                             rowSizeBytes;
+	// ---- Upload heap: get per-mip footprints and total size ----------------
+	D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[DX12_MAX_MIP_LEVELS];
+	UINT                               mipNumRows[DX12_MAX_MIP_LEVELS];
+	UINT64                             mipRowSizes[DX12_MAX_MIP_LEVELS];
 	UINT64                             uploadSize;
-	dx12.device->GetCopyableFootprints(&texDesc, 0, 1, 0, &footprint, &numRows, &rowSizeBytes, &uploadSize);
+	dx12.device->GetCopyableFootprints(&texDesc, 0, mipLevels, 0,
+	                                   footprints, mipNumRows, mipRowSizes,
+	                                   &uploadSize);
 
 	D3D12_HEAP_PROPERTIES uploadHeap = {};
 	uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
@@ -701,19 +764,65 @@ dx12Texture_t DX12_CreateTextureFromRGBA(const byte *data, int width, int height
 		return tex;
 	}
 
-	// ---- Copy pixel rows into the upload buffer ----
+	// ---- Build mip chain and copy into the upload buffer -------------------
+	// mipData[0] points to the caller's buffer; mipData[i] (i>0) owns a
+	// heap-allocated downscaled copy.
+	const byte *mipData[DX12_MAX_MIP_LEVELS];
+	byte       *mipAlloc[DX12_MAX_MIP_LEVELS]; // freed after upload
+	int         mipW[DX12_MAX_MIP_LEVELS];
+	int         mipH[DX12_MAX_MIP_LEVELS];
+
+	mipData[0]  = data;
+	mipAlloc[0] = NULL;
+	mipW[0]     = width;
+	mipH[0]     = height;
+
+	for (mip = 1; mip < (int)mipLevels; mip++)
+	{
+		mipW[mip] = (mipW[mip - 1] > 1) ? (mipW[mip - 1] >> 1) : 1;
+		mipH[mip] = (mipH[mip - 1] > 1) ? (mipH[mip - 1] >> 1) : 1;
+
+		mipAlloc[mip] = (byte *)malloc((size_t)(mipW[mip] * mipH[mip] * 4));
+		if (!mipAlloc[mip])
+		{
+			// Fall back to repeating the previous mip level in this slot
+			mipData[mip]  = mipData[mip - 1];
+			mipAlloc[mip] = NULL;
+		}
+		else
+		{
+			DX12_BuildMipLevel(mipAlloc[mip], mipData[mip - 1], mipW[mip - 1], mipH[mip - 1]);
+			mipData[mip] = mipAlloc[mip];
+		}
+	}
+
 	UINT8       *pMapped  = NULL;
 	D3D12_RANGE readRange = { 0, 0 };
 	uploadBuffer->Map(0, &readRange, (void **)&pMapped);
-	for (UINT row = 0; row < numRows; row++)
+
+	for (mip = 0; mip < (int)mipLevels; mip++)
 	{
-		memcpy(
-			pMapped + footprint.Offset + (UINT64)row * footprint.Footprint.RowPitch,
-			data + (UINT64)row * (UINT)width * 4,
-			(size_t)width * 4
-			);
+		for (UINT row = 0; row < mipNumRows[mip]; row++)
+		{
+			memcpy(
+				pMapped + footprints[mip].Offset + (UINT64)row * footprints[mip].Footprint.RowPitch,
+				mipData[mip] + (UINT64)row * (UINT)mipW[mip] * 4,
+				(size_t)mipW[mip] * 4
+				);
+		}
 	}
+
 	uploadBuffer->Unmap(0, NULL);
+
+	// Free CPU mip buffers (no longer needed after mapping)
+	for (mip = 1; mip < (int)mipLevels; mip++)
+	{
+		if (mipAlloc[mip])
+		{
+			free(mipAlloc[mip]);
+			mipAlloc[mip] = NULL;
+		}
+	}
 
 	// ---- Record upload + transition into the dedicated upload command list ----
 	hr = dx12.uploadCmdAllocator->Reset();
@@ -738,17 +847,21 @@ dx12Texture_t DX12_CreateTextureFromRGBA(const byte *data, int width, int height
 		return tex;
 	}
 
-	D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
-	srcLoc.pResource       = uploadBuffer;
-	srcLoc.Type            = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-	srcLoc.PlacedFootprint = footprint;
+	// Record one CopyTextureRegion per mip level
+	for (mip = 0; mip < (int)mipLevels; mip++)
+	{
+		D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
+		srcLoc.pResource       = uploadBuffer;
+		srcLoc.Type            = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+		srcLoc.PlacedFootprint = footprints[mip];
 
-	D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
-	dstLoc.pResource        = tex.resource;
-	dstLoc.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-	dstLoc.SubresourceIndex = 0;
+		D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
+		dstLoc.pResource        = tex.resource;
+		dstLoc.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		dstLoc.SubresourceIndex = (UINT)mip;
 
-	dx12.uploadCmdList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, NULL);
+		dx12.uploadCmdList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, NULL);
+	}
 
 	D3D12_RESOURCE_BARRIER barrier = {};
 	barrier.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -768,12 +881,12 @@ dx12Texture_t DX12_CreateTextureFromRGBA(const byte *data, int width, int height
 	DX12_WaitForUpload(dx12.commandQueue);
 	uploadBuffer->Release();
 
-	// ---- Create SRV in the requested slot of the SRV heap ----
+	// ---- Create SRV exposing the full mip chain ----------------------------
 	D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
 	srvDesc.Format                        = DXGI_FORMAT_R8G8B8A8_UNORM;
 	srvDesc.ViewDimension                 = D3D12_SRV_DIMENSION_TEXTURE2D;
 	srvDesc.Shader4ComponentMapping       = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-	srvDesc.Texture2D.MipLevels           = 1;
+	srvDesc.Texture2D.MipLevels           = mipLevels;
 	srvDesc.Texture2D.MostDetailedMip     = 0;
 	srvDesc.Texture2D.ResourceMinLODClamp = 0.0f;
 

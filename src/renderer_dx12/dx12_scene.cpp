@@ -69,7 +69,7 @@
  * @brief Embedded HLSL for the 3D world pipeline.
  *
  * Root signature (slot assignments must match DX12_SceneInit):
- *   b0 – SceneConstants (CBV): viewProj, modelMatrix, cameraPos
+ *   b0 – SceneConstants (CBV): viewProj, modelMatrix, cameraPos, fog params
  *   t0 – diffuse texture  (SRV)
  *   t1 – lightmap texture (SRV)
  *   s0 – linear-wrap sampler (static)
@@ -80,6 +80,8 @@
  *   TEXCOORD1 float2   lm   (lightmap UV)
  *   NORMAL    float3   normal
  *   COLOR     float4   color (per-vertex modulate)
+ *
+ * The pixel shader applies linear depth fog when fogEnabled > 0.
  */
 static const char g_worldShaderSource[] =
 	"cbuffer SceneConstants : register(b0)\n"
@@ -87,6 +89,11 @@ static const char g_worldShaderSource[] =
 	"    float4x4 viewProj;\n"
 	"    float4x4 modelMatrix;\n"
 	"    float4   cameraPos;\n"
+	"    float4   fogColor;\n"
+	"    float    fogStart;\n"
+	"    float    fogEnd;\n"
+	"    float    fogEnabled;\n"
+	"    float    _pad0;\n"
 	"};\n"
 	"\n"
 	"Texture2D    g_diffuse  : register(t0);\n"
@@ -104,20 +111,22 @@ static const char g_worldShaderSource[] =
 	"\n"
 	"struct PSInput\n"
 	"{\n"
-	"    float4 pos    : SV_POSITION;\n"
-	"    float2 uv     : TEXCOORD0;\n"
-	"    float2 lm     : TEXCOORD1;\n"
-	"    float4 color  : COLOR;\n"
+	"    float4 pos      : SV_POSITION;\n"
+	"    float2 uv       : TEXCOORD0;\n"
+	"    float2 lm       : TEXCOORD1;\n"
+	"    float4 color    : COLOR;\n"
+	"    float3 worldPos : TEXCOORD2;\n"
 	"};\n"
 	"\n"
 	"PSInput VSMain(VSInput input)\n"
 	"{\n"
 	"    PSInput o;\n"
-	"    float4 worldPos = mul(modelMatrix, float4(input.pos, 1.0));\n"
-	"    o.pos   = mul(viewProj, worldPos);\n"
-	"    o.uv    = input.uv;\n"
-	"    o.lm    = input.lm;\n"
-	"    o.color = input.color;\n"
+	"    float4 worldPos4 = mul(modelMatrix, float4(input.pos, 1.0));\n"
+	"    o.pos      = mul(viewProj, worldPos4);\n"
+	"    o.uv       = input.uv;\n"
+	"    o.lm       = input.lm;\n"
+	"    o.color    = input.color;\n"
+	"    o.worldPos = worldPos4.xyz;\n"
 	"    return o;\n"
 	"}\n"
 	"\n"
@@ -127,7 +136,15 @@ static const char g_worldShaderSource[] =
 	"    float4 lightmap = g_lightmap.Sample(g_sampler, input.lm);\n"
 	"    // 2x overbright to match GL1 renderer default (r_overBrightBits=1)\n"
 	"    float4 result   = diffuse * (lightmap * 2.0) * input.color;\n"
-	"    return float4(saturate(result.rgb), result.a);\n"
+	"    result = float4(saturate(result.rgb), result.a);\n"
+	"    // Linear depth fog: blend toward fogColor over [fogStart, fogEnd]\n"
+	"    if (fogEnabled > 0.0)\n"
+	"    {\n"
+	"        float viewDist  = length(input.worldPos - cameraPos.xyz);\n"
+	"        float fogFactor = saturate((fogEnd - viewDist) / max(fogEnd - fogStart, 1.0));\n"
+	"        result.rgb      = lerp(fogColor.rgb, result.rgb, fogFactor);\n"
+	"    }\n"
+	"    return result;\n"
 	"}\n";
 
 // ---------------------------------------------------------------------------
@@ -1200,6 +1217,29 @@ void DX12_RenderScene(const refdef_t *fd)
 	cb.cameraPos[2] = fd->vieworg[2];
 	cb.cameraPos[3] = 1.0f;
 
+	// Populate fog fields from global-fog override or clear them
+	if (dx12World.globalFogActive && dx12World.globalFogDepth > 0.0f)
+	{
+		cb.fogColor[0] = dx12World.globalFogColor[0];
+		cb.fogColor[1] = dx12World.globalFogColor[1];
+		cb.fogColor[2] = dx12World.globalFogColor[2];
+		cb.fogColor[3] = 1.0f;
+		cb.fogStart    = 0.0f;
+		cb.fogEnd      = dx12World.globalFogDepth;
+		cb.fogEnabled  = 1.0f;
+	}
+	else
+	{
+		cb.fogColor[0] = 0.0f;
+		cb.fogColor[1] = 0.0f;
+		cb.fogColor[2] = 0.0f;
+		cb.fogColor[3] = 1.0f;
+		cb.fogStart    = 0.0f;
+		cb.fogEnd      = 0.0f;
+		cb.fogEnabled  = 0.0f;
+	}
+	cb._pad0 = 0.0f;
+
 	SCN_UpdateCB(cbBaseSlot, &cb);
 
 	// ----------------------------------------------------------------
@@ -1343,6 +1383,16 @@ void DX12_RenderScene(const refdef_t *fd)
 			entCB.cameraPos[1] = cb.cameraPos[1];
 			entCB.cameraPos[2] = cb.cameraPos[2];
 			entCB.cameraPos[3] = cb.cameraPos[3];
+
+			// Copy fog parameters from the world CB so entities are also fogged
+			entCB.fogColor[0] = cb.fogColor[0];
+			entCB.fogColor[1] = cb.fogColor[1];
+			entCB.fogColor[2] = cb.fogColor[2];
+			entCB.fogColor[3] = cb.fogColor[3];
+			entCB.fogStart    = cb.fogStart;
+			entCB.fogEnd      = cb.fogEnd;
+			entCB.fogEnabled  = cb.fogEnabled;
+			entCB._pad0       = 0.0f;
 
 			// Write to the entity's dedicated slot
 			SCN_UpdateCB(entSlot, &entCB);

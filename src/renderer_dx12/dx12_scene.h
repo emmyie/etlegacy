@@ -144,12 +144,22 @@ typedef struct
  *   viewProj    – combined view * projection matrix (row-major float4x4)
  *   modelMatrix – per-object model-to-world transform (row-major float4x4)
  *   cameraPos   – world-space camera origin (xyz) + padding (w)
+ *   fogColor    – fog RGBA color (alpha unused)
+ *   fogStart    – linear fog start distance (0 = fog disabled)
+ *   fogEnd      – linear fog end distance
+ *   fogEnabled  – non-zero when fog should be applied
+ *   _pad0       – padding to 256-byte boundary
  */
 typedef struct
 {
 	float viewProj[4][4];    ///< View * Projection matrix (row-major)
 	float modelMatrix[4][4]; ///< Model matrix (row-major); identity for world
 	float cameraPos[4];      ///< World-space camera position (w unused)
+	float fogColor[4];       ///< Linear fog colour (rgb) + unused alpha
+	float fogStart;          ///< Linear fog start distance (camera units)
+	float fogEnd;            ///< Linear fog end distance (camera units)
+	float fogEnabled;        ///< 1.0 = fog active, 0.0 = no fog
+	float _pad0;             ///< Explicit padding
 } dx12SceneConstants_t;
 
 // ---------------------------------------------------------------------------

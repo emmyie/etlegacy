@@ -667,9 +667,9 @@ static int  dx12NumModels = 0;
 /**
  * @brief DX12_ClearPerSessionState
  *
- * Resets all CPU-side per-session registries: the model-name lookup table
- * and the skin table.  GPU model resources must have been released already
- * by DX12_ShutdownModels() before this is called.
+ * Resets all CPU-side per-session registries: the model-name lookup table,
+ * the skin table, and the shader remap table.  GPU model resources must have
+ * been released already by DX12_ShutdownModels() before this is called.
  *
  * Called by R_DX12_Shutdown(qfalse) (soft reset, between map loads) so that
  * the next map load starts with completely clean registries.  Also called by
@@ -682,6 +682,11 @@ void DX12_ClearPerSessionState(void)
 
 	Com_Memset(dx12Skins, 0, sizeof(dx12Skins));
 	dx12NumSkins = 0;
+
+	// Reset shader remaps so that remaps from the previous map cannot bleed
+	// into a newly loaded map's shader lookups.
+	Com_Memset(dx12ShaderRemaps, 0, sizeof(dx12ShaderRemaps));
+	dx12NumShaderRemaps = 0;
 }
 
 /**
@@ -2539,6 +2544,14 @@ static void RE_DX12_purgeCache(void)
 	// ---- 5. Release model GPU resources and reset all CPU lookup tables ----
 	DX12_ShutdownModels();
 	DX12_ClearPerSessionState();
+
+	// ---- 6. Reset per-map fog state ----------------------------------------
+	// dx12FogSettings[] and dx12FogNum are file-scope statics set via
+	// RE_DX12_SetFog.  They are never reset between map loads otherwise, which
+	// means fog slots from the previous map can bleed into the new map once fog
+	// rendering is active.
+	Com_Memset(dx12FogSettings, 0, sizeof(dx12FogSettings));
+	dx12FogNum = FOG_NONE;
 }
 
 static qboolean RE_DX12_LoadDynamicShader(const char *shadername, const char *shadertext)

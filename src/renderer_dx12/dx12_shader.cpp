@@ -250,6 +250,11 @@ void DX12_ShutdownTextures(void)
 		dx12Shaders[i].valid = qfalse;
 	}
 	dx12NumShaders = 0;
+
+	// Zero the whole table so that stale names / SRV indices from the previous
+	// map session cannot be accidentally reused if a future code path checks an
+	// entry without consulting .valid first.
+	Com_Memset(dx12Shaders, 0, sizeof(dx12Shaders));
 }
 
 // ---------------------------------------------------------------------------
