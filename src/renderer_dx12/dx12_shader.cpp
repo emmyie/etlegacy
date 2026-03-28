@@ -948,6 +948,33 @@ static const char *SH_ParseStage(const char *p, const char *end,
 			continue;
 		}
 
+		// alphaFunc <GE128 | GT0 | LT128>
+		// Maps to a PS clip() threshold stored in alphaTestThreshold.
+		//   GE128  – keep pixels with alpha >= 0.5 (most common, used by foliage/fences)
+		//   GT0    – keep pixels with alpha > 0 (discard fully transparent)
+		//   LT128  – keep pixels with alpha < 0.5 (less common; stored as negative)
+		if (!DX12_Stricmp(tok, "alphaFunc"))
+		{
+			char func[32];
+
+			p = SH_ReadToken(p, end, func, sizeof(func));
+
+			if (!DX12_Stricmp(func, "GE128"))
+			{
+				stage->alphaTestThreshold = 0.5f;
+			}
+			else if (!DX12_Stricmp(func, "GT0"))
+			{
+				stage->alphaTestThreshold = 0.004f; // just above zero
+			}
+			else if (!DX12_Stricmp(func, "LT128"))
+			{
+				// Negative threshold signals "clip if alpha >= |threshold|"
+				stage->alphaTestThreshold = -0.5f;
+			}
+			continue;
+		}
+
 		// tcMod <scroll|rotate|stretch> [params…]
 		if (!DX12_Stricmp(tok, "tcMod"))
 		{

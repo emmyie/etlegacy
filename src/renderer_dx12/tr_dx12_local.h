@@ -133,6 +133,7 @@ typedef struct
 	qhandle_t animFrames[DX12_MAX_ANIM_FRAMES];    ///< Per-frame texture handles (animMap)
 	int animNumFrames;                             ///< Number of animation frames
 	float animFps;                                 ///< Animation playback rate (frames/s)
+	float alphaTestThreshold;                      ///< Alpha-test cutoff (0 = disabled, e.g. 0.5 for GE128)
 } dx12MaterialStage_t;
 
 /**

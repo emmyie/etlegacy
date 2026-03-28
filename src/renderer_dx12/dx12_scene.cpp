@@ -69,7 +69,8 @@
  * @brief Embedded HLSL for the 3D world pipeline.
  *
  * Root signature (slot assignments must match DX12_SceneInit):
- *   b0 – SceneConstants (CBV): viewProj, modelMatrix, cameraPos, fog params
+ *   b0 – SceneConstants (CBV): viewProj, modelMatrix, cameraPos, fog, entity light
+ *   b1 – PerSurfaceConstants (root 32-bit constants): uvOffset, alphaTest, isEntity
  *   t0 – diffuse texture  (SRV)
  *   t1 – lightmap texture (SRV)
  *   s0 – linear-wrap sampler (static)
@@ -81,9 +82,15 @@
  *   NORMAL    float3   normal
  *   COLOR     float4   color (per-vertex modulate)
  *
- * The pixel shader applies linear depth fog when fogEnabled > 0.
+ * The pixel shader:
+ *   - Applies uvOffset (inline root constants) to the diffuse UV.
+ *   - Discards pixels whose alpha fails the alphaTestThreshold test.
+ *   - For world surfaces (isEntity == 0): applies lightmap * overbright.
+ *   - For entity surfaces (isEntity > 0): applies entity ambient + N.L * directed.
+ *   - Applies linear depth fog when fogEnabled > 0.
  */
 static const char g_worldShaderSource[] =
+	// Main per-frame/per-entity constant buffer
 	"cbuffer SceneConstants : register(b0)\n"
 	"{\n"
 	"    float4x4 viewProj;\n"
@@ -94,6 +101,17 @@ static const char g_worldShaderSource[] =
 	"    float    fogEnd;\n"
 	"    float    fogEnabled;\n"
 	"    float    overBrightFactor;\n"
+	"    float4   entityAmbient;\n"
+	"    float4   entityDirected;\n"
+	"    float4   entityLightDir;\n"
+	"};\n"
+	// Per-draw-surface inline root constants (set via SetGraphicsRoot32BitConstants)
+	"cbuffer PerSurface : register(b1)\n"
+	"{\n"
+	"    float uvOffsetU;\n"
+	"    float uvOffsetV;\n"
+	"    float alphaTestThreshold;\n"
+	"    float isEntity;\n"
 	"};\n"
 	"\n"
 	"Texture2D    g_diffuse  : register(t0);\n"
@@ -116,6 +134,7 @@ static const char g_worldShaderSource[] =
 	"    float2 lm       : TEXCOORD1;\n"
 	"    float4 color    : COLOR;\n"
 	"    float3 worldPos : TEXCOORD2;\n"
+	"    float3 normal   : TEXCOORD3;\n"
 	"};\n"
 	"\n"
 	"PSInput VSMain(VSInput input)\n"
@@ -123,24 +142,47 @@ static const char g_worldShaderSource[] =
 	"    PSInput o;\n"
 	"    float4 worldPos4 = mul(modelMatrix, float4(input.pos, 1.0));\n"
 	"    o.pos      = mul(viewProj, worldPos4);\n"
-	"    o.uv       = input.uv;\n"
+	"    o.uv       = input.uv + float2(uvOffsetU, uvOffsetV);\n"
 	"    o.lm       = input.lm;\n"
 	"    o.color    = input.color;\n"
 	"    o.worldPos = worldPos4.xyz;\n"
+	"    // Transform normal to world space (rotation part of modelMatrix only)\n"
+	"    o.normal   = normalize(mul((float3x3)modelMatrix, input.normal));\n"
 	"    return o;\n"
 	"}\n"
 	"\n"
 	"float4 PSMain(PSInput input) : SV_TARGET\n"
 	"{\n"
-	"    float4 diffuse  = g_diffuse.Sample(g_sampler, input.uv);\n"
-	"    float4 lightmap = g_lightmap.Sample(g_sampler, input.lm);\n"
-	"    // Overbright: matches GL1 R_ColorShiftLightingBytes with\n"
-	"    // shift = r_mapOverBrightBits(2) - r_overBrightBits(0) = 2 → factor = 4.\n"
-	"    // For vertex-lit surfaces (no lightmap), t1 is bound to the white\n"
-	"    // fallback texture (1,1,1,1) so the same factor applies.\n"
-	"    float4 result   = diffuse * (lightmap * overBrightFactor) * input.color;\n"
+	"    float4 diffuse = g_diffuse.Sample(g_sampler, input.uv);\n"
+	"\n"
+	"    // Alpha test: positive threshold = GE (keep if alpha >= threshold),\n"
+	"    // negative = LT (keep if alpha < |threshold|).\n"
+	"    if (alphaTestThreshold > 0.0)\n"
+	"    {\n"
+	"        clip(diffuse.a - alphaTestThreshold);\n"
+	"    }\n"
+	"    else if (alphaTestThreshold < 0.0)\n"
+	"    {\n"
+	"        clip(-alphaTestThreshold - diffuse.a);\n"
+	"    }\n"
+	"\n"
+	"    float4 result;\n"
+	"    if (isEntity > 0.0)\n"
+	"    {\n"
+	"        // Entity shading: ambient + N.L * directed, then overbright.\n"
+	"        float  nDotL  = saturate(dot(input.normal, entityLightDir.xyz));\n"
+	"        float3 light  = entityAmbient.rgb + nDotL * entityDirected.rgb;\n"
+	"        result = diffuse * float4(saturate(light * overBrightFactor), 1.0) * input.color;\n"
+	"    }\n"
+	"    else\n"
+	"    {\n"
+	"        // World surface: lightmap overbright (matches GL1 R_ColorShiftLightingBytes).\n"
+	"        float4 lightmap = g_lightmap.Sample(g_sampler, input.lm);\n"
+	"        result = diffuse * (lightmap * overBrightFactor) * input.color;\n"
+	"    }\n"
 	"    result = float4(saturate(result.rgb), result.a);\n"
-	"    // Linear depth fog: blend toward fogColor over [fogStart, fogEnd]\n"
+	"\n"
+	"    // Linear depth fog\n"
 	"    if (fogEnabled > 0.0)\n"
 	"    {\n"
 	"        float viewDist  = length(input.worldPos - cameraPos.xyz);\n"
@@ -155,6 +197,20 @@ static const char g_worldShaderSource[] =
 // ---------------------------------------------------------------------------
 
 dx12SceneState_t dx12Scene;
+
+// ---------------------------------------------------------------------------
+// Per-map IB/VB overrun warn counters (Issue #11 fix).
+// File-scope so DX12_SceneInit() can reset them between map loads.
+// (Previously declared static inside SCN_DrawSurface, which caused them to
+// persist across map reloads and suppress warnings on subsequent maps.)
+// ---------------------------------------------------------------------------
+static int g_ibWarnCount = 0;
+static int g_vbWarnCount = 0;
+
+// Current scene time in milliseconds (from refdef_t::time).
+// Set at the start of DX12_RenderScene; used by SCN_DrawSurface for
+// tcMod scroll UV animation and animMap frame selection.
+static int g_sceneTimeMs = 0;
 
 // ---------------------------------------------------------------------------
 // Matrix helpers
@@ -338,38 +394,47 @@ static void SCN_UpdateCB(UINT slot, const dx12SceneConstants_t *cb)
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Bind SRVs for one draw surface and issue a DrawIndexedInstanced call.
+ * @brief Bind SRVs, per-surface root constants, and issue a DrawIndexedInstanced.
+ *
+ * Per-surface variables (uvOffset, alphaTestThreshold, isEntity) are passed as
+ * inline root 32-bit constants (DX12_SCENE_ROOT_PARAM_PERSURF) recorded inline
+ * in the command list.  This is the correct DX12 approach for per-draw-call
+ * variation: unlike CB writes to a shared upload-heap slot, root constants are
+ * embedded in the command stream and are guaranteed correct for each draw call
+ * even under deferred GPU execution.
+ *
+ * Also handles:
+ *   - animMap: selects the current animation frame via g_sceneTimeMs.
+ *   - tcMod scroll: accumulates UV offsets from SCROLL entries.
+ *   - alphaFunc: passes the stage's alphaTestThreshold as a root constant.
  *
  * @param[in] ds      World draw surface descriptor.
- * @param[in] cbGpuVA GPU virtual address of the constant buffer slot.
+ * @param[in] cbGpuVA GPU virtual address of the (per-frame or per-entity) CB slot.
  */
 static void SCN_DrawSurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDRESS cbGpuVA)
 {
-	dx12Material_t *mat     = NULL;
-	dx12Texture_t  *diffTex = NULL;
-	dx12Texture_t  *lmTex   = NULL;
+	dx12Material_t         *mat      = NULL;
+	dx12Texture_t          *diffTex  = NULL;
+	dx12Texture_t          *lmTex    = NULL;
+	qhandle_t               diffHandle = 0;
+	dx12PerSurfConstants_t  psc      = {};
 
 	if (ds->numIndexes <= 0 || ds->numVertices <= 0)
 	{
 		return;
 	}
 
-	// Guard against out-of-range draw calls that would trigger D3D12 debug
-	// warnings COMMAND_LIST_DRAW_INDEX_BUFFER_TOO_SMALL /
-	// COMMAND_LIST_DRAW_VERTEX_BUFFER_TOO_SMALL.
-	// Both checks are unsigned so a negative firstIndex / firstVertex would
-	// wrap to a huge value and be caught correctly.
-	// A rate-limited developer warning (≤5 per map load) is printed so bugs
-	// in the world builder are visible without flooding the console.
+	// Guard against out-of-range draw calls.
+	// g_ibWarnCount / g_vbWarnCount are file-scope and reset by DX12_SceneInit()
+	// (Issue #11 fix: previously declared static inside this function, causing
+	// them to persist across map loads and suppress warnings on subsequent maps.)
 	if (dx12World.numIndexes > 0
 	    && ((UINT)ds->firstIndex >= dx12World.numIndexes
 	        || (UINT)ds->firstIndex + (UINT)ds->numIndexes > dx12World.numIndexes))
 	{
-		static int ibWarnCount = 0;
-
-		if (ibWarnCount < 5)
+		if (g_ibWarnCount < 5)
 		{
-			ibWarnCount++;
+			g_ibWarnCount++;
 			dx12.ri.Printf(PRINT_DEVELOPER,
 			               "SCN_DrawSurface: IB overrun – firstIdx %d numIdx %d totalIdx %u (skipped)\n",
 			               ds->firstIndex, ds->numIndexes, dx12World.numIndexes);
@@ -382,11 +447,9 @@ static void SCN_DrawSurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDRESS 
 	    && ((UINT)ds->firstVertex >= dx12World.numVertices
 	        || (UINT)ds->firstVertex + (UINT)ds->numVertices > dx12World.numVertices))
 	{
-		static int vbWarnCount = 0;
-
-		if (vbWarnCount < 5)
+		if (g_vbWarnCount < 5)
 		{
-			vbWarnCount++;
+			g_vbWarnCount++;
 			dx12.ri.Printf(PRINT_DEVELOPER,
 			               "SCN_DrawSurface: VB overrun – firstVtx %d numVtx %d totalVtx %u (skipped)\n",
 			               ds->firstVertex, ds->numVertices, dx12World.numVertices);
@@ -395,18 +458,54 @@ static void SCN_DrawSurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDRESS 
 		return;
 	}
 
-	// --- Bind constant buffer (root CBV at slot 0) ---
-	dx12.commandList->SetGraphicsRootConstantBufferView(0, cbGpuVA);
-
-	// --- Resolve textures ---
+	// --- Resolve textures; build per-surface root constants ---
 	mat = DX12_GetMaterial(ds->materialHandle);
 
 	if (mat && mat->numStages > 0 && mat->stages[0].active)
 	{
-		diffTex = DX12_GetTexture(mat->stages[0].texHandle);
+		const dx12MaterialStage_t *st = &mat->stages[0];
+		int t;
+
+		// animMap: select the animation frame for the current scene time
+		if (st->animNumFrames > 0 && st->animFps > 0.0f)
+		{
+			int frameIdx = (int)((float)g_sceneTimeMs * st->animFps / 1000.0f);
+
+			frameIdx = ((frameIdx % st->animNumFrames) + st->animNumFrames) % st->animNumFrames;
+			diffHandle = st->animFrames[frameIdx];
+		}
+		else
+		{
+			diffHandle = st->texHandle;
+		}
+
+		// tcMod scroll: accumulate UV offset from SCROLL entries
+		for (t = 0; t < st->numTcMods; t++)
+		{
+			if (st->tcMods[t].type == DX12_TMOD_SCROLL)
+			{
+				float timeSec = (float)g_sceneTimeMs / 1000.0f;
+
+				psc.uvOffsetU += st->tcMods[t].scroll[0] * timeSec;
+				psc.uvOffsetV += st->tcMods[t].scroll[1] * timeSec;
+			}
+		}
+
+		// alphaFunc → inline root constant (correct per draw call)
+		psc.alphaTestThreshold = st->alphaTestThreshold;
 	}
 
-	// --- Bind SRV descriptor table (slot 1) ---
+	// isEntity = 0 for world surfaces; entity draws override this before calling
+	psc.isEntity = 0.0f;
+
+	diffTex = DX12_GetTexture(diffHandle);
+
+	// --- Bind constant buffer and per-surface root constants ---
+	dx12.commandList->SetGraphicsRootConstantBufferView(DX12_SCENE_ROOT_PARAM_CB, cbGpuVA);
+	dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
+	                                                4, &psc, 0);
+
+	// --- Bind SRV descriptor tables ---
 	{
 		D3D12_GPU_DESCRIPTOR_HANDLE srvHandle = {};
 
@@ -416,19 +515,13 @@ static void SCN_DrawSurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDRESS 
 		}
 		else
 		{
-			// Fallback: first SRV in heap (should be a white/default texture)
 			srvHandle = dx12.srvHeap->GetGPUDescriptorHandleForHeapStart();
 		}
 
-		// Bind diffuse (t0) via descriptor table root param 1
-		dx12.commandList->SetGraphicsRootDescriptorTable(1, srvHandle);
+		dx12.commandList->SetGraphicsRootDescriptorTable(DX12_SCENE_ROOT_PARAM_DIFFUSE,
+		                                                 srvHandle);
 
-		// Bind lightmap (t1) from the correct BSP lightmap slot.
-		// Falls back to the white default texture (heap slot 0) for vertex-lit
-		// surfaces (lightmapIndex == -1).  Using the diffuse texture as the
-		// lightmap fallback was incorrect: it caused vertex-lit surfaces to
-		// render as  diffuse² × overBrightFactor  instead of
-		// diffuse × overBrightFactor × vertexColor.
+		// Lightmap: BSP slot or white fallback for vertex-lit surfaces
 		D3D12_GPU_DESCRIPTOR_HANDLE lmHandle = dx12.srvHeap->GetGPUDescriptorHandleForHeapStart();
 
 		if (ds->lightmapIndex >= 0 && ds->lightmapIndex < dx12World.numLightmaps)
@@ -442,20 +535,18 @@ static void SCN_DrawSurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDRESS 
 			}
 		}
 
-		dx12.commandList->SetGraphicsRootDescriptorTable(2, lmHandle);
+		dx12.commandList->SetGraphicsRootDescriptorTable(DX12_SCENE_ROOT_PARAM_LIGHTMAP,
+		                                                 lmHandle);
 	}
 
 	// --- Issue draw call ---
-	// Indices in the world index buffer are absolute (the loader rebases them
-	// to the global vertex array), so BaseVertexLocation must be 0.
-	// Using ds->firstVertex here would double-add the per-surface base offset
-	// and cause "vertex buffer too small" / "index buffer too small" errors.
+	// Indices are absolute (rebased in dx12_world.cpp loader), so BaseVertexLocation = 0.
 	dx12.commandList->DrawIndexedInstanced(
-		(UINT)ds->numIndexes,   // IndexCountPerInstance
-		1,                      // InstanceCount
-		(UINT)ds->firstIndex,   // StartIndexLocation
-		0,                      // BaseVertexLocation (indices are already absolute)
-		0                       // StartInstanceLocation
+		(UINT)ds->numIndexes,
+		1,
+		(UINT)ds->firstIndex,
+		0,
+		0
 		);
 }
 
@@ -480,11 +571,18 @@ qboolean DX12_SceneInit(void)
 
 	Com_Memset(&dx12Scene, 0, sizeof(dx12Scene));
 
+	// Reset per-map warn counters (Issue #11 fix)
+	g_ibWarnCount = 0;
+	g_vbWarnCount = 0;
+	g_sceneTimeMs = 0;
+
 	// ----------------------------------------------------------------
 	// Root Signature for 3D rendering
-	//   Param 0: Root CBV at b0  (VS + PS visible)
-	//   Param 1: Descriptor table – 1 SRV at t0 (diffuse)
-	//   Param 2: Descriptor table – 1 SRV at t1 (lightmap)
+	//   Param 0 (DX12_SCENE_ROOT_PARAM_CB):       Root CBV at b0  (VS + PS)
+	//   Param 1 (DX12_SCENE_ROOT_PARAM_DIFFUSE):  Descriptor table – 1 SRV at t0
+	//   Param 2 (DX12_SCENE_ROOT_PARAM_LIGHTMAP): Descriptor table – 1 SRV at t1
+	//   Param 3 (DX12_SCENE_ROOT_PARAM_PERSURF):  32-bit constants at b1 (4 DWORDs)
+	//     uvOffsetU, uvOffsetV, alphaTestThreshold, isEntity
 	//   Static sampler at s0: linear-wrap
 	// ----------------------------------------------------------------
 	{
@@ -502,25 +600,34 @@ qboolean DX12_SceneInit(void)
 		srvRange1.RegisterSpace                     = 0;
 		srvRange1.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
-		D3D12_ROOT_PARAMETER params[3] = {};
+		D3D12_ROOT_PARAMETER params[4] = {};
 
-		// Param 0: root CBV
-		params[0].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_CBV;
-		params[0].Descriptor.ShaderRegister = 0; // b0
-		params[0].Descriptor.RegisterSpace  = 0;
-		params[0].ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
+		// Param 0: root CBV (b0) – scene + entity constants
+		params[DX12_SCENE_ROOT_PARAM_CB].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_CBV;
+		params[DX12_SCENE_ROOT_PARAM_CB].Descriptor.ShaderRegister = 0; // b0
+		params[DX12_SCENE_ROOT_PARAM_CB].Descriptor.RegisterSpace  = 0;
+		params[DX12_SCENE_ROOT_PARAM_CB].ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
 
-		// Param 1: diffuse SRV table
-		params[1].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-		params[1].DescriptorTable.NumDescriptorRanges = 1;
-		params[1].DescriptorTable.pDescriptorRanges   = &srvRange0;
-		params[1].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_PIXEL;
+		// Param 1: diffuse SRV table (t0)
+		params[DX12_SCENE_ROOT_PARAM_DIFFUSE].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+		params[DX12_SCENE_ROOT_PARAM_DIFFUSE].DescriptorTable.NumDescriptorRanges = 1;
+		params[DX12_SCENE_ROOT_PARAM_DIFFUSE].DescriptorTable.pDescriptorRanges   = &srvRange0;
+		params[DX12_SCENE_ROOT_PARAM_DIFFUSE].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_PIXEL;
 
-		// Param 2: lightmap SRV table
-		params[2].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-		params[2].DescriptorTable.NumDescriptorRanges = 1;
-		params[2].DescriptorTable.pDescriptorRanges   = &srvRange1;
-		params[2].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_PIXEL;
+		// Param 2: lightmap SRV table (t1)
+		params[DX12_SCENE_ROOT_PARAM_LIGHTMAP].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+		params[DX12_SCENE_ROOT_PARAM_LIGHTMAP].DescriptorTable.NumDescriptorRanges = 1;
+		params[DX12_SCENE_ROOT_PARAM_LIGHTMAP].DescriptorTable.pDescriptorRanges   = &srvRange1;
+		params[DX12_SCENE_ROOT_PARAM_LIGHTMAP].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_PIXEL;
+
+		// Param 3: per-surface inline root constants (b1) – 4 DWORDs
+		// uvOffsetU, uvOffsetV, alphaTestThreshold, isEntity
+		// Recorded inline in the command list – correct per draw call.
+		params[DX12_SCENE_ROOT_PARAM_PERSURF].ParameterType                         = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+		params[DX12_SCENE_ROOT_PARAM_PERSURF].Constants.ShaderRegister              = 1; // b1
+		params[DX12_SCENE_ROOT_PARAM_PERSURF].Constants.RegisterSpace               = 0;
+		params[DX12_SCENE_ROOT_PARAM_PERSURF].Constants.Num32BitValues              = 4;
+		params[DX12_SCENE_ROOT_PARAM_PERSURF].ShaderVisibility                      = D3D12_SHADER_VISIBILITY_ALL;
 
 		D3D12_STATIC_SAMPLER_DESC sampler = {};
 		sampler.Filter           = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -538,7 +645,7 @@ qboolean DX12_SceneInit(void)
 		sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
 		D3D12_ROOT_SIGNATURE_DESC rsd = {};
-		rsd.NumParameters     = 3;
+		rsd.NumParameters     = 4;
 		rsd.pParameters       = params;
 		rsd.NumStaticSamplers = 1;
 		rsd.pStaticSamplers   = &sampler;
@@ -1127,12 +1234,20 @@ void DX12_AddScenePoly(qhandle_t hShader, int numVerts, const polyVert_t *verts)
  * @brief DX12_RenderScene – render a full 3D scene from a refdef_t.
  * @param[in] fd  Frame parameters: view origin/axis, FOV, and entity list.
  *
- * Render order: sky → opaque world → fog-tagged → entities → translucent.
+ * Render order: sky → opaque world → fog-tagged → entities (sorted back-to-front)
+ *               → translucent world surfaces.
  *
- * Each entity gets its own constant-buffer slot so that all recorded draw
- * commands reference a unique memory location.  Without per-entity slots the
- * GPU would see only the last value written to the shared slot because the
- * entire command list executes AFTER all CPU-side CB writes are done.
+ * Improvements over the original pass:
+ *   - Issue #11 fix: ibWarnCount/vbWarnCount are file-scope and reset on world load.
+ *   - Issue #15 fix: entities sorted by decreasing squared distance (painter's
+ *     algorithm for translucent entities; depth test handles opaque ones).
+ *   - Issue #10 fix: entity ambient and directed light sampled from the BSP light
+ *     grid and passed to the per-entity CB; the HLSL uses them when isEntity=1.
+ *   - Issue #6  fix: dynamic lights contribute to the entity ambient light.
+ *   - Issue #3  fix: animMap frame and tcMod scroll UV offset passed as per-surface
+ *     root constants (DX12_SCENE_ROOT_PARAM_PERSURF) and applied in the shader.
+ *   - Issue #4  fix: alphaTestThreshold passed as per-surface root constant and
+ *     used in the PS to clip() fragments below the cutoff.
  */
 void DX12_RenderScene(const refdef_t *fd)
 {
@@ -1152,7 +1267,12 @@ void DX12_RenderScene(const refdef_t *fd)
 	}
 
 	// ----------------------------------------------------------------
-	// 0.  Tick global fog transition (matches GL tr_main.c ~line 622)
+	// 0a. Store scene time for animMap / tcMod scroll animation.
+	// ----------------------------------------------------------------
+	g_sceneTimeMs = fd->time;
+
+	// ----------------------------------------------------------------
+	// 0b. Tick global fog transition (matches GL tr_main.c ~line 622)
 	// ----------------------------------------------------------------
 	if (dx12World.loaded && dx12World.globalFogTransEndTime > 0)
 	{
@@ -1259,7 +1379,85 @@ void DX12_RenderScene(const refdef_t *fd)
 		cb.overBrightFactor = (float)(1 << shift);
 	}
 
+	// World CB has no entity light (entity light fields are 0 for world surfaces)
+	cb.entityAmbient[0]  = 0.0f; cb.entityAmbient[1]  = 0.0f;
+	cb.entityAmbient[2]  = 0.0f; cb.entityAmbient[3]  = 0.0f;
+	cb.entityDirected[0] = 0.0f; cb.entityDirected[1] = 0.0f;
+	cb.entityDirected[2] = 0.0f; cb.entityDirected[3] = 0.0f;
+	cb.entityLightDir[0] = 0.0f; cb.entityLightDir[1] = 0.0f;
+	cb.entityLightDir[2] = 1.0f; cb.entityLightDir[3] = 0.0f;
+
 	SCN_UpdateCB(cbBaseSlot, &cb);
+
+	// ----------------------------------------------------------------
+	// 2b. Pre-compute per-entity light grid samples and distance sort
+	//     (Issues #10, #15)
+	//
+	//     We sort entity indices by decreasing squared distance from the
+	//     camera.  This is the painter's-algorithm order for translucent
+	//     entities; depth test ensures opaque entities are unaffected.
+	//
+	//     Light grid sampling (DX12_SampleLightGrid) is done here so
+	//     the sampled values are available when building the entity CB.
+	//     Dynamic lights (dlights) contribute to entity ambient light
+	//     with a simple 1/r² attenuation (Issue #6 partial fix).
+	// ----------------------------------------------------------------
+	{
+		int i, j;
+
+		// Build entity distance array for sorting
+		for (i = 0; i < dx12Scene.numEntities; i++)
+		{
+			dx12SceneEntity_t *ent = &dx12Scene.entities[i];
+			float dx, dy, dz;
+
+			dx = ent->origin[0] - fd->vieworg[0];
+			dy = ent->origin[1] - fd->vieworg[1];
+			dz = ent->origin[2] - fd->vieworg[2];
+			ent->distSq = dx * dx + dy * dy + dz * dz;
+
+			// Sample light grid for this entity's world position
+			DX12_SampleLightGrid(ent->origin, ent->ambientLight,
+			                     ent->directedLight, ent->lightDir);
+
+			// Apply dynamic light contributions to entity ambient (Issue #6)
+			for (j = 0; j < dx12Scene.numDLights; j++)
+			{
+				const dx12DLight_t *dl = &dx12Scene.dlights[j];
+				float dlDx, dlDy, dlDz, distSqDl, rSq, atten;
+
+				dlDx    = ent->origin[0] - dl->origin[0];
+				dlDy    = ent->origin[1] - dl->origin[1];
+				dlDz    = ent->origin[2] - dl->origin[2];
+				distSqDl = dlDx * dlDx + dlDy * dlDy + dlDz * dlDz;
+				rSq      = dl->radius * dl->radius;
+
+				if (distSqDl >= rSq)
+				{
+					continue; // outside light radius
+				}
+
+				atten = (1.0f - distSqDl / rSq) * dl->intensity;
+				ent->ambientLight[0] += dl->color[0] * atten;
+				ent->ambientLight[1] += dl->color[1] * atten;
+				ent->ambientLight[2] += dl->color[2] * atten;
+			}
+		}
+
+		// Insertion sort: entities ordered by decreasing distSq (furthest first)
+		for (i = 1; i < dx12Scene.numEntities; i++)
+		{
+			dx12SceneEntity_t tmp = dx12Scene.entities[i];
+
+			j = i - 1;
+			while (j >= 0 && dx12Scene.entities[j].distSq < tmp.distSq)
+			{
+				dx12Scene.entities[j + 1] = dx12Scene.entities[j];
+				j--;
+			}
+			dx12Scene.entities[j + 1] = tmp;
+		}
+	}
 
 	// ----------------------------------------------------------------
 	// 3.  Switch to the 3D pipeline
@@ -1283,6 +1481,14 @@ void DX12_RenderScene(const refdef_t *fd)
 	dx12.commandList->RSSetViewports(1, &dx12.viewport);
 	dx12.commandList->RSSetScissorRects(1, &dx12.scissorRect);
 
+	// Initialise per-surface root constants to safe defaults (world mode)
+	{
+		dx12PerSurfConstants_t pscDefault = {};
+
+		dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
+		                                                4, &pscDefault, 0);
+	}
+
 	// ----------------------------------------------------------------
 	// 4.  Bind world vertex + index buffers (if world is loaded)
 	// ----------------------------------------------------------------
@@ -1305,12 +1511,6 @@ void DX12_RenderScene(const refdef_t *fd)
 
 		// ----------------------------------------------------------------
 		// 5a. Sky surfaces
-		//
-		// Sky shaders in ET use 'skyParms' and typically have no diffuse
-		// stage.  Rendering them with the world PSO falls back to the white
-		// texture for both diffuse and lightmap channels, producing a large
-		// solid-white blob wherever the sky is visible (open sky areas,
-		// outdoor maps).
 		//
 		// TODO: Implement proper skybox / sky-portal rendering.  Until then
 		// sky surfaces are intentionally skipped so the background clear
@@ -1354,9 +1554,10 @@ void DX12_RenderScene(const refdef_t *fd)
 	}
 
 	// ----------------------------------------------------------------
-	// 6.  Entities
+	// 6.  Entities (sorted back-to-front by distance; Issue #15 fix)
 	//     Each entity uses its own dedicated CB slot so all recorded
 	//     draw commands reference unique CB memory.
+	//     Entity ambient + directed light from light grid (Issue #10).
 	// ----------------------------------------------------------------
 	{
 		int i;
@@ -1365,6 +1566,7 @@ void DX12_RenderScene(const refdef_t *fd)
 		{
 			dx12SceneEntity_t    *ent = &dx12Scene.entities[i];
 			dx12SceneConstants_t  entCB;
+			dx12PerSurfConstants_t entPsc = {};
 			UINT                  entSlot;
 			D3D12_GPU_VIRTUAL_ADDRESS entCBGpuVA;
 
@@ -1375,7 +1577,7 @@ void DX12_RenderScene(const refdef_t *fd)
 			}
 
 			// Each entity gets its own unique slot within this frame
-			entSlot   = cbBaseSlot + 1u + (UINT)i;
+			entSlot    = cbBaseSlot + 1u + (UINT)i;
 			entCBGpuVA = dx12Scene.constantBuffer->GetGPUVirtualAddress()
 			             + (D3D12_GPU_VIRTUAL_ADDRESS)entSlot * dx12Scene.cbSlotSize;
 
@@ -1401,28 +1603,58 @@ void DX12_RenderScene(const refdef_t *fd)
 			entCB.cameraPos[2] = cb.cameraPos[2];
 			entCB.cameraPos[3] = cb.cameraPos[3];
 
-			// Copy fog parameters from the world CB so entities are also fogged
+			// Copy fog parameters so entities are also fogged
 			entCB.fogColor[0] = cb.fogColor[0];
 			entCB.fogColor[1] = cb.fogColor[1];
 			entCB.fogColor[2] = cb.fogColor[2];
 			entCB.fogColor[3] = cb.fogColor[3];
-			entCB.fogStart          = cb.fogStart;
-			entCB.fogEnd            = cb.fogEnd;
-			entCB.fogEnabled        = cb.fogEnabled;
-			entCB.overBrightFactor  = cb.overBrightFactor;
+			entCB.fogStart         = cb.fogStart;
+			entCB.fogEnd           = cb.fogEnd;
+			entCB.fogEnabled       = cb.fogEnabled;
+			entCB.overBrightFactor = cb.overBrightFactor;
+
+			// Entity light from grid (Issue #10 fix)
+			entCB.entityAmbient[0]  = ent->ambientLight[0];
+			entCB.entityAmbient[1]  = ent->ambientLight[1];
+			entCB.entityAmbient[2]  = ent->ambientLight[2];
+			entCB.entityAmbient[3]  = 0.0f;
+			entCB.entityDirected[0] = ent->directedLight[0];
+			entCB.entityDirected[1] = ent->directedLight[1];
+			entCB.entityDirected[2] = ent->directedLight[2];
+			entCB.entityDirected[3] = 0.0f;
+			entCB.entityLightDir[0] = ent->lightDir[0];
+			entCB.entityLightDir[1] = ent->lightDir[1];
+			entCB.entityLightDir[2] = ent->lightDir[2];
+			entCB.entityLightDir[3] = 0.0f;
 
 			// Write to the entity's dedicated slot
 			SCN_UpdateCB(entSlot, &entCB);
 
-			// Draw the entity's MD3 surfaces (no-op if model has no geometry)
+			// Per-surface root constants for entity: isEntity=1, no UV offset,
+			// no alpha test (entity models rarely use alphaFunc)
+			entPsc.uvOffsetU          = 0.0f;
+			entPsc.uvOffsetV          = 0.0f;
+			entPsc.alphaTestThreshold = 0.0f;
+			entPsc.isEntity           = 1.0f;
+
+			dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
+			                                                4, &entPsc, 0);
+
+			// Draw the entity's model surfaces
 			DX12_DrawEntity(ent, entCBGpuVA);
+		}
+
+		// Reset per-surface root constants back to world defaults after entity pass
+		{
+			dx12PerSurfConstants_t pscWorld = {};
+
+			dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
+			                                                4, &pscWorld, 0);
 		}
 	}
 
 	// ----------------------------------------------------------------
 	// 7a. Persistent decals – re-submitted every frame with time-based fade.
-	//     Expired decals are skipped; live decals go through DX12_AddScenePoly
-	//     so they land in the poly vertex buffer drawn below.
 	// ----------------------------------------------------------------
 	{
 		int i, p;
@@ -1499,9 +1731,10 @@ void DX12_RenderScene(const refdef_t *fd)
 
 		for (b = 0; b < dx12Scene.numPolyBatches; b++)
 		{
-			const dx12ScenePolyBatch_t *batch = &dx12Scene.polyBatches[b];
+			const dx12ScenePolyBatch_t *batch   = &dx12Scene.polyBatches[b];
 			dx12Texture_t              *polyTex;
 			D3D12_GPU_DESCRIPTOR_HANDLE srvPoly;
+			dx12PerSurfConstants_t      polyPsc = {};
 
 			if (batch->numVerts <= 0)
 			{
@@ -1519,9 +1752,14 @@ void DX12_RenderScene(const refdef_t *fd)
 				srvPoly = dx12.srvHeap->GetGPUDescriptorHandleForHeapStart();
 			}
 
-			dx12.commandList->SetGraphicsRootConstantBufferView(0, cbBaseGpuVA);
-			dx12.commandList->SetGraphicsRootDescriptorTable(1, srvPoly);
-			dx12.commandList->SetGraphicsRootDescriptorTable(2, srvPoly);
+			dx12.commandList->SetGraphicsRootConstantBufferView(DX12_SCENE_ROOT_PARAM_CB,
+			                                                    cbBaseGpuVA);
+			dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
+			                                                4, &polyPsc, 0);
+			dx12.commandList->SetGraphicsRootDescriptorTable(DX12_SCENE_ROOT_PARAM_DIFFUSE,
+			                                                 srvPoly);
+			dx12.commandList->SetGraphicsRootDescriptorTable(DX12_SCENE_ROOT_PARAM_LIGHTMAP,
+			                                                 srvPoly);
 
 			dx12.commandList->DrawInstanced((UINT)batch->numVerts, 1,
 			                                (UINT)batch->firstVert, 0);
@@ -1547,14 +1785,8 @@ void DX12_RenderScene(const refdef_t *fd)
 	}
 
 	// ----------------------------------------------------------------
-	// 7b. Translucent / alpha world surfaces (back-to-front order)
+	// 7c. Translucent / alpha world surfaces (back-to-front order)
 	//     Switch to the translucent PSO (alpha-blend, no depth-write).
-	//     The draw list is already sorted by the loader, so iterating
-	//     in reverse gives correct painter's-algorithm blending.
-	//
-	//     Entities (section 6) and polys (section 7a) may have rebound
-	//     their own vertex/index buffers, so we must explicitly rebind
-	//     the world VB/IB here before issuing any world draw calls.
 	// ----------------------------------------------------------------
 	if (dx12World.loaded && dx12World.vertexBuffer && dx12World.indexBuffer
 	    && dx12World.numVertices > 0 && dx12World.numIndexes > 0)

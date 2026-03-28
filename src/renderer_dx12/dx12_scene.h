@@ -140,29 +140,62 @@ typedef struct
  * @struct dx12SceneConstants_t
  * @brief Per-frame / per-draw constant buffer uploaded to the GPU.
  *
- * Layout (256-byte aligned as required by D3D12 CBV):
- *   viewProj         – combined view * projection matrix (row-major float4x4)
- *   modelMatrix      – per-object model-to-world transform (row-major float4x4)
- *   cameraPos        – world-space camera origin (xyz) + padding (w)
- *   fogColor         – fog RGBA color (alpha unused)
- *   fogStart         – linear fog start distance (0 = fog disabled)
- *   fogEnd           – linear fog end distance
- *   fogEnabled       – non-zero when fog should be applied
- *   overBrightFactor – lightmap/vertex-colour brightness multiplier;
- *                      matches GL's 2^(r_mapOverBrightBits-r_overBrightBits).
- *                      Default: 4.0 (r_mapOverBrightBits=2, r_overBrightBits=0)
+ * Layout (256-byte aligned as required by D3D12 CBV, 224 bytes used):
+ *   viewProj              – combined view * projection matrix (row-major float4x4)
+ *   modelMatrix           – per-object model-to-world transform (row-major float4x4)
+ *   cameraPos             – world-space camera origin (xyz) + padding (w)
+ *   fogColor              – fog RGBA color (alpha unused)
+ *   fogStart              – linear fog start distance (0 = fog disabled)
+ *   fogEnd                – linear fog end distance
+ *   fogEnabled            – non-zero when fog should be applied
+ *   overBrightFactor      – lightmap/vertex-colour brightness multiplier;
+ *                           matches GL's 2^(r_mapOverBrightBits-r_overBrightBits).
+ *                           Default: 4.0 (r_mapOverBrightBits=2, r_overBrightBits=0)
+ *   entityAmbient[4]      – entity ambient light colour from light grid (rgb, w=0)
+ *   entityDirected[4]     – entity directed light colour from light grid (rgb, w=0)
+ *   entityLightDir[4]     – entity directed light direction (xyz, w=0)
+ *
+ * Per-draw-surface varying values (uvOffset, alphaTestThreshold, isEntity) are
+ * passed via root 32-bit constants at b1 (DX12_SCENE_ROOT_PARAM_PERSURF) so
+ * that they are recorded inline in the command list and are guaranteed to be
+ * correct for each individual draw call, regardless of deferred GPU execution.
  */
 typedef struct
 {
-	float viewProj[4][4];    ///< View * Projection matrix (row-major)
-	float modelMatrix[4][4]; ///< Model matrix (row-major); identity for world
-	float cameraPos[4];      ///< World-space camera position (w unused)
-	float fogColor[4];       ///< Linear fog colour (rgb) + unused alpha
-	float fogStart;          ///< Linear fog start distance (camera units)
-	float fogEnd;            ///< Linear fog end distance (camera units)
-	float fogEnabled;        ///< 1.0 = fog active, 0.0 = no fog
-	float overBrightFactor;  ///< Lightmap/vertex-colour overbright scale (default 4.0)
+	float viewProj[4][4];      ///< View * Projection matrix (row-major)
+	float modelMatrix[4][4];   ///< Model matrix (row-major); identity for world
+	float cameraPos[4];        ///< World-space camera position (w unused)
+	float fogColor[4];         ///< Linear fog colour (rgb) + unused alpha
+	float fogStart;            ///< Linear fog start distance (camera units)
+	float fogEnd;              ///< Linear fog end distance (camera units)
+	float fogEnabled;          ///< 1.0 = fog active, 0.0 = no fog
+	float overBrightFactor;    ///< Lightmap/vertex-colour overbright scale (default 4.0)
+	float entityAmbient[4];    ///< Entity ambient light from light grid (rgb, w unused)
+	float entityDirected[4];   ///< Entity directed light from light grid (rgb, w unused)
+	float entityLightDir[4];   ///< Entity directed light direction (xyz, w unused)
 } dx12SceneConstants_t;
+
+/**
+ * @struct dx12PerSurfConstants_t
+ * @brief Inline root constants (4×DWORD) for per-draw-surface variation.
+ *
+ * Passed via SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF, …)
+ * so the values are embedded directly in the command list and are correct for
+ * every individual draw call even with deferred GPU execution.
+ */
+typedef struct
+{
+	float uvOffsetU;           ///< Diffuse UV scroll offset X (tcMod scroll)
+	float uvOffsetV;           ///< Diffuse UV scroll offset Y (tcMod scroll)
+	float alphaTestThreshold;  ///< PS clip threshold (0 = off, +0.5 = GE128, -0.5 = LT128)
+	float isEntity;            ///< 1.0 = use entity ambient/directed light, 0.0 = use lightmap
+} dx12PerSurfConstants_t;
+
+/** Root signature parameter indices for the 3D pipeline. */
+#define DX12_SCENE_ROOT_PARAM_CB        0  ///< Root CBV at b0 (dx12SceneConstants_t)
+#define DX12_SCENE_ROOT_PARAM_DIFFUSE   1  ///< Descriptor table t0 (diffuse SRV)
+#define DX12_SCENE_ROOT_PARAM_LIGHTMAP  2  ///< Descriptor table t1 (lightmap SRV)
+#define DX12_SCENE_ROOT_PARAM_PERSURF   3  ///< Root constants b1 (dx12PerSurfConstants_t)
 
 // ---------------------------------------------------------------------------
 // Per-entity scene entry
@@ -174,9 +207,14 @@ typedef struct
  */
 typedef struct
 {
-	vec3_t  origin;   ///< World-space origin
-	vec3_t  axis[3];  ///< Rotation axes: [0]=forward [1]=left [2]=up
-	qhandle_t hModel; ///< Model handle (0 = no model)
+	vec3_t    origin;          ///< World-space origin
+	vec3_t    axis[3];         ///< Rotation axes: [0]=forward [1]=left [2]=up
+	qhandle_t hModel;          ///< Model handle (0 = no model)
+	// Light grid sample – filled by DX12_RenderScene before the entity draw loop
+	vec3_t    ambientLight;    ///< Trilinearly sampled ambient light from light grid
+	vec3_t    directedLight;   ///< Trilinearly sampled directed light from light grid
+	vec3_t    lightDir;        ///< Normalised direction of directed light
+	float     distSq;          ///< Squared distance from camera (for sort)
 } dx12SceneEntity_t;
 
 // ---------------------------------------------------------------------------

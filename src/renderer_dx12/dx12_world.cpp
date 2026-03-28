@@ -63,13 +63,160 @@ extern "C" {
 
 #include <string.h>  // memcpy, memset
 #include <stdlib.h>  // malloc, free, qsort
-#include <math.h>    // sqrtf for patch tessellation
+#include <math.h>    // sqrtf for patch tessellation, cosf, sinf
 
 // ---------------------------------------------------------------------------
 // Global world state
 // ---------------------------------------------------------------------------
 
 dx12World_t dx12World;
+
+// ---------------------------------------------------------------------------
+// DX12_SampleLightGrid
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief DX12_SampleLightGrid
+ *
+ * Trilinearly interpolates the BSP light grid to return the ambient and
+ * directed light colours and the directed light direction at @p point.
+ * Mirrors RE_DX12_LightForPoint / R_LightPoint from the GL renderer.
+ *
+ * @return qtrue on success; qfalse if the grid is absent or point is in wall.
+ */
+qboolean DX12_SampleLightGrid(const vec3_t point, vec3_t ambientLight,
+                              vec3_t directedLight, vec3_t lightDir)
+{
+	vec3_t  lightOrigin;
+	int     pos[3];
+	int     i, j;
+	byte   *gridData;
+	float   frac[3];
+	int     gridStep[3];
+	vec3_t  direction;
+	float   totalFactor;
+	float   factor;
+	byte   *data;
+	float   v;
+	cvar_t *r_ambientScale;
+	cvar_t *r_directedScale;
+
+	if (!dx12World.lightGridData || !dx12World.loaded)
+	{
+		VectorSet(ambientLight, 0.0f, 0.0f, 0.0f);
+		VectorSet(directedLight, 0.0f, 0.0f, 0.0f);
+		VectorSet(lightDir, 0.0f, 0.0f, 1.0f);
+		return qfalse;
+	}
+
+	VectorCopy(point, lightOrigin);
+	VectorSubtract(lightOrigin, dx12World.lightGridOrigin, lightOrigin);
+
+	for (i = 0; i < 3; i++)
+	{
+		v       = lightOrigin[i] * dx12World.lightGridInverseSize[i];
+		pos[i]  = (int)floorf(v);
+		frac[i] = v - (float)pos[i];
+		if (pos[i] < 0)
+		{
+			pos[i] = 0;
+		}
+		else if (pos[i] > dx12World.lightGridBounds[i] - 1)
+		{
+			pos[i] = dx12World.lightGridBounds[i] - 1;
+		}
+	}
+
+	VectorClear(ambientLight);
+	VectorClear(directedLight);
+	VectorClear(direction);
+
+	// Trilinear interpolation over 8 surrounding cells.
+	// Each cell is 8 bytes: [0..2] ambient RGB, [3..5] directed RGB,
+	// [6] lng byte, [7] lat byte (same layout as GL renderer).
+	gridStep[0] = 8;
+	gridStep[1] = 8 * dx12World.lightGridBounds[0];
+	gridStep[2] = 8 * dx12World.lightGridBounds[0] * dx12World.lightGridBounds[1];
+	gridData    = dx12World.lightGridData
+	              + pos[0] * gridStep[0]
+	              + pos[1] * gridStep[1]
+	              + pos[2] * gridStep[2];
+
+	totalFactor = 0.0f;
+	for (i = 0; i < 8; i++)
+	{
+		float  lat_rad, lng_rad;
+		vec3_t normal;
+		int    lat_byte, lng_byte;
+
+		factor = 1.0f;
+		data   = gridData;
+		for (j = 0; j < 3; j++)
+		{
+			if (i & (1 << j))
+			{
+				factor *= frac[j];
+				data   += gridStep[j];
+			}
+			else
+			{
+				factor *= (1.0f - frac[j]);
+			}
+		}
+
+		if (!(data[0] + data[1] + data[2]))
+		{
+			continue;   // skip samples inside walls
+		}
+		totalFactor += factor;
+
+		ambientLight[0] += factor * data[0];
+		ambientLight[1] += factor * data[1];
+		ambientLight[2] += factor * data[2];
+
+		directedLight[0] += factor * data[3];
+		directedLight[1] += factor * data[4];
+		directedLight[2] += factor * data[5];
+
+		lng_byte = data[6];
+		lat_byte = data[7];
+		lat_rad  = ((float)lat_byte * (2.0f * M_PI)) / 256.0f;
+		lng_rad  = ((float)lng_byte * (2.0f * M_PI)) / 256.0f;
+
+		normal[0] = cosf(lat_rad) * sinf(lng_rad);
+		normal[1] = sinf(lat_rad) * sinf(lng_rad);
+		normal[2] = cosf(lng_rad);
+
+		VectorMA(direction, factor, normal, direction);
+	}
+
+	if (totalFactor > 0.0f && totalFactor < 0.99f)
+	{
+		totalFactor = 1.0f / totalFactor;
+		VectorScale(ambientLight, totalFactor, ambientLight);
+		VectorScale(directedLight, totalFactor, directedLight);
+	}
+
+	// Normalise to [0,1] range (grid stores bytes 0-255)
+	VectorScale(ambientLight, 1.0f / 255.0f, ambientLight);
+	VectorScale(directedLight, 1.0f / 255.0f, directedLight);
+
+	r_ambientScale  = dx12.ri.Cvar_Get("r_ambientScale", "0.5", CVAR_CHEAT);
+	r_directedScale = dx12.ri.Cvar_Get("r_directedScale", "1", CVAR_CHEAT);
+
+	if (r_ambientScale)
+	{
+		VectorScale(ambientLight, r_ambientScale->value, ambientLight);
+	}
+	if (r_directedScale)
+	{
+		VectorScale(directedLight, r_directedScale->value, directedLight);
+	}
+
+	VectorNormalize2(direction, lightDir);
+
+	return (totalFactor > 0.0f) ? qtrue : qfalse;
+}
 
 // ---------------------------------------------------------------------------
 // Internal helpers

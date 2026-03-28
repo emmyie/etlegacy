@@ -283,5 +283,24 @@ void DX12_ShutdownWorld(void);
  */
 qboolean DX12_inPVS(const vec3_t p1, const vec3_t p2);
 
+/**
+ * @brief DX12_SampleLightGrid
+ *
+ * Trilinearly sample the BSP light grid at @p point and return the ambient
+ * colour, directed (sun) colour, and directed light direction.  Mirrors the
+ * logic in the GL renderer's R_LightPoint / R_LightForPoint.
+ *
+ * Returns qtrue if valid light data was found, qfalse when the grid is absent
+ * or the point falls in an unlit cell.  Outputs are zeroed on failure.
+ *
+ * @param[in]  point          World-space sample position.
+ * @param[out] ambientLight   Ambient RGB colour [0,255] normalised to [0,1].
+ * @param[out] directedLight  Directed (sun) RGB colour [0,255] normalised to [0,1].
+ * @param[out] lightDir       Normalised direction of the directed light.
+ * @return qtrue on success.
+ */
+qboolean DX12_SampleLightGrid(const vec3_t point, vec3_t ambientLight,
+                              vec3_t directedLight, vec3_t lightDir);
+
 #endif // _WIN32
 #endif // DX12_WORLD_H
