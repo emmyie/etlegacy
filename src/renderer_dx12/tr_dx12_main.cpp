@@ -18,8 +18,58 @@
 #pragma comment(lib, "d3dcompiler.lib")
 
 #include <string.h>  // memcpy
+#include "tr_common.h"
 
 dx12Globals_t dx12;
+
+/* Minimal image buffer helpers (copied from the GL renderer). */
+#define R_IMAGE_BUFFER_SIZE (512 * 512 * 4)
+
+int  imageBufferSize[BUFFER_MAX_TYPES] = { 0, 0, 0 };
+void *imageBufferPtr[BUFFER_MAX_TYPES] = { NULL, NULL, NULL };
+
+extern "C" void *R_GetImageBuffer(int size, bufferMemType_t bufferType, const char *filename)
+{
+	if (imageBufferSize[bufferType] < R_IMAGE_BUFFER_SIZE)
+	{
+		imageBufferSize[bufferType] = R_IMAGE_BUFFER_SIZE;
+		imageBufferPtr[bufferType]  = Com_Allocate(imageBufferSize[bufferType]);
+	}
+	if (size > imageBufferSize[bufferType])
+	{
+		if (imageBufferPtr[bufferType])
+		{
+			Com_Dealloc(imageBufferPtr[bufferType]);
+		}
+
+		imageBufferSize[bufferType] = size;
+		imageBufferPtr[bufferType]  = Com_Allocate(imageBufferSize[bufferType]);
+	}
+
+	if (!imageBufferPtr[bufferType])
+	{
+		Ren_Drop("R_GetImageBuffer: unable to allocate buffer for image %s with size: %i\n", filename, size);
+	}
+
+	return imageBufferPtr[bufferType];
+}
+
+extern "C" void R_FreeImageBuffer(void)
+{
+	int bufferType;
+
+	for (bufferType = 0; bufferType < BUFFER_MAX_TYPES; bufferType++)
+	{
+		if (!imageBufferPtr[bufferType])
+		{
+			continue;
+		}
+		Com_Dealloc(imageBufferPtr[bufferType]);
+
+		imageBufferSize[bufferType] = 0;
+		imageBufferPtr[bufferType]  = NULL;
+	}
+}
 
 // ---------------------------------------------------------------------------
 // Dynamic shader list  (populated by RE_DX12_LoadDynamicShader)

@@ -40,6 +40,10 @@
 #include "iqm.h"
 #include "tr_common_cvars.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 extern refimport_t ri;
 
 // image buffer
@@ -52,6 +56,10 @@ typedef enum
 } bufferMemType_t;
 void *R_GetImageBuffer(int size, bufferMemType_t bufferType, const char *filename);
 void R_FreeImageBuffer(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 /*
 ====================================================================

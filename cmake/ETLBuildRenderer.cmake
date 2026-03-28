@@ -195,7 +195,14 @@ if(FEATURE_RENDERER_DX12)
 		${CMAKE_SOURCE_DIR}/src/qcommon/q_math.c
 		${CMAKE_SOURCE_DIR}/src/qcommon/puff.c
 		${CMAKE_SOURCE_DIR}/src/qcommon/md4.c
-		${CMAKE_SOURCE_DIR}/src/renderercommon/tr_image_jpg.c
+		${RENDERER_COMMON}
+	)
+
+	list(REMOVE_ITEM RENDERER_DX12_COMMON_SOURCES
+		${CMAKE_SOURCE_DIR}/src/renderercommon/tr_font.c
+		${CMAKE_SOURCE_DIR}/src/renderercommon/tr_splash.c
+		${CMAKE_SOURCE_DIR}/src/renderercommon/tr_common_opengl.c
+		${CMAKE_SOURCE_DIR}/src/renderercommon/anorms256.h
 	)
 
 	add_library(renderer_dx12 ${REND_LIBTYPE} ${RENDERER_DX12_FILES} ${RENDERER_DX12_COMMON_SOURCES})
