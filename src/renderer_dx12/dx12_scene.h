@@ -247,6 +247,7 @@ typedef struct
 	ID3D12RootSignature  *rootSignature3D; ///< Root sig: CBV b0 + SRV table (t0, t1)
 	ID3D12PipelineState  *pso3D;           ///< PSO for dx12WorldVertex_t input – opaque
 	ID3D12PipelineState  *pso3DTranslucent; ///< Same layout but with alpha blending + no depth write
+	ID3D12PipelineState  *pso3DSky;         ///< Sky PSO: no depth write, depth always passes, no back-face cull
 
 	// Per-frame constant buffer (upload heap, persistently mapped, CBV_SIZE aligned)
 	ID3D12Resource *constantBuffer;       ///< Holds DX12_FRAME_COUNT * DX12_MAX_CB_SLOTS_PER_FRAME slots

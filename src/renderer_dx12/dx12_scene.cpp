@@ -269,6 +269,80 @@ static void Mat4Mul(float out[4][4], const float a[4][4], const float b[4][4])
  * @param[in]  origin Camera position in world space.
  * @param[in]  axis   3×3 rotation: axis[0]=forward, axis[1]=left, axis[2]=up.
  */
+
+// ---------------------------------------------------------------------------
+// HLSL source for the sky shader
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Embedded HLSL for the sky surface pipeline.
+ *
+ * The sky VS strips the translation component from the view matrix so the
+ * skybox stays centred on the camera.  The position is emitted with w==z so
+ * the depth buffer always sees NDC depth = 1.0 (far plane), ensuring sky is
+ * drawn behind everything else.
+ *
+ * Root signature is the same as the world pipeline; only t0 (diffuse) is used.
+ */
+static const char g_skyShaderSource[] =
+	"cbuffer SceneConstants : register(b0)\n"
+	"{\n"
+	"    float4x4 viewProj;\n"
+	"    float4x4 modelMatrix;\n"
+	"    float4   cameraPos;\n"
+	"    float4   fogColor;\n"
+	"    float    fogStart;\n"
+	"    float    fogEnd;\n"
+	"    float    fogEnabled;\n"
+	"    float    overBrightFactor;\n"
+	"    float4   entityAmbient;\n"
+	"    float4   entityDirected;\n"
+	"    float4   entityLightDir;\n"
+	"};\n"
+	"cbuffer PerSurfConstants : register(b1)\n"
+	"{\n"
+	"    float uvOffsetU;\n"
+	"    float uvOffsetV;\n"
+	"    float alphaTestThreshold;\n"
+	"    float isEntity;\n"
+	"};\n"
+	"Texture2D    gDiffuse  : register(t0);\n"
+	"SamplerState gSampler  : register(s0);\n"
+	"struct VSIn\n"
+	"{\n"
+	"    float3 pos   : POSITION;\n"
+	"    float2 st    : TEXCOORD0;\n"
+	"    float2 lm    : TEXCOORD1;\n"
+	"    float3 norm  : NORMAL;\n"
+	"    float4 col   : COLOR;\n"
+	"};\n"
+	"struct VSOut\n"
+	"{\n"
+	"    float4 pos    : SV_POSITION;\n"
+	"    float2 st     : TEXCOORD0;\n"
+	"};\n"
+	"VSOut VSMain(VSIn vin)\n"
+	"{\n"
+	"    VSOut vout;\n"
+	"    // Remove translation from viewProj so sky stays centred on the camera.\n"
+	"    // Build a rotation-only viewProj by zeroing out the translation column.\n"
+	"    float4x4 vpNoTrans = viewProj;\n"
+	"    vpNoTrans[3][0] = 0.0f;\n"
+	"    vpNoTrans[3][1] = 0.0f;\n"
+	"    vpNoTrans[3][2] = 0.0f;\n"
+	"    float4 clipPos = mul(float4(vin.pos, 1.0f), vpNoTrans);\n"
+	"    // Force depth to far plane (NDC depth = 1.0) by setting w = z.\n"
+	"    vout.pos = clipPos.xyww;\n"
+	"    vout.st  = float2(vin.st.x + uvOffsetU, vin.st.y + uvOffsetV);\n"
+	"    return vout;\n"
+	"}\n"
+	"float4 PSMain(VSOut pin) : SV_TARGET\n"
+	"{\n"
+	"    float4 col = gDiffuse.Sample(gSampler, pin.st);\n"
+	"    if (alphaTestThreshold > 0.0f && col.a < alphaTestThreshold) { discard; }\n"
+	"    return col;\n"
+	"}\n";
+
 static void BuildViewMatrix(float m[4][4], const vec3_t origin, const vec3_t axis[3])
 {
 	float rx[3], ry[3], rz[3];
@@ -548,6 +622,111 @@ static void SCN_DrawSurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDRESS 
 		0,
 		0
 		);
+}
+
+// ---------------------------------------------------------------------------
+// DX12_DrawSkySurface
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Draw a single MST_SKY world surface using the sky PSO.
+ *
+ * Uses the sky PSO (pso3DSky) which strips view translation so the skybox
+ * stays centred on the camera, and forces NDC depth = 1.0 so sky is always
+ * behind world geometry.  Falls back to the opaque PSO when pso3DSky is NULL.
+ *
+ * @param[in] ds      World draw surface descriptor.
+ * @param[in] cbGpuVA GPU virtual address of the per-frame CB slot.
+ */
+static void DX12_DrawSkySurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDRESS cbGpuVA)
+{
+	dx12Material_t         *mat     = NULL;
+	dx12Texture_t          *diffTex = NULL;
+	qhandle_t               diffHandle = 0;
+	dx12PerSurfConstants_t  psc     = {};
+
+	if (ds->numIndexes <= 0 || ds->numVertices <= 0)
+	{
+		return;
+	}
+
+	if (dx12World.numIndexes > 0
+	    && ((UINT)ds->firstIndex >= dx12World.numIndexes
+	        || (UINT)ds->firstIndex + (UINT)ds->numIndexes > dx12World.numIndexes))
+	{
+		return;
+	}
+
+	mat = DX12_GetMaterial(ds->materialHandle);
+
+	if (mat && mat->numStages > 0 && mat->stages[0].active)
+	{
+		const dx12MaterialStage_t *st = &mat->stages[0];
+		int t;
+
+		if (st->animNumFrames > 0 && st->animFps > 0.0f)
+		{
+			int frameIdx = (int)((float)g_sceneTimeMs * st->animFps / 1000.0f);
+
+			frameIdx = ((frameIdx % st->animNumFrames) + st->animNumFrames) % st->animNumFrames;
+			diffHandle = st->animFrames[frameIdx];
+		}
+		else
+		{
+			diffHandle = st->texHandle;
+		}
+
+		for (t = 0; t < st->numTcMods; t++)
+		{
+			if (st->tcMods[t].type == DX12_TMOD_SCROLL)
+			{
+				float timeSec = (float)g_sceneTimeMs / 1000.0f;
+
+				psc.uvOffsetU += st->tcMods[t].scroll[0] * timeSec;
+				psc.uvOffsetV += st->tcMods[t].scroll[1] * timeSec;
+			}
+		}
+
+		psc.alphaTestThreshold = st->alphaTestThreshold;
+	}
+
+	psc.isEntity = 0.0f;
+
+	diffTex = DX12_GetTexture(diffHandle);
+
+	// Switch to sky PSO (no depth write, view-translation stripped)
+	if (dx12Scene.pso3DSky)
+	{
+		dx12.commandList->SetPipelineState(dx12Scene.pso3DSky);
+	}
+
+	dx12.commandList->SetGraphicsRootConstantBufferView(DX12_SCENE_ROOT_PARAM_CB, cbGpuVA);
+	dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF, 4, &psc, 0);
+
+	{
+		D3D12_GPU_DESCRIPTOR_HANDLE srvHandle = dx12.srvHeap->GetGPUDescriptorHandleForHeapStart();
+
+		if (diffTex && diffTex->resource)
+		{
+			srvHandle = diffTex->gpuHandle;
+		}
+
+		dx12.commandList->SetGraphicsRootDescriptorTable(DX12_SCENE_ROOT_PARAM_DIFFUSE, srvHandle);
+		// Sky does not use a lightmap; bind the heap start as a dummy
+		dx12.commandList->SetGraphicsRootDescriptorTable(DX12_SCENE_ROOT_PARAM_LIGHTMAP,
+		                                                 dx12.srvHeap->GetGPUDescriptorHandleForHeapStart());
+	}
+
+	dx12.commandList->DrawIndexedInstanced(
+		(UINT)ds->numIndexes,
+		1,
+		(UINT)ds->firstIndex,
+		0,
+		0
+		);
+
+	// Restore opaque PSO for subsequent draws
+	dx12.commandList->SetPipelineState(dx12Scene.pso3D);
 }
 
 // ---------------------------------------------------------------------------
@@ -927,6 +1106,115 @@ qboolean DX12_SceneInit(void)
 	}
 
 	// ----------------------------------------------------------------
+	// Sky 3D PSO – renders sky surfaces at the far plane.
+	//   • depth test uses LESS_EQUAL (sky VS forces w=z → NDC depth 1.0)
+	//   • depth writes disabled (sky must not occlude world geometry)
+	//   • back-face culling disabled
+	//   • no blending
+	// Uses the dedicated g_skyShaderSource which strips view translation.
+	// ----------------------------------------------------------------
+	{
+		ID3DBlob *vs       = NULL;
+		ID3DBlob *ps       = NULL;
+		ID3DBlob *errBlob  = NULL;
+		UINT      flags    = 0;
+
+#ifdef _DEBUG
+		flags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+#endif
+
+		SIZE_T skyLen = strlen(g_skyShaderSource);
+
+		hr = D3DCompile(g_skyShaderSource, skyLen, "dx12_sky_shader", NULL, NULL,
+		                "VSMain", "vs_5_0", flags, 0, &vs, &errBlob);
+		if (SUCCEEDED(hr))
+		{
+			if (errBlob) { errBlob->Release(); errBlob = NULL; }
+			hr = D3DCompile(g_skyShaderSource, skyLen, "dx12_sky_shader", NULL, NULL,
+			                "PSMain", "ps_5_0", flags, 0, &ps, &errBlob);
+		}
+
+		if (FAILED(hr) || !vs || !ps)
+		{
+			if (errBlob) { errBlob->Release(); }
+			if (vs)      { vs->Release(); }
+			if (ps)      { ps->Release(); }
+			dx12Scene.pso3DSky = NULL;
+			dx12.ri.Printf(PRINT_DEVELOPER, "DX12_SceneInit: sky PSO shader compile failed, "
+			               "sky surfaces will be skipped\n");
+		}
+		else
+		{
+			if (errBlob) { errBlob->Release(); errBlob = NULL; }
+
+			D3D12_INPUT_ELEMENT_DESC skyElems[] =
+			{
+				{ "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT,    0,  0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+				{ "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,       0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+				{ "TEXCOORD", 1, DXGI_FORMAT_R32G32_FLOAT,       0, 20, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+				{ "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT,    0, 28, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+				{ "COLOR",    0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 40, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+			};
+
+			D3D12_GRAPHICS_PIPELINE_STATE_DESC psoSky = {};
+			psoSky.InputLayout.pInputElementDescs = skyElems;
+			psoSky.InputLayout.NumElements        = 5;
+			psoSky.pRootSignature                 = dx12Scene.rootSignature3D;
+			psoSky.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+			psoSky.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+
+			psoSky.RasterizerState.FillMode              = D3D12_FILL_MODE_SOLID;
+			psoSky.RasterizerState.CullMode              = D3D12_CULL_MODE_NONE;
+			psoSky.RasterizerState.FrontCounterClockwise = TRUE;
+			psoSky.RasterizerState.DepthBias             = D3D12_DEFAULT_DEPTH_BIAS;
+			psoSky.RasterizerState.DepthBiasClamp        = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
+			psoSky.RasterizerState.SlopeScaledDepthBias  = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
+			psoSky.RasterizerState.DepthClipEnable       = TRUE;
+
+			// No blending for sky
+			psoSky.BlendState.AlphaToCoverageEnable  = FALSE;
+			psoSky.BlendState.IndependentBlendEnable = FALSE;
+			{
+				D3D12_RENDER_TARGET_BLEND_DESC &rt = psoSky.BlendState.RenderTarget[0];
+				rt.BlendEnable           = FALSE;
+				rt.LogicOpEnable         = FALSE;
+				rt.SrcBlend              = D3D12_BLEND_ONE;
+				rt.DestBlend             = D3D12_BLEND_ZERO;
+				rt.BlendOp               = D3D12_BLEND_OP_ADD;
+				rt.SrcBlendAlpha         = D3D12_BLEND_ONE;
+				rt.DestBlendAlpha        = D3D12_BLEND_ZERO;
+				rt.BlendOpAlpha          = D3D12_BLEND_OP_ADD;
+				rt.LogicOp               = D3D12_LOGIC_OP_NOOP;
+				rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+			}
+
+			// Depth: test but no write – sky renders at far plane (depth = 1.0)
+			psoSky.DepthStencilState.DepthEnable    = TRUE;
+			psoSky.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+			psoSky.DepthStencilState.DepthFunc      = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+			psoSky.DepthStencilState.StencilEnable  = FALSE;
+
+			psoSky.SampleMask               = UINT_MAX;
+			psoSky.PrimitiveTopologyType    = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+			psoSky.NumRenderTargets         = 1;
+			psoSky.RTVFormats[0]            = DXGI_FORMAT_R8G8B8A8_UNORM;
+			psoSky.DSVFormat                = DXGI_FORMAT_D32_FLOAT;
+			psoSky.SampleDesc.Count         = 1;
+
+			hr = dx12.device->CreateGraphicsPipelineState(&psoSky, IID_PPV_ARGS(&dx12Scene.pso3DSky));
+			vs->Release();
+			ps->Release();
+
+			if (FAILED(hr))
+			{
+				dx12.ri.Printf(PRINT_WARNING,
+				               "DX12_SceneInit: CreateGraphicsPipelineState (sky) failed (0x%08lx)\n", hr);
+				dx12Scene.pso3DSky = NULL;
+			}
+		}
+	}
+
+	// ----------------------------------------------------------------
 	// Per-frame constant buffer
 	// Each frame reserves DX12_MAX_CB_SLOTS_PER_FRAME slots:
 	//   slot 0        – world / identity model matrix
@@ -1075,6 +1363,12 @@ void DX12_SceneShutdown(void)
 	{
 		dx12Scene.pso3DTranslucent->Release();
 		dx12Scene.pso3DTranslucent = NULL;
+	}
+
+	if (dx12Scene.pso3DSky)
+	{
+		dx12Scene.pso3DSky->Release();
+		dx12Scene.pso3DSky = NULL;
 	}
 
 	if (dx12Scene.rootSignature3D)
@@ -1517,6 +1811,24 @@ void DX12_RenderScene(const refdef_t *fd)
 		// colour shows through — this is preferable to a pure-white blob.
 		// ----------------------------------------------------------------
 		/* sky surfaces intentionally not drawn here */
+		// ----------------------------------------------------------------
+		// 5a. Sky surfaces – rendered at far plane using sky PSO.
+		// ----------------------------------------------------------------
+		if (dx12Scene.pso3DSky)
+		{
+			int i;
+
+			for (i = 0; i < dx12World.numDrawSurfs; i++)
+			{
+				const dx12DrawSurf_t *ds  = &dx12World.drawSurfs[i];
+				const dx12Material_t *mat = DX12_GetMaterial(ds->materialHandle);
+
+				if (mat && mat->isSky)
+				{
+					DX12_DrawSkySurface(ds, cbBaseGpuVA);
+				}
+			}
+		}
 
 		// ----------------------------------------------------------------
 		// 5b. Opaque world surfaces (not sky, not translucent, not fog)
