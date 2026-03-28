@@ -93,7 +93,7 @@ static const char g_worldShaderSource[] =
 	"    float    fogStart;\n"
 	"    float    fogEnd;\n"
 	"    float    fogEnabled;\n"
-	"    float    _pad0;\n"
+	"    float    overBrightFactor;\n"
 	"};\n"
 	"\n"
 	"Texture2D    g_diffuse  : register(t0);\n"
@@ -134,8 +134,11 @@ static const char g_worldShaderSource[] =
 	"{\n"
 	"    float4 diffuse  = g_diffuse.Sample(g_sampler, input.uv);\n"
 	"    float4 lightmap = g_lightmap.Sample(g_sampler, input.lm);\n"
-	"    // 2x overbright to match GL1 renderer default (r_overBrightBits=1)\n"
-	"    float4 result   = diffuse * (lightmap * 2.0) * input.color;\n"
+	"    // Overbright: matches GL1 R_ColorShiftLightingBytes with\n"
+	"    // shift = r_mapOverBrightBits(2) - r_overBrightBits(0) = 2 → factor = 4.\n"
+	"    // For vertex-lit surfaces (no lightmap), t1 is bound to the white\n"
+	"    // fallback texture (1,1,1,1) so the same factor applies.\n"
+	"    float4 result   = diffuse * (lightmap * overBrightFactor) * input.color;\n"
 	"    result = float4(saturate(result.rgb), result.a);\n"
 	"    // Linear depth fog: blend toward fogColor over [fogStart, fogEnd]\n"
 	"    if (fogEnabled > 0.0)\n"
@@ -421,9 +424,12 @@ static void SCN_DrawSurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDRESS 
 		dx12.commandList->SetGraphicsRootDescriptorTable(1, srvHandle);
 
 		// Bind lightmap (t1) from the correct BSP lightmap slot.
-		// Falls back to the diffuse texture when no lightmap is assigned
-		// (vertex-lit surface or lightmapIndex == -1).
-		D3D12_GPU_DESCRIPTOR_HANDLE lmHandle = srvHandle;
+		// Falls back to the white default texture (heap slot 0) for vertex-lit
+		// surfaces (lightmapIndex == -1).  Using the diffuse texture as the
+		// lightmap fallback was incorrect: it caused vertex-lit surfaces to
+		// render as  diffuse² × overBrightFactor  instead of
+		// diffuse × overBrightFactor × vertexColor.
+		D3D12_GPU_DESCRIPTOR_HANDLE lmHandle = dx12.srvHeap->GetGPUDescriptorHandleForHeapStart();
 
 		if (ds->lightmapIndex >= 0 && ds->lightmapIndex < dx12World.numLightmaps)
 		{
@@ -1238,7 +1244,20 @@ void DX12_RenderScene(const refdef_t *fd)
 		cb.fogEnd      = 0.0f;
 		cb.fogEnabled  = 0.0f;
 	}
-	cb._pad0 = 0.0f;
+	// ----------------------------------------------------------------
+	// Compute overbright factor matching GL renderer1 behaviour:
+	//   factor = 2^(r_mapOverBrightBits - r_overBrightBits)
+	// Default: 2^(2-0) = 4.  Clamped to [1, 8].
+	// ----------------------------------------------------------------
+	{
+		cvar_t *r_mapOB = dx12.ri.Cvar_Get("r_mapOverBrightBits", "2", 0);
+		cvar_t *r_ob    = dx12.ri.Cvar_Get("r_overBrightBits",    "0", 0);
+		int     shift   = (r_mapOB ? r_mapOB->integer : 2) - (r_ob ? r_ob->integer : 0);
+
+		if (shift < 0) { shift = 0; }
+		if (shift > 3) { shift = 3; }
+		cb.overBrightFactor = (float)(1 << shift);
+	}
 
 	SCN_UpdateCB(cbBaseSlot, &cb);
 
@@ -1286,20 +1305,18 @@ void DX12_RenderScene(const refdef_t *fd)
 
 		// ----------------------------------------------------------------
 		// 5a. Sky surfaces
+		//
+		// Sky shaders in ET use 'skyParms' and typically have no diffuse
+		// stage.  Rendering them with the world PSO falls back to the white
+		// texture for both diffuse and lightmap channels, producing a large
+		// solid-white blob wherever the sky is visible (open sky areas,
+		// outdoor maps).
+		//
+		// TODO: Implement proper skybox / sky-portal rendering.  Until then
+		// sky surfaces are intentionally skipped so the background clear
+		// colour shows through — this is preferable to a pure-white blob.
 		// ----------------------------------------------------------------
-		{
-			int i;
-
-			for (i = 0; i < dx12World.numDrawSurfs; i++)
-			{
-				const dx12DrawSurf_t *ds = &dx12World.drawSurfs[i];
-
-				if (ds->isSky)
-				{
-					SCN_DrawSurface(ds, cbBaseGpuVA);
-				}
-			}
-		}
+		/* sky surfaces intentionally not drawn here */
 
 		// ----------------------------------------------------------------
 		// 5b. Opaque world surfaces (not sky, not translucent, not fog)
@@ -1389,10 +1406,10 @@ void DX12_RenderScene(const refdef_t *fd)
 			entCB.fogColor[1] = cb.fogColor[1];
 			entCB.fogColor[2] = cb.fogColor[2];
 			entCB.fogColor[3] = cb.fogColor[3];
-			entCB.fogStart    = cb.fogStart;
-			entCB.fogEnd      = cb.fogEnd;
-			entCB.fogEnabled  = cb.fogEnabled;
-			entCB._pad0       = 0.0f;
+			entCB.fogStart          = cb.fogStart;
+			entCB.fogEnd            = cb.fogEnd;
+			entCB.fogEnabled        = cb.fogEnabled;
+			entCB.overBrightFactor  = cb.overBrightFactor;
 
 			// Write to the entity's dedicated slot
 			SCN_UpdateCB(entSlot, &entCB);

@@ -141,14 +141,16 @@ typedef struct
  * @brief Per-frame / per-draw constant buffer uploaded to the GPU.
  *
  * Layout (256-byte aligned as required by D3D12 CBV):
- *   viewProj    – combined view * projection matrix (row-major float4x4)
- *   modelMatrix – per-object model-to-world transform (row-major float4x4)
- *   cameraPos   – world-space camera origin (xyz) + padding (w)
- *   fogColor    – fog RGBA color (alpha unused)
- *   fogStart    – linear fog start distance (0 = fog disabled)
- *   fogEnd      – linear fog end distance
- *   fogEnabled  – non-zero when fog should be applied
- *   _pad0       – padding to 256-byte boundary
+ *   viewProj         – combined view * projection matrix (row-major float4x4)
+ *   modelMatrix      – per-object model-to-world transform (row-major float4x4)
+ *   cameraPos        – world-space camera origin (xyz) + padding (w)
+ *   fogColor         – fog RGBA color (alpha unused)
+ *   fogStart         – linear fog start distance (0 = fog disabled)
+ *   fogEnd           – linear fog end distance
+ *   fogEnabled       – non-zero when fog should be applied
+ *   overBrightFactor – lightmap/vertex-colour brightness multiplier;
+ *                      matches GL's 2^(r_mapOverBrightBits-r_overBrightBits).
+ *                      Default: 4.0 (r_mapOverBrightBits=2, r_overBrightBits=0)
  */
 typedef struct
 {
@@ -159,7 +161,7 @@ typedef struct
 	float fogStart;          ///< Linear fog start distance (camera units)
 	float fogEnd;            ///< Linear fog end distance (camera units)
 	float fogEnabled;        ///< 1.0 = fog active, 0.0 = no fog
-	float _pad0;             ///< Explicit padding
+	float overBrightFactor;  ///< Lightmap/vertex-colour overbright scale (default 4.0)
 } dx12SceneConstants_t;
 
 // ---------------------------------------------------------------------------
