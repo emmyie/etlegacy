@@ -169,6 +169,9 @@ void DX12_ShutdownScratchTextures(void)
 // Stub implementations required by refexport_t
 // ---------------------------------------------------------------------------
 
+// Forward declaration – defined later in this file.
+static void RE_DX12_purgeCache(void);
+
 static void RE_DX12_BeginRegistration(glconfig_t *config)
 {
 	cvar_t *r_mode;
@@ -186,6 +189,14 @@ static void RE_DX12_BeginRegistration(glconfig_t *config)
 	if ( !dx12.initialized )
 	{
 		R_DX12_Init( );   // creates device, queues, heaps, PSO, VB, textures, etc.
+	}
+	else
+	{
+		// Already initialized: flush all per-map GPU/CPU resources so the
+		// incoming map starts with a clean material, texture, model and skin
+		// cache.  Without this, disconnecting and reconnecting accumulates
+		// materials until DX12_RegisterMaterial reports "cache full".
+		RE_DX12_purgeCache();
 	}
 
 	r_mode        = dx12.ri.Cvar_Get("r_mode", "4", 0);
