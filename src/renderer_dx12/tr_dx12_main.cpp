@@ -1871,10 +1871,11 @@ static int RE_DX12_MarkFragments(int numPoints, const vec3_t *points, const vec3
 
 		for (i = 0; i < wm->numSurfaces; i++)
 		{
-			const dx12DrawSurf_t *ds = &dx12World.drawSurfs[wm->firstSurface + i];
+			const dx12DrawSurf_t  *ds     = &dx12World.drawSurfs[wm->firstSurface + i];
+			const dx12Material_t  *dsMat  = DX12_GetMaterial(ds->materialHandle);
 
 			// Skip non-triangle surfaces (sky, flares) and empty surfaces
-			if (ds->isSky || ds->surfaceType == MST_FLARE || ds->numIndexes < 3)
+			if ((dsMat && dsMat->isSky) || ds->surfaceType == MST_FLARE || ds->numIndexes < 3)
 			{
 				continue;
 			}

@@ -1432,9 +1432,6 @@ void DX12_LoadWorld(const char *name)
 			// lmNum == -1 means "no lightmap" (vertex-lit surface).
 			ds->lightmapIndex  = (lmNum >= 0 && lmNum < dx12World.numLightmaps) ? lmNum : -1;
 			ds->surfaceType    = sType;
-			ds->isSky          = mat ? mat->isSky         : qfalse;
-			ds->isTranslucent  = mat ? mat->isTranslucent : qfalse;
-			ds->isFog          = mat ? mat->isFog         : qfalse;
 
 			if (sType == MST_PATCH)
 			{

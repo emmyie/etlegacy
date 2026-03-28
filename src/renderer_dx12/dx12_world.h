@@ -123,9 +123,6 @@ typedef struct
 	int       firstIndex;     ///< First index in the world IB
 	int       numIndexes;     ///< Number of indices
 	int       surfaceType;    ///< mapSurfaceType_t from BSP (MST_PLANAR etc.)
-	qboolean  isSky;          ///< Copied from material surfaceparm sky
-	qboolean  isTranslucent;  ///< Copied from material surfaceparm trans
-	qboolean  isFog;          ///< Copied from material surfaceparm fog
 } dx12DrawSurf_t;
 
 // ---------------------------------------------------------------------------
