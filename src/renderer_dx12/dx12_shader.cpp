@@ -676,7 +676,7 @@ qhandle_t DX12_RegisterTexture(const char *name)
 
 	if (!name || !name[0])
 	{
-		return 0;
+		return 2; // slot 2 = noshader
 	}
 
 	Q_strncpyz(fixedName, name, sizeof(fixedName));
@@ -695,7 +695,7 @@ qhandle_t DX12_RegisterTexture(const char *name)
 	if (dx12NumShaders >= DX12_MAX_TEXTURES)
 	{
 		dx12.ri.Printf(PRINT_WARNING, "DX12_RegisterTexture: texture registry full\n");
-		return 0;
+		return 2; // slot 2 = noshader
 	}
 
 	// Virtual '*white' textures: register as a named alias sharing slot 0's
@@ -756,7 +756,7 @@ qhandle_t DX12_RegisterTexture(const char *name)
 	}
 
 	// Try loading the name directly as an image file
-	DX12_LoadImage(name, &pic, &width, &height);
+	DX12_LoadImageSmart(name, &pic, &width, &height);
 
 	// If direct loading failed, try resolving via shader scripts
 	if (!pic || width <= 0 || height <= 0)
@@ -768,7 +768,7 @@ qhandle_t DX12_RegisterTexture(const char *name)
 			dx12.ri.Printf(PRINT_DEVELOPER,
 			               "DX12_RegisterTexture: resolved shader '%s' -> '%s'\n",
 			               name, resolved);
-			DX12_LoadImage(resolved, &pic, &width, &height);
+			DX12_LoadImageSmart(resolved, &pic, &width, &height);
 		}
 	}
 
@@ -778,7 +778,7 @@ qhandle_t DX12_RegisterTexture(const char *name)
 		{
 			dx12.ri.Printf(PRINT_DEVELOPER, "DX12_RegisterTexture: could not load '%s'\n", name);
 		}
-		return 0;
+		return 2; // slot 2 = noshader
 	}
 
 	slot = dx12NumShaders;
@@ -788,7 +788,7 @@ qhandle_t DX12_RegisterTexture(const char *name)
 	if (!tex.resource)
 	{
 		dx12.ri.Printf(PRINT_WARNING, "DX12_RegisterTexture: GPU upload failed for '%s'\n", name);
-		return 0;
+		return 2; // slot 2 = noshader
 	}
 
 	Q_strncpyz(dx12Shaders[slot].name, name, sizeof(dx12Shaders[slot].name));

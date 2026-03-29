@@ -1921,6 +1921,30 @@ static void DX12_DecodePNG(const byte *buf, int bufSize,
 // Public API
 // ---------------------------------------------------------------------------
 
+void DX12_LoadImageSmart( const char* base, byte** pic, int* w, int* h )
+{
+	char path[ MAX_QPATH ];
+
+	// Try exact
+	Q_strncpyz( path, base, sizeof( path ) );
+	DX12_LoadImage( path, pic, w, h );
+	if ( *pic ) return;
+
+	// Try .tga
+	Com_sprintf( path, sizeof( path ), "%s.tga", base );
+	DX12_LoadImage( path, pic, w, h );
+	if ( *pic ) return;
+
+	// Try .jpg
+	Com_sprintf( path, sizeof( path ), "%s.jpg", base );
+	DX12_LoadImage( path, pic, w, h );
+	if ( *pic ) return;
+
+	// Try .png
+	Com_sprintf( path, sizeof( path ), "%s.png", base );
+	DX12_LoadImage( path, pic, w, h );
+}
+
 /**
  * @brief DX12_LoadImage
  * @param[in]  name   Game-path (with or without extension).

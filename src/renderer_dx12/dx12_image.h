@@ -26,6 +26,8 @@
  */
 void DX12_LoadImage(const char *name, byte **pic, int *width, int *height);
 
+void DX12_LoadImageSmart( const char* base, byte** pic, int* w, int* h );
+
 /**
  * @brief Free a pixel buffer previously returned by DX12_LoadImage().
  * @param[in] pic  Pointer returned by DX12_LoadImage(), or NULL (no-op).
