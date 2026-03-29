@@ -381,5 +381,17 @@ void DX12_ClearDecals(void);
  */
 void DX12_RenderScene(const refdef_t *fd);
 
+/**
+ * @brief DX12_BlendFromGL – convert raw OpenGL blend-factor enumerants to a
+ *        D3D12_BLEND_DESC ready for use in a PSO BlendState.
+ *
+ * @param src  Raw GL source blend factor (GL_ONE=0x0001, GL_SRC_ALPHA=0x0302, …).
+ * @param dst  Raw GL destination blend factor (GL_ZERO=0x0000,
+ *             GL_ONE_MINUS_SRC_ALPHA=0x0303, …).
+ * @return     Fully initialised D3D12_BLEND_DESC.  BlendEnable is FALSE only
+ *             when the combination is opaque (ONE / ZERO).
+ */
+D3D12_BLEND_DESC DX12_BlendFromGL(int src, int dst);
+
 #endif // _WIN32
 #endif // DX12_SCENE_H

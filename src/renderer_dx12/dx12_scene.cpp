@@ -735,6 +735,98 @@ static void SCN_BuildUVMatrix(dx12PerSurfConstants_t *psc, const dx12MaterialSta
 }
 
 // ---------------------------------------------------------------------------
+// GL blend enum → D3D12_BLEND_DESC conversion
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Map a pair of raw OpenGL blend-factor enumerants to a D3D12_BLEND_DESC.
+ *
+ * @param src  OpenGL source blend factor (e.g. GL_ONE=0x0001, GL_SRC_ALPHA=0x0302).
+ * @param dst  OpenGL destination blend factor (e.g. GL_ZERO=0x0000,
+ *             GL_ONE_MINUS_SRC_ALPHA=0x0303).
+ * @return     A fully initialised D3D12_BLEND_DESC ready for use in
+ *             D3D12_GRAPHICS_PIPELINE_STATE_DESC::BlendState.
+ *             BlendEnable is set to FALSE when src==GL_ONE and dst==GL_ZERO
+ *             (opaque), and TRUE for every other combination.
+ *             IndependentBlendEnable is always FALSE (all render targets share
+ *             the same blend state, only RenderTarget[0] is filled).
+ *             BlendOp / BlendOpAlpha are always D3D12_BLEND_OP_ADD.
+ *
+ * Raw OpenGL blend-factor values used as input (from <GL/gl.h>):
+ *   GL_ZERO                    0x0000
+ *   GL_ONE                     0x0001
+ *   GL_SRC_COLOR               0x0300
+ *   GL_ONE_MINUS_SRC_COLOR     0x0301
+ *   GL_SRC_ALPHA               0x0302
+ *   GL_ONE_MINUS_SRC_ALPHA     0x0303
+ *   GL_DST_ALPHA               0x0304
+ *   GL_ONE_MINUS_DST_ALPHA     0x0305
+ *   GL_DST_COLOR               0x0306
+ *   GL_ONE_MINUS_DST_COLOR     0x0307
+ *   GL_SRC_ALPHA_SATURATE      0x0308
+ */
+D3D12_BLEND_DESC DX12_BlendFromGL(int src, int dst)
+{
+	D3D12_BLEND_DESC                desc = {};
+	D3D12_RENDER_TARGET_BLEND_DESC *rt   = &desc.RenderTarget[0];
+	D3D12_BLEND                     d3dSrc, d3dDst;
+
+	// ----- source factor -----
+	switch (src)
+	{
+	case 0x0000: /* GL_ZERO */                  d3dSrc = D3D12_BLEND_ZERO;          break;
+	case 0x0001: /* GL_ONE */                   d3dSrc = D3D12_BLEND_ONE;           break;
+	case 0x0300: /* GL_SRC_COLOR */             d3dSrc = D3D12_BLEND_SRC_COLOR;     break;
+	case 0x0301: /* GL_ONE_MINUS_SRC_COLOR */   d3dSrc = D3D12_BLEND_INV_SRC_COLOR; break;
+	case 0x0302: /* GL_SRC_ALPHA */             d3dSrc = D3D12_BLEND_SRC_ALPHA;     break;
+	case 0x0303: /* GL_ONE_MINUS_SRC_ALPHA */   d3dSrc = D3D12_BLEND_INV_SRC_ALPHA; break;
+	case 0x0304: /* GL_DST_ALPHA */             d3dSrc = D3D12_BLEND_DEST_ALPHA;    break;
+	case 0x0305: /* GL_ONE_MINUS_DST_ALPHA */   d3dSrc = D3D12_BLEND_INV_DEST_ALPHA; break;
+	case 0x0306: /* GL_DST_COLOR */             d3dSrc = D3D12_BLEND_DEST_COLOR;    break;
+	case 0x0307: /* GL_ONE_MINUS_DST_COLOR */   d3dSrc = D3D12_BLEND_INV_DEST_COLOR; break;
+	case 0x0308: /* GL_SRC_ALPHA_SATURATE */    d3dSrc = D3D12_BLEND_SRC_ALPHA_SAT; break;
+	default:                                    d3dSrc = D3D12_BLEND_ONE;           break;
+	}
+
+	// ----- destination factor -----
+	switch (dst)
+	{
+	case 0x0000: /* GL_ZERO */                  d3dDst = D3D12_BLEND_ZERO;          break;
+	case 0x0001: /* GL_ONE */                   d3dDst = D3D12_BLEND_ONE;           break;
+	case 0x0300: /* GL_SRC_COLOR */             d3dDst = D3D12_BLEND_SRC_COLOR;     break;
+	case 0x0301: /* GL_ONE_MINUS_SRC_COLOR */   d3dDst = D3D12_BLEND_INV_SRC_COLOR; break;
+	case 0x0302: /* GL_SRC_ALPHA */             d3dDst = D3D12_BLEND_SRC_ALPHA;     break;
+	case 0x0303: /* GL_ONE_MINUS_SRC_ALPHA */   d3dDst = D3D12_BLEND_INV_SRC_ALPHA; break;
+	case 0x0304: /* GL_DST_ALPHA */             d3dDst = D3D12_BLEND_DEST_ALPHA;    break;
+	case 0x0305: /* GL_ONE_MINUS_DST_ALPHA */   d3dDst = D3D12_BLEND_INV_DEST_ALPHA; break;
+	case 0x0306: /* GL_DST_COLOR */             d3dDst = D3D12_BLEND_DEST_COLOR;    break;
+	case 0x0307: /* GL_ONE_MINUS_DST_COLOR */   d3dDst = D3D12_BLEND_INV_DEST_COLOR; break;
+	default:                                    d3dDst = D3D12_BLEND_ZERO;          break;
+	}
+
+	desc.AlphaToCoverageEnable  = FALSE;
+	desc.IndependentBlendEnable = FALSE;
+
+	rt->BlendEnable   = (d3dSrc == D3D12_BLEND_ONE && d3dDst == D3D12_BLEND_ZERO) ? FALSE : TRUE;
+	rt->LogicOpEnable = FALSE;
+
+	rt->SrcBlend  = d3dSrc;
+	rt->DestBlend = d3dDst;
+	rt->BlendOp   = D3D12_BLEND_OP_ADD;
+
+	// Alpha channel: keep src-alpha contribution and apply the same dest factor.
+	// This matches the translucent / additive / modulate patterns in SCN_DrawSurface.
+	rt->SrcBlendAlpha  = D3D12_BLEND_ONE;
+	rt->DestBlendAlpha = d3dDst;
+	rt->BlendOpAlpha   = D3D12_BLEND_OP_ADD;
+
+	rt->LogicOp              = D3D12_LOGIC_OP_NOOP;
+	rt->RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+	return desc;
+}
+
+// ---------------------------------------------------------------------------
 // Per-stage helper: select PSO based on material stage blend mode
 // ---------------------------------------------------------------------------
 
