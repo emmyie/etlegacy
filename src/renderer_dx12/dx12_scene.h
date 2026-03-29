@@ -177,7 +177,7 @@ typedef struct
 
 /**
  * @struct dx12PerSurfConstants_t
- * @brief Inline root constants (8×DWORD) for per-draw-surface variation.
+ * @brief Inline root constants (12×DWORD) for per-draw-surface variation.
  *
  * Passed via SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF, …)
  * so the values are embedded directly in the command list and are correct for
@@ -192,6 +192,15 @@ typedef struct
  * Rotate:   uvM00=cos(a), uvM01=-sin(a), uvM10=sin(a), uvM11=cos(a),
  *           offsets set so rotation is centred at (0.5, 0.5).
  * Stretch:  uvM00=uvM11=1/scale, offsets = 0.5*(1-1/scale).
+ *
+ * stageColor (RGBA) holds the precomputed output of rgbGen / alphaGen evaluated
+ * on the CPU each frame.  The PS multiplies this into the final lit colour before
+ * returning it.  Defaults to (1,1,1,1) so existing code that does not set it is
+ * unaffected.  Typical non-trivial values:
+ *   rgbGen const    → stageColor.rgb = constantColor / 255
+ *   rgbGen wave     → stageColor.rgb = (wave, wave, wave)
+ *   alphaGen const  → stageColor.a   = constantColor[3] / 255
+ *   alphaGen wave   → stageColor.a   = waveValue
  */
 typedef struct
 {
@@ -203,16 +212,17 @@ typedef struct
 	float uvOffsetV;           ///< UV matrix row 1 col 2 (translation Y)
 	float alphaTestThreshold;  ///< PS clip threshold (0 = off, +0.5 = GE128, -0.5 = LT128)
 	float isEntity;            ///< 1.0 = use entity ambient/directed light, 0.0 = use lightmap
+	float stageColor[4];       ///< Precomputed rgbGen/alphaGen result (r,g,b,a); default (1,1,1,1)
 } dx12PerSurfConstants_t;
 
 /** Number of 32-bit root constants for dx12PerSurfConstants_t. */
-#define DX12_SCENE_PERSURF_DWORDS  8
+#define DX12_SCENE_PERSURF_DWORDS  12
 
 /** Root signature parameter indices for the 3D pipeline. */
 #define DX12_SCENE_ROOT_PARAM_CB        0  ///< Root CBV at b0 (dx12SceneConstants_t)
 #define DX12_SCENE_ROOT_PARAM_DIFFUSE   1  ///< Descriptor table t0 (diffuse SRV)
 #define DX12_SCENE_ROOT_PARAM_LIGHTMAP  2  ///< Descriptor table t1 (lightmap SRV)
-#define DX12_SCENE_ROOT_PARAM_PERSURF   3  ///< Root constants b1 (dx12PerSurfConstants_t, 8 DWORDs)
+#define DX12_SCENE_ROOT_PARAM_PERSURF   3  ///< Root constants b1 (dx12PerSurfConstants_t, 12 DWORDs)
 
 // ---------------------------------------------------------------------------
 // Per-entity scene entry

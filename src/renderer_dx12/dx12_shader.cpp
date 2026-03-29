@@ -827,6 +827,43 @@ static D3D12_BLEND SH_ParseBlendFactor(const char *tok)
 }
 
 /**
+ * @brief Parse wave-function parameters: <func> <base> <amplitude> <phase> <freq>
+ *        into @p wave.  Unknown func tokens default to sin.
+ */
+static void SH_ParseWaveParams(const char **pp, const char *end, dx12Wave_t *wave)
+{
+	char wfunc[32];
+
+	*pp = SH_ReadToken(*pp, end, wfunc, sizeof(wfunc));
+
+	if (!DX12_Stricmp(wfunc, "square"))
+	{
+		wave->func = DX12_WAVE_SQUARE;
+	}
+	else if (!DX12_Stricmp(wfunc, "triangle"))
+	{
+		wave->func = DX12_WAVE_TRIANGLE;
+	}
+	else if (!DX12_Stricmp(wfunc, "sawtooth"))
+	{
+		wave->func = DX12_WAVE_SAWTOOTH;
+	}
+	else if (!DX12_Stricmp(wfunc, "inversesawtooth"))
+	{
+		wave->func = DX12_WAVE_INVERSE_SAWTOOTH;
+	}
+	else
+	{
+		wave->func = DX12_WAVE_SIN;
+	}
+
+	wave->base      = SH_ParseFloat(pp, end);
+	wave->amplitude = SH_ParseFloat(pp, end);
+	wave->phase     = SH_ParseFloat(pp, end);
+	wave->frequency = SH_ParseFloat(pp, end);
+}
+
+/**
  * @brief Parse one stage block from just after its opening '{' to (and
  *        including) the closing '}'.
  *
@@ -1001,39 +1038,133 @@ static const char *SH_ParseStage(const char *p, const char *end,
 				}
 				else if (!DX12_Stricmp(type, "stretch"))
 				{
-					char wfunc[32];
-
 					tm->type = DX12_TMOD_STRETCH;
-					p        = SH_ReadToken(p, end, wfunc, sizeof(wfunc));
-
-					if (!DX12_Stricmp(wfunc, "square"))
-					{
-						tm->stretch.func = DX12_WAVE_SQUARE;
-					}
-					else if (!DX12_Stricmp(wfunc, "triangle"))
-					{
-						tm->stretch.func = DX12_WAVE_TRIANGLE;
-					}
-					else if (!DX12_Stricmp(wfunc, "sawtooth"))
-					{
-						tm->stretch.func = DX12_WAVE_SAWTOOTH;
-					}
-					else if (!DX12_Stricmp(wfunc, "inversesawtooth"))
-					{
-						tm->stretch.func = DX12_WAVE_INVERSE_SAWTOOTH;
-					}
-					else
-					{
-						tm->stretch.func = DX12_WAVE_SIN; // default: sin
-					}
-
-					tm->stretch.base      = SH_ParseFloat(&p, end);
-					tm->stretch.amplitude = SH_ParseFloat(&p, end);
-					tm->stretch.phase     = SH_ParseFloat(&p, end);
-					tm->stretch.frequency = SH_ParseFloat(&p, end);
+					SH_ParseWaveParams(&p, end, &tm->stretch);
 					stage->numTcMods++;
 				}
 				// Other tcMod types (scale, turb, etc.) are recognised but ignored
+			}
+			continue;
+		}
+
+		// rgbGen <identity|identityLighting|vertex|exactVertex|entity|oneMinusEntity|wave|const>
+		if (!DX12_Stricmp(tok, "rgbGen"))
+		{
+			char type[64];
+
+			p = SH_ReadToken(p, end, type, sizeof(type));
+
+			if (!DX12_Stricmp(type, "identity"))
+			{
+				stage->rgbGen = DX12_CGEN_IDENTITY;
+			}
+			else if (!DX12_Stricmp(type, "identityLighting"))
+			{
+				stage->rgbGen = DX12_CGEN_IDENTITY;
+			}
+			else if (!DX12_Stricmp(type, "vertex"))
+			{
+				stage->rgbGen = DX12_CGEN_VERTEX;
+			}
+			else if (!DX12_Stricmp(type, "exactVertex"))
+			{
+				stage->rgbGen = DX12_CGEN_EXACT_VERTEX;
+			}
+			else if (!DX12_Stricmp(type, "entity"))
+			{
+				stage->rgbGen = DX12_CGEN_ENTITY;
+			}
+			else if (!DX12_Stricmp(type, "oneMinusEntity"))
+			{
+				stage->rgbGen = DX12_CGEN_ONE_MINUS_ENTITY;
+			}
+			else if (!DX12_Stricmp(type, "wave"))
+			{
+				stage->rgbGen = DX12_CGEN_WAVEFORM;
+				SH_ParseWaveParams(&p, end, &stage->rgbWave);
+			}
+			else if (!DX12_Stricmp(type, "const"))
+			{
+				// const ( r g b ) – parse three floats in optional parens
+				char  tmp[64];
+				float r, g, b;
+
+				p = SH_ReadToken(p, end, tmp, sizeof(tmp));
+				if (tmp[0] == '(')
+				{
+					r = SH_ParseFloat(&p, end);
+					g = SH_ParseFloat(&p, end);
+					b = SH_ParseFloat(&p, end);
+					p = SH_ReadToken(p, end, tmp, sizeof(tmp)); // consume ')'
+				}
+				else
+				{
+					r = tmp[0] ? (float)atof(tmp) : 0.0f;
+					g = SH_ParseFloat(&p, end);
+					b = SH_ParseFloat(&p, end);
+				}
+
+				stage->rgbGen           = DX12_CGEN_CONST;
+				stage->constantColor[0] = (byte)(r * 255.0f);
+				stage->constantColor[1] = (byte)(g * 255.0f);
+				stage->constantColor[2] = (byte)(b * 255.0f);
+			}
+			// Unrecognised rgbGen sub-types are silently ignored
+			continue;
+		}
+
+		// alphaGen <identity|vertex|entity|wave|const>
+		if (!DX12_Stricmp(tok, "alphaGen"))
+		{
+			char type[64];
+
+			p = SH_ReadToken(p, end, type, sizeof(type));
+
+			if (!DX12_Stricmp(type, "identity"))
+			{
+				stage->alphaGen = DX12_AGEN_IDENTITY;
+			}
+			else if (!DX12_Stricmp(type, "vertex"))
+			{
+				stage->alphaGen = DX12_AGEN_VERTEX;
+			}
+			else if (!DX12_Stricmp(type, "entity"))
+			{
+				stage->alphaGen = DX12_AGEN_ENTITY;
+			}
+			else if (!DX12_Stricmp(type, "wave"))
+			{
+				stage->alphaGen = DX12_AGEN_WAVEFORM;
+				SH_ParseWaveParams(&p, end, &stage->alphaWave);
+			}
+			else if (!DX12_Stricmp(type, "const"))
+			{
+				stage->alphaGen = DX12_AGEN_CONST;
+				stage->constantColor[3] = (byte)(SH_ParseFloat(&p, end) * 255.0f);
+			}
+			// Unrecognised alphaGen sub-types are silently ignored
+			continue;
+		}
+
+		// tcGen <base|texture|lightmap|environment>
+		if (!DX12_Stricmp(tok, "tcGen"))
+		{
+			char type[64];
+
+			p = SH_ReadToken(p, end, type, sizeof(type));
+
+			if (!DX12_Stricmp(type, "lightmap"))
+			{
+				stage->tcGen = DX12_TCGEN_LIGHTMAP;
+			}
+			else if (!DX12_Stricmp(type, "environment"))
+			{
+				stage->tcGen = DX12_TCGEN_ENVIRONMENT;
+			}
+			else
+			{
+				// "base", "texture", or anything else → default mesh UVs
+				stage->tcGen = DX12_TCGEN_TEXTURE;
 			}
 			continue;
 		}

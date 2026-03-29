@@ -116,6 +116,10 @@ static const char g_worldShaderSource[] =
 	"    float uvOffsetV;\n"
 	"    float alphaTestThreshold;\n"
 	"    float isEntity;\n"
+	"    float stageColorR;\n"
+	"    float stageColorG;\n"
+	"    float stageColorB;\n"
+	"    float stageColorA;\n"
 	"};\n"
 	"\n"
 	"Texture2D    g_diffuse  : register(t0);\n"
@@ -187,6 +191,12 @@ static const char g_worldShaderSource[] =
 	"        result = diffuse * (lightmap * overBrightFactor) * input.color;\n"
 	"    }\n"
 	"    result = float4(saturate(result.rgb), result.a);\n"
+	"\n"
+	"    // Per-stage color modulator from rgbGen / alphaGen (CPU-evaluated each frame).\n"
+	"    // Default is (1,1,1,1) so surfaces without explicit rgbGen/alphaGen are unaffected.\n"
+	"    float4 stageColor = float4(stageColorR, stageColorG, stageColorB, stageColorA);\n"
+	"    result = float4(saturate(result.rgb * stageColor.rgb),\n"
+	"                    saturate(result.a   * stageColor.a));\n"
 	"\n"
 	"    // Linear depth fog\n"
 	"    if (fogEnabled > 0.0)\n"
@@ -315,6 +325,10 @@ static const char g_skyShaderSource[] =
 	"    float uvOffsetV;\n"
 	"    float alphaTestThreshold;\n"
 	"    float isEntity;\n"
+	"    float stageColorR;\n"
+	"    float stageColorG;\n"
+	"    float stageColorB;\n"
+	"    float stageColorA;\n"
 	"};\n"
 	"Texture2D    gDiffuse  : register(t0);\n"
 	"SamplerState gSampler  : register(s0);\n"
@@ -351,6 +365,9 @@ static const char g_skyShaderSource[] =
 	"{\n"
 	"    float4 col = gDiffuse.Sample(gSampler, pin.st);\n"
 	"    if (alphaTestThreshold > 0.0f && col.a < alphaTestThreshold) { discard; }\n"
+	"    // Apply rgbGen / alphaGen stage color modulator.\n"
+	"    col.rgb = saturate(col.rgb * float3(stageColorR, stageColorG, stageColorB));\n"
+	"    col.a   = saturate(col.a   * stageColorA);\n"
 	"    return col;\n"
 	"}\n";
 
@@ -479,6 +496,134 @@ static void SCN_UpdateCB(UINT slot, const dx12SceneConstants_t *cb)
 // ---------------------------------------------------------------------------
 
 /**
+ * @brief Evaluate a periodic waveform at @p timeSec and return a scalar result.
+ *
+ * Used by DX12_TMOD_STRETCH (tcMod), CGEN_WAVEFORM (rgbGen), and AGEN_WAVEFORM
+ * (alphaGen).  The returned value is: base + amplitude * wave(phase + freq*t).
+ *
+ * @param[in] w        Wave parameters.
+ * @param[in] timeSec  Scene time in seconds.
+ * @return Evaluated scalar.
+ */
+static float SCN_EvalWave(const dx12Wave_t *w, float timeSec)
+{
+	float phase = w->phase + timeSec * w->frequency;
+	float wave  = 0.0f;
+
+	// Reduce phase to [0, 1)
+	phase = phase - (float)(int)phase;
+	if (phase < 0.0f)
+	{
+		phase += 1.0f;
+	}
+
+	switch (w->func)
+	{
+	case DX12_WAVE_SIN:
+		wave = sinf(phase * 2.0f * (float)M_PI);
+		break;
+	case DX12_WAVE_SQUARE:
+		wave = (phase < 0.5f) ? 1.0f : -1.0f;
+		break;
+	case DX12_WAVE_TRIANGLE:
+		wave = (phase < 0.5f) ? (4.0f * phase - 1.0f) : (3.0f - 4.0f * phase);
+		break;
+	case DX12_WAVE_SAWTOOTH:
+		wave = 2.0f * phase - 1.0f;
+		break;
+	case DX12_WAVE_INVERSE_SAWTOOTH:
+		wave = 1.0f - 2.0f * phase;
+		break;
+	default:
+		break;
+	}
+
+	return w->base + w->amplitude * wave;
+}
+
+/**
+ * @brief Evaluate rgbGen and alphaGen for a material stage and write the
+ *        resulting RGBA modulator into psc->stageColor[4].
+ *
+ * The stageColor is post-multiplied into the lit pixel colour in the PS.
+ * Default (CGEN_IDENTITY / AGEN_IDENTITY) produces (1,1,1,1) which leaves
+ * the output unchanged.
+ *
+ * Supported rgbGen:
+ *   DX12_CGEN_IDENTITY       → (1,1,1)  [default, no-op]
+ *   DX12_CGEN_VERTEX / EXACT → (1,1,1)  [vertex color already in VB]
+ *   DX12_CGEN_CONST          → constantColor.rgb / 255
+ *   DX12_CGEN_WAVEFORM       → (wave, wave, wave)
+ *   DX12_CGEN_ENTITY / etc.  → (1,1,1)  [entity color not tracked per-stage]
+ *
+ * Supported alphaGen:
+ *   DX12_AGEN_IDENTITY / VERTEX → 1.0  [default / vertex alpha in VB]
+ *   DX12_AGEN_CONST             → constantColor[3] / 255
+ *   DX12_AGEN_WAVEFORM          → wave value
+ *   DX12_AGEN_ENTITY            → 1.0  [entity alpha not tracked per-stage]
+ *
+ * @param[out] psc      Per-surface constants to fill in (stageColor[4]).
+ * @param[in]  st       Material stage.
+ * @param[in]  timeSec  Scene time in seconds (for wave evaluation).
+ */
+static void SCN_ComputeStageColor(dx12PerSurfConstants_t *psc,
+                                  const dx12MaterialStage_t *st, float timeSec)
+{
+	float r, g, b, a;
+
+	// --- rgbGen ---
+	switch (st->rgbGen)
+	{
+	case DX12_CGEN_CONST:
+		r = (float)st->constantColor[0] / 255.0f;
+		g = (float)st->constantColor[1] / 255.0f;
+		b = (float)st->constantColor[2] / 255.0f;
+		break;
+
+	case DX12_CGEN_WAVEFORM:
+	{
+		float v = SCN_EvalWave(&st->rgbWave, timeSec);
+
+		r = g = b = v;
+		break;
+	}
+
+	case DX12_CGEN_IDENTITY:
+	case DX12_CGEN_VERTEX:
+	case DX12_CGEN_EXACT_VERTEX:
+	case DX12_CGEN_ENTITY:
+	case DX12_CGEN_ONE_MINUS_ENTITY:
+	default:
+		r = g = b = 1.0f;
+		break;
+	}
+
+	// --- alphaGen ---
+	switch (st->alphaGen)
+	{
+	case DX12_AGEN_CONST:
+		a = (float)st->constantColor[3] / 255.0f;
+		break;
+
+	case DX12_AGEN_WAVEFORM:
+		a = SCN_EvalWave(&st->alphaWave, timeSec);
+		break;
+
+	case DX12_AGEN_IDENTITY:
+	case DX12_AGEN_VERTEX:
+	case DX12_AGEN_ENTITY:
+	default:
+		a = 1.0f;
+		break;
+	}
+
+	psc->stageColor[0] = r;
+	psc->stageColor[1] = g;
+	psc->stageColor[2] = b;
+	psc->stageColor[3] = a;
+}
+
+/**
  * @brief Evaluate the tcMod chain for a material stage and write the resulting
  *        2×3 affine UV transform into @p psc.
  *
@@ -552,39 +697,7 @@ static void SCN_BuildUVMatrix(dx12PerSurfConstants_t *psc, const dx12MaterialSta
 		case DX12_TMOD_STRETCH:
 		{
 			// Evaluate wave function to get a scale value.
-			const dx12Wave_t *w = &mod->stretch;
-			float             phase = w->phase + timeSec * w->frequency;
-			float             wave  = 0.0f;
-
-			// Reduce phase to [0, 1)
-			phase = phase - (float)(int)phase;
-			if (phase < 0.0f)
-			{
-				phase += 1.0f;
-			}
-
-			switch (w->func)
-			{
-			case DX12_WAVE_SIN:
-				wave = sinf(phase * 2.0f * (float)M_PI);
-				break;
-			case DX12_WAVE_SQUARE:
-				wave = (phase < 0.5f) ? 1.0f : -1.0f;
-				break;
-			case DX12_WAVE_TRIANGLE:
-				wave = (phase < 0.5f) ? (4.0f * phase - 1.0f) : (3.0f - 4.0f * phase);
-				break;
-			case DX12_WAVE_SAWTOOTH:
-				wave = 2.0f * phase - 1.0f;
-				break;
-			case DX12_WAVE_INVERSE_SAWTOOTH:
-				wave = 1.0f - 2.0f * phase;
-				break;
-			default:
-				break;
-			}
-
-			float scaleVal = w->base + w->amplitude * wave;
+			float scaleVal = SCN_EvalWave(&mod->stretch, timeSec);
 
 			if (scaleVal == 0.0f)
 			{
@@ -814,11 +927,14 @@ static void SCN_DrawSurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDRESS 
 			psc.alphaTestThreshold = st->alphaTestThreshold;
 			psc.isEntity           = 0.0f; // world surface; entity draws set this to 1.0
 
+			// Evaluate rgbGen / alphaGen → stageColor modulator
+			SCN_ComputeStageColor(&psc, st, timeSec);
+
 			// Select PSO based on blend mode and stage index
 			stagePso = SCN_SelectStagePSO(st->srcBlend, st->dstBlend, firstDraw);
 			dx12.commandList->SetPipelineState(stagePso);
 
-			// Per-surface root constants (8 DWORDs)
+			// Per-surface root constants (12 DWORDs)
 			dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
 			                                                DX12_SCENE_PERSURF_DWORDS, &psc, 0);
 
@@ -850,8 +966,12 @@ static void SCN_DrawSurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDRESS 
 		dx12PerSurfConstants_t psc;
 
 		Com_Memset(&psc, 0, sizeof(psc));
-		psc.uvM00 = 1.0f;
-		psc.uvM11 = 1.0f;
+		psc.uvM00          = 1.0f;
+		psc.uvM11          = 1.0f;
+		psc.stageColor[0]  = 1.0f;
+		psc.stageColor[1]  = 1.0f;
+		psc.stageColor[2]  = 1.0f;
+		psc.stageColor[3]  = 1.0f;
 
 		dx12.commandList->SetPipelineState(dx12Scene.pso3D);
 		dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
@@ -947,6 +1067,9 @@ static void DX12_DrawSkySurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDR
 			psc.alphaTestThreshold = st->alphaTestThreshold;
 			psc.isEntity           = 0.0f;
 
+			// Evaluate rgbGen / alphaGen → stageColor modulator
+			SCN_ComputeStageColor(&psc, st, timeSec);
+
 			dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
 			                                                DX12_SCENE_PERSURF_DWORDS, &psc, 0);
 
@@ -961,12 +1084,16 @@ static void DX12_DrawSkySurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDR
 	}
 	else
 	{
-		// No material: draw with identity UV
+		// No material: draw with identity UV and white stageColor
 		dx12PerSurfConstants_t psc;
 
 		Com_Memset(&psc, 0, sizeof(psc));
-		psc.uvM00 = 1.0f;
-		psc.uvM11 = 1.0f;
+		psc.uvM00         = 1.0f;
+		psc.uvM11         = 1.0f;
+		psc.stageColor[0] = 1.0f;
+		psc.stageColor[1] = 1.0f;
+		psc.stageColor[2] = 1.0f;
+		psc.stageColor[3] = 1.0f;
 		dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
 		                                                DX12_SCENE_PERSURF_DWORDS, &psc, 0);
 		dx12.commandList->SetGraphicsRootDescriptorTable(DX12_SCENE_ROOT_PARAM_DIFFUSE,
@@ -1009,8 +1136,9 @@ qboolean DX12_SceneInit(void)
 	//   Param 0 (DX12_SCENE_ROOT_PARAM_CB):       Root CBV at b0  (VS + PS)
 	//   Param 1 (DX12_SCENE_ROOT_PARAM_DIFFUSE):  Descriptor table – 1 SRV at t0
 	//   Param 2 (DX12_SCENE_ROOT_PARAM_LIGHTMAP): Descriptor table – 1 SRV at t1
-	//   Param 3 (DX12_SCENE_ROOT_PARAM_PERSURF):  32-bit constants at b1 (8 DWORDs)
-	//     uvM00, uvM01, uvOffsetU, uvM10, uvM11, uvOffsetV, alphaTestThreshold, isEntity
+	//   Param 3 (DX12_SCENE_ROOT_PARAM_PERSURF):  32-bit constants at b1 (12 DWORDs)
+	//     uvM00, uvM01, uvOffsetU, uvM10, uvM11, uvOffsetV, alphaTestThreshold, isEntity,
+	//     stageColorR, stageColorG, stageColorB, stageColorA
 	//   Static sampler at s0: linear-wrap
 	// ----------------------------------------------------------------
 	{
@@ -1048,8 +1176,9 @@ qboolean DX12_SceneInit(void)
 		params[DX12_SCENE_ROOT_PARAM_LIGHTMAP].DescriptorTable.pDescriptorRanges   = &srvRange1;
 		params[DX12_SCENE_ROOT_PARAM_LIGHTMAP].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_PIXEL;
 
-		// Param 3: per-surface inline root constants (b1) – 8 DWORDs
-		// uvM00, uvM01, uvOffsetU, uvM10, uvM11, uvOffsetV, alphaTestThreshold, isEntity
+		// Param 3: per-surface inline root constants (b1) – 12 DWORDs
+		// uvM00, uvM01, uvOffsetU, uvM10, uvM11, uvOffsetV, alphaTestThreshold, isEntity,
+		// stageColorR, stageColorG, stageColorB, stageColorA
 		// Recorded inline in the command list – correct per draw call.
 		params[DX12_SCENE_ROOT_PARAM_PERSURF].ParameterType                         = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 		params[DX12_SCENE_ROOT_PARAM_PERSURF].Constants.ShaderRegister              = 1; // b1
@@ -2247,8 +2376,13 @@ void DX12_RenderScene(const refdef_t *fd)
 		dx12PerSurfConstants_t pscDefault = {};
 
 		// Identity UV transform
-		pscDefault.uvM00 = 1.0f;
-		pscDefault.uvM11 = 1.0f;
+		pscDefault.uvM00         = 1.0f;
+		pscDefault.uvM11         = 1.0f;
+		// Identity stageColor (no-op modulator)
+		pscDefault.stageColor[0] = 1.0f;
+		pscDefault.stageColor[1] = 1.0f;
+		pscDefault.stageColor[2] = 1.0f;
+		pscDefault.stageColor[3] = 1.0f;
 		dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
 		                                                DX12_SCENE_PERSURF_DWORDS, &pscDefault, 0);
 	}
@@ -2414,11 +2548,15 @@ void DX12_RenderScene(const refdef_t *fd)
 			// Write to the entity's dedicated slot
 			SCN_UpdateCB(entSlot, &entCB);
 
-			// Per-surface root constants for entity: isEntity=1, identity UV transform
+			// Per-surface root constants for entity: isEntity=1, identity UV transform, white stageColor
 			entPsc.uvM00              = 1.0f;
 			entPsc.uvM11              = 1.0f;
 			entPsc.alphaTestThreshold = 0.0f;
 			entPsc.isEntity           = 1.0f;
+			entPsc.stageColor[0]      = 1.0f;
+			entPsc.stageColor[1]      = 1.0f;
+			entPsc.stageColor[2]      = 1.0f;
+			entPsc.stageColor[3]      = 1.0f;
 
 			dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
 			                                                DX12_SCENE_PERSURF_DWORDS, &entPsc, 0);
@@ -2431,8 +2569,12 @@ void DX12_RenderScene(const refdef_t *fd)
 		{
 			dx12PerSurfConstants_t pscWorld = {};
 
-			pscWorld.uvM00 = 1.0f;
-			pscWorld.uvM11 = 1.0f;
+			pscWorld.uvM00         = 1.0f;
+			pscWorld.uvM11         = 1.0f;
+			pscWorld.stageColor[0] = 1.0f;
+			pscWorld.stageColor[1] = 1.0f;
+			pscWorld.stageColor[2] = 1.0f;
+			pscWorld.stageColor[3] = 1.0f;
 			dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
 			                                                DX12_SCENE_PERSURF_DWORDS, &pscWorld, 0);
 		}
@@ -2539,8 +2681,15 @@ void DX12_RenderScene(const refdef_t *fd)
 
 			dx12.commandList->SetGraphicsRootConstantBufferView(DX12_SCENE_ROOT_PARAM_CB,
 			                                                    cbBaseGpuVA);
+			// Full struct update: identity UV, white stageColor (no-op modulator)
+			polyPsc.uvM00         = 1.0f;
+			polyPsc.uvM11         = 1.0f;
+			polyPsc.stageColor[0] = 1.0f;
+			polyPsc.stageColor[1] = 1.0f;
+			polyPsc.stageColor[2] = 1.0f;
+			polyPsc.stageColor[3] = 1.0f;
 			dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
-			                                                4, &polyPsc, 0);
+			                                                DX12_SCENE_PERSURF_DWORDS, &polyPsc, 0);
 			dx12.commandList->SetGraphicsRootDescriptorTable(DX12_SCENE_ROOT_PARAM_DIFFUSE,
 			                                                 srvPoly);
 			dx12.commandList->SetGraphicsRootDescriptorTable(DX12_SCENE_ROOT_PARAM_LIGHTMAP,

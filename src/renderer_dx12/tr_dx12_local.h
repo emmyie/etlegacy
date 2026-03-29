@@ -82,7 +82,7 @@ typedef enum
 
 /**
  * @enum dx12WaveFunc_t
- * @brief Waveform function used by tcMod stretch.
+ * @brief Waveform function used by tcMod stretch and rgbGen/alphaGen waveform.
  */
 typedef enum
 {
@@ -95,7 +95,7 @@ typedef enum
 
 /**
  * @struct dx12Wave_t
- * @brief Parameters for a periodic waveform (used by tcMod stretch).
+ * @brief Parameters for a periodic waveform (used by tcMod stretch, rgbGen, alphaGen).
  */
 typedef struct
 {
@@ -119,6 +119,45 @@ typedef struct
 } dx12TcMod_t;
 
 /**
+ * @enum dx12ColorGen_t
+ * @brief RGB color generator for a material stage (rgbGen keyword).
+ */
+typedef enum
+{
+	DX12_CGEN_IDENTITY = 0,      ///< always (1,1,1) – default
+	DX12_CGEN_VERTEX,            ///< use vertex color (scaled by identityLight)
+	DX12_CGEN_EXACT_VERTEX,      ///< use vertex color as-is
+	DX12_CGEN_ENTITY,            ///< use entity.shaderRGBA (falls back to identity)
+	DX12_CGEN_ONE_MINUS_ENTITY,  ///< (1,1,1) - entity.shaderRGBA
+	DX12_CGEN_WAVEFORM,          ///< wave function evaluated to scalar RGB
+	DX12_CGEN_CONST,             ///< constantColor[0..2]
+} dx12ColorGen_t;
+
+/**
+ * @enum dx12AlphaGen_t
+ * @brief Alpha generator for a material stage (alphaGen keyword).
+ */
+typedef enum
+{
+	DX12_AGEN_IDENTITY = 0,  ///< always 1.0 – default
+	DX12_AGEN_VERTEX,        ///< use vertex alpha
+	DX12_AGEN_ENTITY,        ///< use entity.shaderRGBA[3]
+	DX12_AGEN_WAVEFORM,      ///< wave function evaluated to alpha
+	DX12_AGEN_CONST,         ///< constantColor[3]
+} dx12AlphaGen_t;
+
+/**
+ * @enum dx12TcGenType_t
+ * @brief Texture-coordinate generator source (tcGen keyword).
+ */
+typedef enum
+{
+	DX12_TCGEN_TEXTURE = 0,  ///< use mesh UV (default)
+	DX12_TCGEN_LIGHTMAP,     ///< use lightmap UV for diffuse sample
+	DX12_TCGEN_ENVIRONMENT,  ///< environment / reflection mapping (computed in VS)
+} dx12TcGenType_t;
+
+/**
  * @struct dx12MaterialStage_t
  * @brief One rendering stage within a DX12 material.
  */
@@ -134,6 +173,13 @@ typedef struct
 	int animNumFrames;                             ///< Number of animation frames
 	float animFps;                                 ///< Animation playback rate (frames/s)
 	float alphaTestThreshold;                      ///< Alpha-test cutoff (0 = disabled, e.g. 0.5 for GE128)
+	// rgbGen / alphaGen / tcGen
+	dx12ColorGen_t  rgbGen;                        ///< RGB color generator (default: DX12_CGEN_IDENTITY)
+	dx12AlphaGen_t  alphaGen;                      ///< Alpha generator (default: DX12_AGEN_IDENTITY)
+	dx12TcGenType_t tcGen;                         ///< Texture coordinate source (default: DX12_TCGEN_TEXTURE)
+	byte            constantColor[4];              ///< RGBA constant for CGEN_CONST / AGEN_CONST
+	dx12Wave_t      rgbWave;                       ///< Wave parameters for CGEN_WAVEFORM
+	dx12Wave_t      alphaWave;                     ///< Wave parameters for AGEN_WAVEFORM
 } dx12MaterialStage_t;
 
 /**
