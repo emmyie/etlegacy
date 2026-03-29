@@ -56,6 +56,14 @@ extern dx12ShaderRemap_t dx12ShaderRemaps[DX12_MAX_SHADER_REMAPS];
 extern int               dx12NumShaderRemaps;
 
 /**
+ * @brief Normalise a game-path in-place: replaces every backslash with a
+ *        forward slash.  ET: Legacy uses forward-slash separators internally,
+ *        but callers may supply Windows-style paths.
+ * @param[in,out] path  NUL-terminated path string; modified in place.
+ */
+void DX12_FixPath(char *path);
+
+/**
  * @brief Add or update a shader remap entry.
  * @param[in] oldName     Original shader name.
  * @param[in] newName     Replacement shader name.

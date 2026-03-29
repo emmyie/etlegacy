@@ -34,6 +34,34 @@ dx12Material_t dx12Materials[DX12_MAX_MATERIALS];
 int            dx12NumMaterials = 0;
 
 // ---------------------------------------------------------------------------
+// DX12_FixPath
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Replace every backslash in @p path with a forward slash.
+ *
+ * ET: Legacy uses '/' as its canonical path separator.  Callers (e.g. the
+ * UI or mod DLL on Windows) sometimes supply paths with '\\' separators; the
+ * VFS never resolves those correctly, so we normalise early.
+ */
+void DX12_FixPath(char *path)
+{
+	char *p;
+
+	if (!path)
+	{
+		return;
+	}
+	for (p = path; *p; ++p)
+	{
+		if (*p == '\\')
+		{
+			*p = '/';
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Shader remap table
 // ---------------------------------------------------------------------------
 
@@ -610,11 +638,16 @@ qhandle_t DX12_RegisterTexture(const char *name)
 	int           height = 0;
 	int           slot;
 	dx12Texture_t tex;
+	char          fixedName[MAX_QPATH];
 
 	if (!name || !name[0])
 	{
 		return 0;
 	}
+
+	Q_strncpyz(fixedName, name, sizeof(fixedName));
+	DX12_FixPath(fixedName);
+	name = fixedName;
 
 	// Deduplicate: return existing handle if already loaded
 	for (i = 1; i < dx12NumShaders; i++)

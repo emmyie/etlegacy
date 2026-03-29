@@ -699,13 +699,18 @@ void DX12_ClearPerSessionState(void)
  */
 static qhandle_t RE_DX12_RegisterModel(const char *name)
 {
-	int i;
-	int slot;
+	int  i;
+	int  slot;
+	char fixedName[MAX_QPATH];
 
 	if (!name || !name[0])
 	{
 		return 0;
 	}
+
+	Q_strncpyz(fixedName, name, sizeof(fixedName));
+	DX12_FixPath(fixedName);
+	name = fixedName;
 
 	// Return an existing handle if already registered
 	for (i = 0; i < dx12NumModels; i++)
