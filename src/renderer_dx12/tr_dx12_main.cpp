@@ -833,11 +833,43 @@ static qhandle_t RE_DX12_RegisterModel(const char *name)
 			{
 				// Attempt MD3 (includes .md3 and any unrecognised extension).
 				DX12_LoadMD3(slot, name);
+
+				// If MD3 failed and the extension is .md3, retry as .mdc.
+				if (!dx12ModelData[slot].valid && ext && !Q_stricmp(ext, ".md3"))
+				{
+					char mdcName[MAX_QPATH];
+					int  mdcNameLen;
+					Q_strncpyz(mdcName, name, sizeof(mdcName));
+					mdcNameLen = (int)strlen(mdcName);
+					if (mdcNameLen > 0)
+					{
+						mdcName[mdcNameLen - 1] = 'c';   // .md3 → .mdc
+						DX12_LoadMDC(slot, mdcName);
+					}
+				}
 			}
 		}
 		else
 		{
 			DX12_LoadMD3(slot, name);
+
+			// No-extension path: also try .mdc if caller used .md3.
+			if (!dx12ModelData[slot].valid)
+			{
+				const char *dot2 = strrchr(name, '.');
+				if (dot2 && !Q_stricmp(dot2, ".md3"))
+				{
+					char mdcName[MAX_QPATH];
+					int  mdcNameLen;
+					Q_strncpyz(mdcName, name, sizeof(mdcName));
+					mdcNameLen = (int)strlen(mdcName);
+					if (mdcNameLen > 0)
+					{
+						mdcName[mdcNameLen - 1] = 'c';
+						DX12_LoadMDC(slot, mdcName);
+					}
+				}
+			}
 		}
 	}
 

@@ -485,6 +485,224 @@ qboolean DX12_LoadMD3(int slot, const char *name)
 }
 
 // ---------------------------------------------------------------------------
+// DX12_LoadMDC
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Load a Compressed MD3 (MDC) model into a GPU model slot.
+ *
+ * MDC is the compressed MD3 variant used for gibs, shells, and weapon effects
+ * in the original Enemy Territory game data.  The on-disk format stores vertex
+ * positions for 'base' frames in the same md3XyzNormal_t layout as MD3, plus
+ * compressed delta frames for the remaining poses.  For DX12 static rendering
+ * (frame-0 only) only the first base frame is needed, so the compressed data
+ * is never touched.
+ *
+ * Surface layout is otherwise identical to MD3 – same md3Triangle_t,
+ * md3St_t, and md3Shader_t blocks – so the GPU upload path is shared.
+ *
+ * @param slot  Registry slot (handle - 1).
+ * @param name  VFS game-path of the .mdc file.
+ * @return      qtrue when at least one surface was uploaded successfully.
+ */
+qboolean DX12_LoadMDC(int slot, const char *name)
+{
+	void             *fileData = NULL;
+	int               fileLen;
+	mdcHeader_t      *header;
+	mdcSurface_t     *surf;
+	int               s;
+	dx12ModelEntry_t *entry;
+
+	if (slot < 0 || slot >= DX12_MAX_MODELS)
+	{
+		return qfalse;
+	}
+
+	entry = &dx12ModelData[slot];
+	Com_Memset(entry, 0, sizeof(*entry));
+
+	fileLen = dx12.ri.FS_ReadFile(name, &fileData);
+	if (fileLen <= 0 || !fileData)
+	{
+		return qfalse;
+	}
+
+	if (fileLen < (int)sizeof(mdcHeader_t))
+	{
+		dx12.ri.FS_FreeFile(fileData);
+		return qfalse;
+	}
+
+	header = (mdcHeader_t *)fileData;
+
+	if (header->ident != MDC_IDENT || header->version != MDC_VERSION)
+	{
+		dx12.ri.FS_FreeFile(fileData);
+		return qfalse;
+	}
+
+	if (header->numSurfaces <= 0 || header->ofsSurfaces < (int)sizeof(mdcHeader_t)
+	    || header->ofsSurfaces >= fileLen)
+	{
+		dx12.ri.FS_FreeFile(fileData);
+		return qfalse;
+	}
+
+	entry->mins[0] = entry->mins[1] = entry->mins[2] =  1.0e9f;
+	entry->maxs[0] = entry->maxs[1] = entry->maxs[2] = -1.0e9f;
+
+	surf = (mdcSurface_t *)((byte *)fileData + header->ofsSurfaces);
+
+	for (s = 0; s < header->numSurfaces && s < DX12_MAX_MODEL_SURFACES; s++)
+	{
+		md3XyzNormal_t    *xyzn;
+		md3St_t           *st;
+		md3Triangle_t     *tris;
+		md3Shader_t       *shaders;
+		short             *frameBaseFrames;
+		int                baseFrameIdx;
+		UINT               numVerts;
+		UINT               numTris;
+		dx12WorldVertex_t *cpuVerts;
+		int               *cpuIdx;
+		dx12ModelSurface_t *ms;
+		int                v, t;
+
+		if ((byte *)surf + sizeof(mdcSurface_t) > (byte *)fileData + fileLen)
+		{
+			break;
+		}
+
+		numVerts = (UINT)surf->numVerts;
+		numTris  = (UINT)surf->numTriangles;
+
+		if (numVerts == 0 || numTris == 0)
+		{
+			surf = (mdcSurface_t *)((byte *)surf + surf->ofsEnd);
+			continue;
+		}
+
+		// For frame 0: look up which base frame to use via the per-frame index
+		// table (ofsFrameBaseFrames), then index into the base-frame XYZ block.
+		frameBaseFrames = (short *)((byte *)surf + surf->ofsFrameBaseFrames);
+		baseFrameIdx    = (int)frameBaseFrames[0];
+
+		xyzn    = (md3XyzNormal_t *)((byte *)surf + surf->ofsXyzNormals) + baseFrameIdx * (int)numVerts;
+		st      = (md3St_t *)((byte *)surf + surf->ofsSt);
+		tris    = (md3Triangle_t *)((byte *)surf + surf->ofsTriangles);
+		shaders = (md3Shader_t *)((byte *)surf + surf->ofsShaders);
+
+		// Validate sub-arrays fit within the file
+		if ((byte *)xyzn + numVerts * sizeof(md3XyzNormal_t) > (byte *)fileData + fileLen ||
+		    (byte *)st   + numVerts * sizeof(md3St_t)        > (byte *)fileData + fileLen ||
+		    (byte *)tris + numTris  * sizeof(md3Triangle_t)  > (byte *)fileData + fileLen)
+		{
+			surf = (mdcSurface_t *)((byte *)surf + surf->ofsEnd);
+			continue;
+		}
+
+		cpuVerts = (dx12WorldVertex_t *)dx12.ri.Z_Malloc(numVerts * sizeof(dx12WorldVertex_t));
+		cpuIdx   = (int *)dx12.ri.Z_Malloc(numTris * 3 * sizeof(int));
+
+		if (!cpuVerts || !cpuIdx)
+		{
+			if (cpuVerts) { dx12.ri.Free(cpuVerts); }
+			if (cpuIdx)   { dx12.ri.Free(cpuIdx); }
+			surf = (mdcSurface_t *)((byte *)surf + surf->ofsEnd);
+			continue;
+		}
+
+		// Decode base-frame vertices (same md3XyzNormal_t format as MD3)
+		for (v = 0; v < (int)numVerts; v++)
+		{
+			float nx, ny, nz;
+			float px = xyzn[v].xyz[0] * (float)MD3_XYZ_SCALE;
+			float py = xyzn[v].xyz[1] * (float)MD3_XYZ_SCALE;
+			float pz = xyzn[v].xyz[2] * (float)MD3_XYZ_SCALE;
+
+			MDL_DecodeNormal(xyzn[v].normal, &nx, &ny, &nz);
+
+			cpuVerts[v].xyz[0]    = px;
+			cpuVerts[v].xyz[1]    = py;
+			cpuVerts[v].xyz[2]    = pz;
+			cpuVerts[v].st[0]     = st[v].st[0];
+			cpuVerts[v].st[1]     = st[v].st[1];
+			cpuVerts[v].lm[0]     = 0.0f;
+			cpuVerts[v].lm[1]     = 0.0f;
+			cpuVerts[v].normal[0] = nx;
+			cpuVerts[v].normal[1] = ny;
+			cpuVerts[v].normal[2] = nz;
+			cpuVerts[v].color[0]  = 1.0f;
+			cpuVerts[v].color[1]  = 1.0f;
+			cpuVerts[v].color[2]  = 1.0f;
+			cpuVerts[v].color[3]  = 1.0f;
+
+			if (px < entry->mins[0]) { entry->mins[0] = px; }
+			if (py < entry->mins[1]) { entry->mins[1] = py; }
+			if (pz < entry->mins[2]) { entry->mins[2] = pz; }
+			if (px > entry->maxs[0]) { entry->maxs[0] = px; }
+			if (py > entry->maxs[1]) { entry->maxs[1] = py; }
+			if (pz > entry->maxs[2]) { entry->maxs[2] = pz; }
+		}
+
+		for (t = 0; t < (int)numTris; t++)
+		{
+			cpuIdx[t * 3 + 0] = tris[t].indexes[0];
+			cpuIdx[t * 3 + 1] = tris[t].indexes[1];
+			cpuIdx[t * 3 + 2] = tris[t].indexes[2];
+		}
+
+		ms = &entry->surfaces[entry->numSurfaces];
+
+		if (!MDL_UploadBuffer(cpuVerts, (UINT64)numVerts * sizeof(dx12WorldVertex_t),
+		                      &ms->vertexBuffer)
+		    || !MDL_UploadBuffer(cpuIdx, (UINT64)numTris * 3 * sizeof(int),
+		                         &ms->indexBuffer))
+		{
+			if (ms->vertexBuffer) { ms->vertexBuffer->Release(); ms->vertexBuffer = NULL; }
+			if (ms->indexBuffer)  { ms->indexBuffer->Release();  ms->indexBuffer  = NULL; }
+			dx12.ri.Free(cpuVerts);
+			dx12.ri.Free(cpuIdx);
+			surf = (mdcSurface_t *)((byte *)surf + surf->ofsEnd);
+			continue;
+		}
+
+		dx12.ri.Free(cpuVerts);
+		dx12.ri.Free(cpuIdx);
+
+		ms->numVertices = numVerts;
+		ms->numIndices  = numTris * 3;
+
+		if (surf->numShaders > 0 && shaders[0].name[0])
+		{
+			ms->texHandle = DX12_RegisterTexture(shaders[0].name);
+			if (!ms->texHandle)
+			{
+				ms->texHandle = DX12_RegisterMaterial(shaders[0].name);
+			}
+		}
+
+		entry->numSurfaces++;
+		surf = (mdcSurface_t *)((byte *)surf + surf->ofsEnd);
+	}
+
+	dx12.ri.FS_FreeFile(fileData);
+
+	if (entry->numSurfaces > 0)
+	{
+		entry->valid     = qtrue;
+		entry->modelType = DX12_MOD_MD3;  // same draw path as MD3
+		dx12.ri.Printf(PRINT_DEVELOPER,
+		               "DX12_LoadMDC: loaded '%s' (%d surface%s)\n",
+		               name, entry->numSurfaces,
+		               entry->numSurfaces == 1 ? "" : "s");
+	}
+
+	return entry->valid;
+}
+
+// ---------------------------------------------------------------------------
 // DX12_DrawEntity
 // ---------------------------------------------------------------------------
 

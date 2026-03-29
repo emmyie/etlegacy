@@ -145,6 +145,19 @@ extern dx12ModelEntry_t dx12ModelData[DX12_MAX_MODELS];
 qboolean DX12_LoadMD3(int slot, const char *name);
 
 /**
+ * @brief Attempt to load a Compressed MD3 (MDC) model from the VFS into GPU buffers.
+ *
+ * MDC is the RtCW/ET compressed variant of MD3, used for gibs, shells, and
+ * weapon effects.  Frame-0 base-frame geometry is decoded and uploaded
+ * identically to DX12_LoadMD3 (same GPU draw path).
+ *
+ * @param slot  Registry slot index (handle - 1).
+ * @param name  Game-path of the .mdc file.
+ * @return      qtrue when at least one surface was uploaded successfully.
+ */
+qboolean DX12_LoadMDC(int slot, const char *name);
+
+/**
  * @brief Draw all GPU surfaces of an entity's model.
  *
  * Assumes the 3D root signature (rootSignature3D) and PSO (pso3D) are already
