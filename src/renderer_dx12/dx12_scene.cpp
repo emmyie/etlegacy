@@ -646,7 +646,7 @@ static void SCN_BuildUVMatrix(dx12PerSurfConstants_t *psc, const dx12MaterialSta
 static ID3D12PipelineState *SCN_SelectStagePSO(D3D12_BLEND srcBlend, D3D12_BLEND dstBlend,
                                                qboolean isFirstStage)
 {
-	qboolean isOpaque = (srcBlend == D3D12_BLEND_ONE && dstBlend == D3D12_BLEND_ZERO);
+	qboolean isOpaque = ( srcBlend == D3D12_BLEND_ONE && dstBlend == D3D12_BLEND_ZERO ) ? qtrue : qfalse;
 
 	if (isFirstStage)
 	{
