@@ -2,9 +2,10 @@
  * @file dx12_shader.h
  * @brief DX12 texture registry – no GL, no renderer_common dependency.
  *
- * A flat array of up to DX12_MAX_TEXTURES entries.  Index 0 is always a
- * 1×1 opaque-white fallback texture used whenever a shader handle is invalid.
- * Handles returned by DX12_RegisterTexture() are indices into this array.
+ * A flat array of up to DX12_MAX_TEXTURES entries.  Indices 0–2 are always
+ * built-in fallback textures: slot 0 (white), slot 1 (black), slot 2
+ * (noshader checkerboard).  Handles returned by DX12_RegisterTexture() are
+ * indices into this array.
  */
 
 #ifndef DX12_SHADER_H

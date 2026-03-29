@@ -3,8 +3,8 @@
  * @brief DX12 texture registry.
  *
  * Wraps DX12_LoadImage + DX12_CreateTextureFromRGBA into a simple name-keyed
- * table of up to DX12_MAX_TEXTURES entries.  Index 0 is a permanent 1×1
- * opaque-white fallback.
+ * table of up to DX12_MAX_TEXTURES entries.  Indices 0–2 are permanent
+ * built-in fallback textures (white, black, noshader checkerboard).
  *
  * When a shader name (e.g. "ui/assets/et_clouds") does not correspond to an
  * image file on disk, DX12_RegisterTexture falls back to a basic shader-script
@@ -185,20 +185,51 @@ static qboolean SHD_WarnOnce(const char *name)
 }
 
 // ---------------------------------------------------------------------------
-// DX12_InitTextures
+// DX12_CreateSolidTexture / DX12_InitTextures
 // ---------------------------------------------------------------------------
+
+/**
+ * @brief Create a 1×1 solid-colour texture in the shader registry at a fixed
+ *        @p slot.  Does not modify dx12NumShaders; the caller is responsible
+ *        for advancing that counter to reserve the slot.
+ *
+ * @param[in] r     Red   component (0–255).
+ * @param[in] g     Green component (0–255).
+ * @param[in] b     Blue  component (0–255).
+ * @param[in] name  Registry name stored in dx12Shaders[slot].name.
+ * @param[in] slot  Index into dx12Shaders[] to populate.
+ */
+static void DX12_CreateSolidTexture(byte r, byte g, byte b, const char *name, int slot)
+{
+	byte          pixel[4] = { r, g, b, 255 };
+	dx12Texture_t fallback = DX12_CreateTextureFromRGBA(pixel, 1, 1, slot);
+
+	if (fallback.resource)
+	{
+		Q_strncpyz(dx12Shaders[slot].name, name, sizeof(dx12Shaders[slot].name));
+		dx12Shaders[slot].width  = 1;
+		dx12Shaders[slot].height = 1;
+		dx12Shaders[slot].tex    = fallback;
+		dx12Shaders[slot].valid  = qtrue;
+	}
+	else
+	{
+		dx12.ri.Printf(PRINT_WARNING, "DX12_InitTextures: '%s' fallback texture failed\n", name);
+	}
+}
 
 /**
  * @brief DX12_InitTextures
  *
- * Clears the registry and pre-loads the fallback white texture at slot 0.
+ * Clears the registry and pre-loads three built-in fallback textures:
+ *   slot 0 – 1×1 opaque-white   ("__white__")
+ *   slot 1 – 1×1 opaque-black   ("__black__")
+ *   slot 2 – 4×4 magenta/purple checkerboard ("noshader")
+ *
  * Must be called after R_DX12_Init() (device + SRV heap must exist).
  */
 void DX12_InitTextures(void)
 {
-	byte white[4] = { 255, 255, 255, 255 };
-	byte black[4] = {   0,   0,   0, 255 };
-
 	Com_Memset(dx12Shaders, 0, sizeof(dx12Shaders));
 	dx12NumShaders = 0;
 
@@ -210,43 +241,46 @@ void DX12_InitTextures(void)
 	s_numMissingNames = 0;
 
 	// Slot 0: 1×1 opaque-white fallback
-	{
-		dx12Texture_t fallback = DX12_CreateTextureFromRGBA(white, 1, 1, 0);
-
-		if (fallback.resource)
-		{
-			Q_strncpyz(dx12Shaders[0].name, "__white__", sizeof(dx12Shaders[0].name));
-			dx12Shaders[0].width  = 1;
-			dx12Shaders[0].height = 1;
-			dx12Shaders[0].tex    = fallback;
-			dx12Shaders[0].valid  = qtrue;
-			dx12NumShaders        = 1;
-		}
-		else
-		{
-			dx12.ri.Printf(PRINT_WARNING, "DX12_InitTextures: white fallback texture failed\n");
-			dx12NumShaders = 1; // still reserve slot 0
-		}
-	}
+	DX12_CreateSolidTexture(255, 255, 255, "__white__", 0);
+	dx12NumShaders = 1; // always reserve slot 0
 
 	// Slot 1: 1×1 opaque-black fallback (used by *black virtual textures)
+	DX12_CreateSolidTexture(0, 0, 0, "__black__", 1);
+	dx12NumShaders = 2; // always reserve slot 1
+
+	// Slot 2: 4×4 magenta/purple checkerboard – "noshader" fallback.
+	// GL creates this texture in memory; DX12 must do the same so that
+	// DX12_RegisterTexture("noshader") finds it in the dedup table and never
+	// tries to load "noshader.tga" from disk.
 	{
-		dx12Texture_t fallback = DX12_CreateTextureFromRGBA(black, 1, 1, 1);
+		byte          pixels[4 * 4 * 4];
+		int           i;
+		dx12Texture_t fallback;
+
+		for (i = 0; i < 16; i++)
+		{
+			byte c             = (byte)(((i ^ (i > 2)) & 1) ? 255 : 128);
+			pixels[i * 4 + 0] = c;
+			pixels[i * 4 + 1] = 0;
+			pixels[i * 4 + 2] = c;
+			pixels[i * 4 + 3] = 255;
+		}
+
+		fallback = DX12_CreateTextureFromRGBA(pixels, 4, 4, 2);
 
 		if (fallback.resource)
 		{
-			Q_strncpyz(dx12Shaders[1].name, "__black__", sizeof(dx12Shaders[1].name));
-			dx12Shaders[1].width  = 1;
-			dx12Shaders[1].height = 1;
-			dx12Shaders[1].tex    = fallback;
-			dx12Shaders[1].valid  = qtrue;
-			dx12NumShaders        = 2;
+			Q_strncpyz(dx12Shaders[2].name, "noshader", sizeof(dx12Shaders[2].name));
+			dx12Shaders[2].width  = 4;
+			dx12Shaders[2].height = 4;
+			dx12Shaders[2].tex    = fallback;
+			dx12Shaders[2].valid  = qtrue;
 		}
 		else
 		{
-			dx12.ri.Printf(PRINT_WARNING, "DX12_InitTextures: black fallback texture failed\n");
-			dx12NumShaders = 2; // still reserve slot 1
+			dx12.ri.Printf(PRINT_WARNING, "DX12_InitTextures: noshader fallback texture failed\n");
 		}
+		dx12NumShaders = 3; // always reserve slot 2
 	}
 }
 
