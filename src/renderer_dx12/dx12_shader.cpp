@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @file dx12_shader.cpp
  * @brief DX12 texture registry.
  *
@@ -21,6 +21,7 @@
 
 #include "dx12_shader.h"
 #include "dx12_image.h"
+#include "dx12_world.h"
 
 #ifdef _WIN32
 
@@ -672,7 +673,7 @@ qhandle_t DX12_RegisterTexture(const char *name)
 	int           height = 0;
 	int           slot;
 	dx12Texture_t tex;
-	char          fixedName[MAX_QPATH];
+	char          fixedName[MAX_OSPATH];
 
 	if (!name || !name[0])
 	{
@@ -681,7 +682,16 @@ qhandle_t DX12_RegisterTexture(const char *name)
 
 	Q_strncpyz(fixedName, name, sizeof(fixedName));
 	DX12_FixPath(fixedName);
+	// Strip any leading slash — the VFS uses relative paths only.
 	name = fixedName;
+	while (*name == '/')
+	{
+		name++;
+	}
+	if (!name[0])
+	{
+		return 2;
+	}
 
 	// Deduplicate: return existing handle if already loaded
 	for (i = 1; i < dx12NumShaders; i++)
@@ -753,6 +763,34 @@ qhandle_t DX12_RegisterTexture(const char *name)
 		                                  : dx12Shaders[0].tex.gpuHandle;
 		dx12NumShaders++;
 		return (qhandle_t)slot;
+	}
+
+	// *N - BSP lightmap index (e.g. *0, *1, ...).
+	// Lightmaps are uploaded by DX12_LoadWorld into dx12World.lightmapHandles[].
+	if (name[0] == '*' && name[1] >= '0' && name[1] <= '9')
+	{
+		const char *p         = name + 1;
+		qboolean    allDigits = qtrue;
+		while (*p) { if (*p < '0' || *p > '9') { allDigits = qfalse; break; } p++; }
+		if (allDigits)
+		{
+			int lmIdx = atoi(name + 1);
+			if (lmIdx >= 0 && lmIdx < dx12World.numLightmaps)
+			{
+				return dx12World.lightmapHandles[lmIdx];
+			}
+			return 2; // out-of-range lightmap index -> noshader
+		}
+	}
+
+	// "noshader", "noshader.tga", "noshader.jpg", etc. -> built-in slot 2.
+	{
+		char baseName[MAX_QPATH];
+		COM_StripExtension(name, baseName, sizeof(baseName));
+		if (!DX12_Stricmp(baseName, "noshader"))
+		{
+			return 2;
+		}
 	}
 
 	// Try loading the name directly as an image file
@@ -1504,7 +1542,52 @@ static qboolean SH_ParseMaterialInBuffer(const char *buf, int bufLen,
 					continue;
 				}
 
-				// All other outer-level directives (cull, sort, deformvertexes, etc.) are skipped
+				// cull <mode> - face culling override.
+// "none", "twosided", "disable" render both faces.
+// "back" (default) or "front" are ignored (default PSO handles back-face cull).
+if (!DX12_Stricmp(tok, "cull"))
+{
+char mode[32];
+
+p = SH_ReadToken(p, end, mode, sizeof(mode));
+if (!DX12_Stricmp(mode, "none") || !DX12_Stricmp(mode, "twosided")
+    || !DX12_Stricmp(mode, "disable"))
+{
+out->isDoubleSided = qtrue;
+}
+continue;
+}
+
+// sort <value> - render order hint.
+// Named or numeric sort keys in the translucent range promote the material
+// to isTranslucent so it is drawn after opaque geometry.
+if (!DX12_Stricmp(tok, "sort"))
+{
+char sortVal[32];
+
+p = SH_ReadToken(p, end, sortVal, sizeof(sortVal));
+if (sortVal[0])
+{
+if (!DX12_Stricmp(sortVal, "nearest") || !DX12_Stricmp(sortVal, "additive")
+    || !DX12_Stricmp(sortVal, "banner") || !DX12_Stricmp(sortVal, "underwater")
+    || !DX12_Stricmp(sortVal, "translucent"))
+{
+out->isTranslucent = qtrue;
+}
+else
+{
+// Numeric sort keys >= 6 are in the translucent range.
+int sv = atoi(sortVal);
+if (sv >= 6)
+{
+out->isTranslucent = qtrue;
+}
+}
+}
+continue;
+}
+
+// All other outer-level directives (deformvertexes, fogparms, skyparms, etc.) are skipped
 			}
 
 			out->valid = qtrue;
@@ -1642,16 +1725,8 @@ qhandle_t DX12_RegisterMaterial(const char *name)
 		// Fall back: treat the name as a plain image path and build a 1-stage material
 		qhandle_t texHandle = DX12_RegisterTexture(resolvedName);
 
-		if (!texHandle)
-		{
-			if (SHD_WarnOnce(resolvedName))
-			{
-				dx12.ri.Printf(PRINT_DEVELOPER,
-				               "DX12_RegisterMaterial: could not resolve '%s'\n", resolvedName);
-			}
-			return 0;
-		}
-
+		// Build a 1-stage material from the texture (always succeeds: failed loads
+		// return a noshader alias slot so no null-check is needed here).
 		Q_strncpyz(mat.name, resolvedName, sizeof(mat.name));
 		mat.stages[0].active   = qtrue;
 		mat.stages[0].texHandle = texHandle;

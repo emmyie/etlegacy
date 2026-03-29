@@ -199,6 +199,7 @@ typedef struct
 	qboolean isTranslucent;            ///< surfaceparm trans
 	qboolean isNodraw;                 ///< surfaceparm nodraw
 	qboolean noMip;                    ///< qtrue when mipmaps should be suppressed (RegisterShaderNoMip)
+	qboolean isDoubleSided;            ///< cull none/twosided – render back faces (e.g. fences, foliage)
 	qboolean valid;                    ///< qtrue once successfully built
 } dx12Material_t;
 

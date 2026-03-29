@@ -712,6 +712,29 @@ static qhandle_t RE_DX12_RegisterModel(const char *name)
 	DX12_FixPath(fixedName);
 	name = fixedName;
 
+	// Inline BSP sub-models are referenced as "*N" (e.g. "*1", "*2" for brush
+	// entities like doors).  They are not files; register a stub handle so the
+	// engine can pass the handle back without generating "Can't find" errors.
+	if (name[0] == '*')
+	{
+		for (i = 0; i < dx12NumModels; i++)
+		{
+			if (!Q_stricmp(dx12ModelNames[i], name))
+			{
+				return (qhandle_t)(i + 1);
+			}
+		}
+		if (dx12NumModels < DX12_MAX_MOD_KNOWN)
+		{
+			slot = dx12NumModels;
+			Q_strncpyz(dx12ModelNames[slot], name, MAX_QPATH);
+			Com_Memset(&dx12ModelData[slot], 0, sizeof(dx12ModelData[slot]));
+			dx12NumModels++;
+			return (qhandle_t)(slot + 1);
+		}
+		return 0;
+	}
+
 	// Return an existing handle if already registered
 	for (i = 0; i < dx12NumModels; i++)
 	{
@@ -945,8 +968,7 @@ static qhandle_t RE_DX12_RegisterSkin(const char *name)
 
 	if (strlen(name) >= MAX_QPATH)
 	{
-		dx12.ri.Printf(PRINT_DEVELOPER, "RE_DX12_RegisterSkin: name exceeds MAX_QPATH\n");
-		return 0;
+		dx12.ri.Printf(PRINT_DEVELOPER, "RE_DX12_RegisterSkin: name exceeds MAX_QPATH, truncating: '%s'\n", name);
 	}
 
 	// Deduplicate: return existing handle (1-based)
@@ -954,7 +976,7 @@ static qhandle_t RE_DX12_RegisterSkin(const char *name)
 	{
 		if (!DX12_Stricmp(dx12Skins[i].name, name))
 		{
-			return (dx12Skins[i].numSurfaces > 0) ? (qhandle_t)(i + 1) : 0;
+			return (qhandle_t)(i + 1);
 		}
 	}
 
@@ -976,7 +998,8 @@ static qhandle_t RE_DX12_RegisterSkin(const char *name)
 	if (!text_v)
 	{
 		dx12.ri.Printf(PRINT_DEVELOPER, "RE_DX12_RegisterSkin: '%s' not found\n", name);
-		return 0;
+		// Return a valid handle for the empty skin so cgame doesn't spam "Failed to load skin"
+		return (qhandle_t)(slot + 1);
 	}
 
 	text_p = (char *)text_v;
@@ -998,9 +1021,10 @@ static qhandle_t RE_DX12_RegisterSkin(const char *name)
 			text_p++;
 		}
 
-		// Skip tag entries
+		// Skip tag entries (consume value token to keep the parser in sync)
 		if (strstr(surfName, "tag_"))
 		{
+			DX12_CommaParse(&text_p);
 			continue;
 		}
 
@@ -2357,10 +2381,8 @@ static void RE_DX12_DrawDebugPolygon(int color, int numpoints, float *points)
 static void RE_DX12_DrawDebugText(const vec3_t org, float r, float g, float b,
                                   const char *text, qboolean neverOcclude)
 {
-	// Mirrors the GL renderer which is also unimplemented (prints a TODO).
-	(void)org; (void)r; (void)g; (void)b; (void)neverOcclude;
-	dx12.ri.Printf(PRINT_DEVELOPER, "TODO: RE_DX12_DrawDebugText – text: %s\n",
-	               text ? text : "(null)");
+	// Debug text rendering is not implemented in the DX12 renderer (mirrors GL/VK).
+	(void)org; (void)r; (void)g; (void)b; (void)text; (void)neverOcclude;
 }
 
 static qboolean RE_DX12_GetEntityToken(char *buffer, size_t size)

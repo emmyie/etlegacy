@@ -841,15 +841,19 @@ D3D12_BLEND_DESC DX12_BlendFromGL(int src, int dst)
  *   DST_COLOR / ZERO → pso3DModulate
  *   all others       → pso3DTranslucent (SRC_ALPHA/INV_SRC_ALPHA, no depth write)
  *
+ * When @p isDoubleSided is qtrue and the first stage is opaque, pso3DOpaqueTwoSided
+ * (CullMode=NONE, depth write ON) is used instead of pso3D so back faces render.
+ *
  * Falls back to pso3D when the preferred PSO has not been created.
  *
- * @param[in] srcBlend     D3D12 source blend factor from dx12MaterialStage_t.
- * @param[in] dstBlend     D3D12 destination blend factor.
- * @param[in] isFirstStage qtrue when this is the first drawn stage of the surface.
+ * @param[in] srcBlend      D3D12 source blend factor from dx12MaterialStage_t.
+ * @param[in] dstBlend      D3D12 destination blend factor.
+ * @param[in] isFirstStage  qtrue when this is the first drawn stage of the surface.
+ * @param[in] isDoubleSided qtrue when the material has "cull none"/"cull twosided".
  * @return Pointer to the selected ID3D12PipelineState.
  */
 static ID3D12PipelineState *SCN_SelectStagePSO(D3D12_BLEND srcBlend, D3D12_BLEND dstBlend,
-                                               qboolean isFirstStage)
+                                               qboolean isFirstStage, qboolean isDoubleSided)
 {
 	qboolean isOpaque = ( srcBlend == D3D12_BLEND_ONE && dstBlend == D3D12_BLEND_ZERO ) ? qtrue : qfalse;
 
@@ -857,6 +861,10 @@ static ID3D12PipelineState *SCN_SelectStagePSO(D3D12_BLEND srcBlend, D3D12_BLEND
 	{
 		if (isOpaque)
 		{
+			if (isDoubleSided && dx12Scene.pso3DOpaqueTwoSided)
+			{
+				return dx12Scene.pso3DOpaqueTwoSided;
+			}
 			return dx12Scene.pso3D;
 		}
 
@@ -1023,7 +1031,8 @@ static void SCN_DrawSurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDRESS 
 			SCN_ComputeStageColor(&psc, st, timeSec);
 
 			// Select PSO based on blend mode and stage index
-			stagePso = SCN_SelectStagePSO(st->srcBlend, st->dstBlend, firstDraw);
+			stagePso = SCN_SelectStagePSO(st->srcBlend, st->dstBlend, firstDraw,
+			                              mat->isDoubleSided);
 			dx12.commandList->SetPipelineState(stagePso);
 
 			// Per-surface root constants (12 DWORDs)
@@ -1445,17 +1454,35 @@ qboolean DX12_SceneInit(void)
 		pso.SampleDesc.Count                 = 1;
 
 		hr = dx12.device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&dx12Scene.pso3D));
-		vs->Release();
-		ps->Release();
-
 		if (FAILED(hr))
 		{
+			vs->Release();
+			ps->Release();
 			dx12.ri.Printf(PRINT_WARNING,
 			               "DX12_SceneInit: CreateGraphicsPipelineState failed (0x%08lx)\n", hr);
 			dx12Scene.rootSignature3D->Release();
 			dx12Scene.rootSignature3D = NULL;
 			return qfalse;
 		}
+
+		// Opaque two-sided PSO – identical to pso3D except CullMode = NONE.
+		// Used for shaders with "cull none"/"cull twosided" (fences, foliage, etc.)
+		// that must be visible from both sides while still writing depth.
+		{
+			D3D12_GRAPHICS_PIPELINE_STATE_DESC psoNC = pso; // copy before releasing shaders
+			psoNC.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+			hr = dx12.device->CreateGraphicsPipelineState(&psoNC, IID_PPV_ARGS(&dx12Scene.pso3DOpaqueTwoSided));
+			if (FAILED(hr))
+			{
+				// Non-fatal: double-sided surfaces fall back to pso3D (single-sided).
+				dx12.ri.Printf(PRINT_DEVELOPER,
+				               "DX12_SceneInit: opaque two-sided PSO failed (0x%08lx), falling back\n", hr);
+				dx12Scene.pso3DOpaqueTwoSided = NULL;
+			}
+		}
+
+		vs->Release();
+		ps->Release();
 	}
 
 	// ----------------------------------------------------------------
@@ -2033,6 +2060,12 @@ void DX12_SceneShutdown(void)
 	{
 		dx12Scene.pso3D->Release();
 		dx12Scene.pso3D = NULL;
+	}
+
+	if (dx12Scene.pso3DOpaqueTwoSided)
+	{
+		dx12Scene.pso3DOpaqueTwoSided->Release();
+		dx12Scene.pso3DOpaqueTwoSided = NULL;
 	}
 
 	if (dx12Scene.pso3DTranslucent)

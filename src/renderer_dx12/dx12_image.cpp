@@ -1940,8 +1940,8 @@ void DX12_LoadImageSmart( const char* base, byte** pic, int* w, int* h )
 void DX12_LoadImage(const char *name, byte **pic, int *width, int *height)
 {
 	static const char *s_exts[] = { "tga", "jpg", "png", NULL };
-	char  localName[MAX_QPATH];
-	char  tryName[MAX_QPATH];
+	char  localName[MAX_OSPATH];
+	char  tryName[MAX_OSPATH];
 	void *buf  = NULL;
 	int   size = 0;
 	int   i;
@@ -1951,6 +1951,16 @@ void DX12_LoadImage(const char *name, byte **pic, int *width, int *height)
 	*height = 0;
 
 	if (!name || !name[0])
+	{
+		return;
+	}
+
+	// Strip any leading slash — the VFS uses relative paths only.
+	while (*name == '/')
+	{
+		name++;
+	}
+	if (!name[0])
 	{
 		return;
 	}

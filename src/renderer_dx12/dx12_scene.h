@@ -272,7 +272,8 @@ typedef struct
 {
 	// 3D-specific GPU resources
 	ID3D12RootSignature  *rootSignature3D; ///< Root sig: CBV b0 + SRV table (t0, t1)
-	ID3D12PipelineState  *pso3D;           ///< PSO for dx12WorldVertex_t input – opaque
+	ID3D12PipelineState  *pso3D;           ///< PSO for dx12WorldVertex_t input – opaque, back-face cull
+	ID3D12PipelineState  *pso3DOpaqueTwoSided; ///< Opaque + depth write, but no back-face cull (cull none shaders)
 	ID3D12PipelineState  *pso3DTranslucent; ///< Same layout but with alpha blending + no depth write
 	ID3D12PipelineState  *pso3DSky;         ///< Sky PSO: no depth write, depth always passes, no back-face cull
 	ID3D12PipelineState  *pso3DAdditive;    ///< Multi-stage additive layer (ONE/ONE, no depth write)
