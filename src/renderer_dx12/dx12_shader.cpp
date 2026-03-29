@@ -778,6 +778,22 @@ qhandle_t DX12_RegisterTexture(const char *name)
 		{
 			dx12.ri.Printf(PRINT_DEVELOPER, "DX12_RegisterTexture: could not load '%s'\n", name);
 		}
+
+		// Register the name as a noshader alias so subsequent lookups for the same
+		// missing texture return immediately without repeating expensive FS searches.
+		if (dx12NumShaders < DX12_MAX_TEXTURES && dx12NumShaders >= 3 && dx12Shaders[2].valid)
+		{
+			slot = dx12NumShaders;
+			Q_strncpyz(dx12Shaders[slot].name, name, sizeof(dx12Shaders[slot].name));
+			dx12Shaders[slot].width         = dx12Shaders[2].width;
+			dx12Shaders[slot].height        = dx12Shaders[2].height;
+			dx12Shaders[slot].valid         = qtrue;
+			dx12Shaders[slot].tex.resource  = NULL; // shared alias – do not release on shutdown
+			dx12Shaders[slot].tex.cpuHandle = dx12Shaders[2].tex.cpuHandle;
+			dx12Shaders[slot].tex.gpuHandle = dx12Shaders[2].tex.gpuHandle;
+			dx12NumShaders++;
+			return (qhandle_t)slot;
+		}
 		return 2; // slot 2 = noshader
 	}
 
@@ -1236,6 +1252,44 @@ static const char *SH_ParseStage(const char *p, const char *end,
 			continue;
 		}
 
+		// stage <type> – PBR stage type qualifier used in ETL/renderer2 material files.
+		// Only "diffusemap" and "liquidmap" map to a visible DX12 diffuse stage.
+		// All other types (bumpmap, specularmap, normalmap, attenuationMapXY, …) are
+		// PBR-only passes that DX12 doesn't render.  Mark the stage inactive and drain
+		// the remaining tokens so no texture is wastefully loaded.
+		if (!DX12_Stricmp(tok, "stage"))
+		{
+			char type[64];
+
+			p = SH_ReadToken(p, end, type, sizeof(type));
+			if (DX12_Stricmp(type, "diffusemap") != 0 && DX12_Stricmp(type, "liquidmap") != 0)
+			{
+				stage->active = qfalse;
+				while (p < end)
+				{
+					p = SH_ReadToken(p, end, tok, sizeof(tok));
+					if (!tok[0] || tok[0] == '}')
+					{
+						break;
+					}
+				}
+				return p;
+			}
+			continue;
+		}
+
+		// bumpmap / normalmap / specularmap / heightmap <path> inside a stage block:
+		// PBR texture references that DX12 does not use.  Consume the path argument
+		// so it is not misread as the next directive keyword.
+		if (!DX12_Stricmp(tok, "bumpmap") || !DX12_Stricmp(tok, "normalmap")
+		    || !DX12_Stricmp(tok, "specularmap") || !DX12_Stricmp(tok, "heightmap"))
+		{
+			char path[MAX_QPATH];
+
+			p = SH_ReadToken(p, end, path, sizeof(path));
+			continue;
+		}
+
 		// All other stage directives are silently skipped
 	}
 
@@ -1385,6 +1439,68 @@ static qboolean SH_ParseMaterialInBuffer(const char *buf, int bufLen,
 					{
 						out->isNodraw = qtrue;
 					}
+					continue;
+				}
+
+				// diffusemap <path> – top-level PBR diffuse shorthand (ETL material format).
+				// Creates stage-0 with the given texture so materials with no explicit stage
+				// blocks still render correctly instead of falling back to blank/white.
+				if (!DX12_Stricmp(tok, "diffusemap"))
+				{
+					char path[MAX_QPATH];
+
+					p = SH_ReadToken(p, end, path, sizeof(path));
+					if (path[0] && out->numStages == 0)
+					{
+						dx12MaterialStage_t *s = &out->stages[0];
+
+						s->active    = qtrue;
+						s->srcBlend  = D3D12_BLEND_ONE;
+						s->dstBlend  = D3D12_BLEND_ZERO;
+						s->texHandle = DX12_RegisterTexture(path);
+						if (s->texHandle)
+						{
+							out->numStages = 1;
+						}
+					}
+					continue;
+				}
+
+				// implicitMap / implicitMask / implicitBlend <path|-> – shorthand that creates
+				// a standard lightmapped stage from a single texture.  The special path "-"
+				// means "use the shader name as the texture path".  Treated as diffusemap for DX12.
+				if (!DX12_Stricmp(tok, "implicitMap") || !DX12_Stricmp(tok, "implicitMask")
+				    || !DX12_Stricmp(tok, "implicitBlend"))
+				{
+					char path[MAX_QPATH];
+
+					p = SH_ReadToken(p, end, path, sizeof(path));
+					if (out->numStages == 0)
+					{
+						const char          *texPath = (path[0] && path[0] != '-') ? path : shaderName;
+						dx12MaterialStage_t *s       = &out->stages[0];
+
+						s->active    = qtrue;
+						s->srcBlend  = D3D12_BLEND_ONE;
+						s->dstBlend  = D3D12_BLEND_ZERO;
+						s->texHandle = DX12_RegisterTexture(texPath);
+						if (s->texHandle)
+						{
+							out->numStages = 1;
+						}
+					}
+					continue;
+				}
+
+				// bumpmap / normalmap / specularmap / heightmap <path> at the outer shader level:
+				// PBR texture references that DX12 doesn't render.  Consume the path argument to
+				// prevent it from being misread as a directive keyword on the next iteration.
+				if (!DX12_Stricmp(tok, "bumpmap") || !DX12_Stricmp(tok, "normalmap")
+				    || !DX12_Stricmp(tok, "specularmap") || !DX12_Stricmp(tok, "heightmap"))
+				{
+					char path[MAX_QPATH];
+
+					p = SH_ReadToken(p, end, path, sizeof(path));
 					continue;
 				}
 

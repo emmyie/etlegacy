@@ -1923,26 +1923,9 @@ static void DX12_DecodePNG(const byte *buf, int bufSize,
 
 void DX12_LoadImageSmart( const char* base, byte** pic, int* w, int* h )
 {
-	char path[ MAX_QPATH ];
-
-	// Try exact
-	Q_strncpyz( path, base, sizeof( path ) );
-	DX12_LoadImage( path, pic, w, h );
-	if ( *pic ) return;
-
-	// Try .tga
-	Com_sprintf( path, sizeof( path ), "%s.tga", base );
-	DX12_LoadImage( path, pic, w, h );
-	if ( *pic ) return;
-
-	// Try .jpg
-	Com_sprintf( path, sizeof( path ), "%s.jpg", base );
-	DX12_LoadImage( path, pic, w, h );
-	if ( *pic ) return;
-
-	// Try .png
-	Com_sprintf( path, sizeof( path ), "%s.png", base );
-	DX12_LoadImage( path, pic, w, h );
+	// DX12_LoadImage already strips any extension and tries .tga / .jpg / .png,
+	// so a single call is sufficient.
+	DX12_LoadImage( base, pic, w, h );
 }
 
 /**
