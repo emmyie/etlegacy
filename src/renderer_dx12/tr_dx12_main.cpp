@@ -768,7 +768,22 @@ static qhandle_t RE_DX12_RegisterModel(const char *name)
 		const char *ext = strrchr(name, '.');
 		if (ext)
 		{
-			if (!Q_stricmp(ext, ".mds"))
+			// .tag files contain only bone-tag attachment data; they are never
+			// loaded as standalone renderable models and have no loader.
+			if (!Q_stricmp(ext, ".tag"))
+			{
+				// Register a stub slot so the handle is non-zero (cgame checks this).
+				if (dx12NumModels < DX12_MAX_MOD_KNOWN)
+				{
+					slot = dx12NumModels;
+					Q_strncpyz(dx12ModelNames[slot], name, MAX_QPATH);
+					Com_Memset(&dx12ModelData[slot], 0, sizeof(dx12ModelData[slot]));
+					dx12NumModels++;
+					return (qhandle_t)(slot + 1);
+				}
+				return 0;
+			}
+			else if (!Q_stricmp(ext, ".mds"))
 			{
 				// MDS: mesh + embedded animation (player bodies).
 				// Store raw data for bone-based tag lookup.
@@ -1187,6 +1202,19 @@ static void RE_DX12_RegisterFont(const char *fontName, int pointSize, void *font
 	Com_Memset(fi, 0, sizeof(fontInfo_t));
 
 	snprintf(datName, sizeof(datName), "fonts/%s_%i.dat", fontName, pointSize);
+
+	// Silently probe pak files + filesystem for the .dat before calling
+	// FS_ReadFile.  FS_FOpenFileRead with a NULL fileHandle searches pak
+	// files without opening them and returns > 0 when found – crucially it
+	// does NOT print the red "ERROR: Can't find" message when the file is
+	// absent (FS_FileExists only checks the OS path, missing pak contents).
+	if (dx12.ri.FS_FOpenFileRead(datName, NULL, qfalse) <= 0)
+	{
+		dx12.ri.Printf(PRINT_DEVELOPER,
+		               "RE_DX12_RegisterFont: font '%s' not found in any search path (FreeType not supported in DX12 renderer)\n",
+		               datName);
+		return;
+	}
 
 	len = dx12.ri.FS_ReadFile(datName, &faceData);
 
