@@ -713,8 +713,8 @@ static qhandle_t RE_DX12_RegisterModel(const char *name)
 	name = fixedName;
 
 	// Inline BSP sub-models are referenced as "*N" (e.g. "*1", "*2" for brush
-	// entities like doors).  They are not files; register a stub handle so the
-	// engine can pass the handle back without generating "Can't find" errors.
+	// entities like doors).  Register a stub handle – the scene will draw these
+	// by indexing dx12World.models[N] directly (no separate GPU model buffers).
 	if (name[0] == '*')
 	{
 		for (i = 0; i < dx12NumModels; i++)
@@ -770,18 +770,10 @@ static qhandle_t RE_DX12_RegisterModel(const char *name)
 		{
 			// .tag files contain only bone-tag attachment data; they are never
 			// loaded as standalone renderable models and have no loader.
+			// Slot was already allocated above; just return the handle.
 			if (!Q_stricmp(ext, ".tag"))
 			{
-				// Register a stub slot so the handle is non-zero (cgame checks this).
-				if (dx12NumModels < DX12_MAX_MOD_KNOWN)
-				{
-					slot = dx12NumModels;
-					Q_strncpyz(dx12ModelNames[slot], name, MAX_QPATH);
-					Com_Memset(&dx12ModelData[slot], 0, sizeof(dx12ModelData[slot]));
-					dx12NumModels++;
-					return (qhandle_t)(slot + 1);
-				}
-				return 0;
+				return (qhandle_t)(slot + 1);
 			}
 			else if (!Q_stricmp(ext, ".mds"))
 			{
@@ -829,13 +821,32 @@ static qhandle_t RE_DX12_RegisterModel(const char *name)
 					dx12ModelData[slot].valid       = qtrue;
 				}
 			}
+			else if (!Q_stricmp(ext, ".mdc"))
+			{
+				// MDC: compressed MD3 – load directly.
+				DX12_LoadMDC(slot, name);
+
+				// Fallback: try the .md3 sibling if .mdc failed.
+				if (!dx12ModelData[slot].valid)
+				{
+					char md3Name[MAX_QPATH];
+					int  md3Len;
+					Q_strncpyz(md3Name, name, sizeof(md3Name));
+					md3Len = (int)strlen(md3Name);
+					if (md3Len > 1)
+					{
+						md3Name[md3Len - 1] = '3';   // .mdc → .md3
+						DX12_LoadMD3(slot, md3Name);
+					}
+				}
+			}
 			else
 			{
 				// Attempt MD3 (includes .md3 and any unrecognised extension).
 				DX12_LoadMD3(slot, name);
 
 				// If MD3 failed and the extension is .md3, retry as .mdc.
-				if (!dx12ModelData[slot].valid && ext && !Q_stricmp(ext, ".md3"))
+				if (!dx12ModelData[slot].valid && !Q_stricmp(ext, ".md3"))
 				{
 					char mdcName[MAX_QPATH];
 					int  mdcNameLen;
@@ -851,9 +862,9 @@ static qhandle_t RE_DX12_RegisterModel(const char *name)
 		}
 		else
 		{
+			// No extension – attempt MD3, then .mdc sibling if the name has .md3.
 			DX12_LoadMD3(slot, name);
 
-			// No-extension path: also try .mdc if caller used .md3.
 			if (!dx12ModelData[slot].valid)
 			{
 				const char *dot2 = strrchr(name, '.');
@@ -865,7 +876,7 @@ static qhandle_t RE_DX12_RegisterModel(const char *name)
 					mdcNameLen = (int)strlen(mdcName);
 					if (mdcNameLen > 0)
 					{
-						mdcName[mdcNameLen - 1] = 'c';
+						mdcName[mdcNameLen - 1] = 'c';   // .md3 → .mdc
 						DX12_LoadMDC(slot, mdcName);
 					}
 				}
@@ -874,6 +885,40 @@ static qhandle_t RE_DX12_RegisterModel(const char *name)
 	}
 
 	return (qhandle_t)(slot + 1);
+}
+
+/**
+ * @brief DX12_GetBrushSubmodelIdx
+ *
+ * If hModel was registered via RE_DX12_RegisterModel("*N"), returns the
+ * submodel index N (1-based into dx12World.models[]).  Returns -1 for any
+ * other handle (regular 3D model file, NULL handle, out-of-range, etc.).
+ *
+ * Used by DX12_RenderScene to detect brush model entities and route them
+ * through SCN_DrawBrushModelEntity instead of DX12_DrawEntity.
+ */
+int DX12_GetBrushSubmodelIdx(qhandle_t hModel)
+{
+	int idx;
+
+	if (!hModel)
+	{
+		return -1;
+	}
+
+	idx = (int)hModel - 1;
+
+	if (idx < 0 || idx >= dx12NumModels)
+	{
+		return -1;
+	}
+
+	if (dx12ModelNames[idx][0] != '*')
+	{
+		return -1;
+	}
+
+	return Q_atoi(dx12ModelNames[idx] + 1);
 }
 
 /**

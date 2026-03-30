@@ -1024,7 +1024,14 @@ static const char *SH_ParseStage(const char *p, const char *end,
 			char path[MAX_QPATH];
 
 			p = SH_ReadToken(p, end, path, sizeof(path));
-			if (path[0] && path[0] != '$' && path[0] != '{' && path[0] != '}')
+			if (!DX12_Stricmp(path, "$lightmap"))
+			{
+				// $lightmap is handled by useLightmap on the first diffuse stage.
+				// Executing it separately multiplies the framebuffer by vertex colour
+				// (which is zero for all lightmapped BSP surfaces), turning everything black.
+				stage->active = qfalse;
+			}
+			else if (path[0] && path[0] != '$' && path[0] != '{' && path[0] != '}')
 			{
 				stage->texHandle = DX12_RegisterTexture(path);
 			}
@@ -1163,7 +1170,28 @@ static const char *SH_ParseStage(const char *p, const char *end,
 					SH_ParseWaveParams(&p, end, &tm->stretch);
 					stage->numTcMods++;
 				}
-				// Other tcMod types (scale, turb, etc.) are recognised but ignored
+				else if (!DX12_Stricmp(type, "scale"))
+				{
+					tm->type     = DX12_TMOD_SCALE;
+					tm->scale[0] = SH_ParseFloat(&p, end);
+					tm->scale[1] = SH_ParseFloat(&p, end);
+					if (tm->scale[0] == 0.0f) { tm->scale[0] = 1.0f; }
+					if (tm->scale[1] == 0.0f) { tm->scale[1] = 1.0f; }
+					stage->numTcMods++;
+				}
+				else if (!DX12_Stricmp(type, "turb"))
+				{
+					// tcMod turb <base> <amplitude> <phase> <frequency>
+					// Pack into dx12Wave_t: base, amplitude, phase, frequency
+					tm->type           = DX12_TMOD_TURB;
+					tm->turb.base      = SH_ParseFloat(&p, end);
+					tm->turb.amplitude = SH_ParseFloat(&p, end);
+					tm->turb.phase     = SH_ParseFloat(&p, end);
+					tm->turb.frequency = SH_ParseFloat(&p, end);
+					tm->turb.func      = DX12_WAVE_SIN;
+					stage->numTcMods++;
+				}
+				// Other tcMod types are recognised but ignored
 			}
 			continue;
 		}
@@ -1587,7 +1615,39 @@ out->isTranslucent = qtrue;
 continue;
 }
 
-// All other outer-level directives (deformvertexes, fogparms, skyparms, etc.) are skipped
+// skyParms <outerbox> <cloudheight> <innerbox>
+// Load the 6 outer-box face textures (named <outerbox>_rt/bk/lf/ft/up/dn).
+// "-" means no sky box (ignore).  Matched to renderer1 tr_shader.c ParseSkyParms.
+if (!DX12_Stricmp(tok, "skyParms"))
+{
+    char skyName[MAX_QPATH];
+    char tmp[MAX_QPATH];
+    int  fi;
+    static const char *suf[6] = { "rt", "bk", "lf", "ft", "up", "dn" };
+
+    p = SH_ReadToken(p, end, skyName, sizeof(skyName));
+    // consume cloudheight and innerbox tokens
+    { char discard[32]; p = SH_ReadToken(p, end, discard, sizeof(discard)); }
+    { char discard[MAX_QPATH]; p = SH_ReadToken(p, end, discard, sizeof(discard)); }
+
+    if (skyName[0] && skyName[0] != '-')
+    {
+        for (fi = 0; fi < 6; fi++)
+        {
+            Com_sprintf(tmp, sizeof(tmp), "%s_%s.tga", skyName, suf[fi]);
+            out->skyOuterBox[fi] = DX12_RegisterTexture(tmp);
+            if (!out->skyOuterBox[fi])
+            {
+                // try without .tga extension (game might provide it differently)
+                Com_sprintf(tmp, sizeof(tmp), "%s_%s", skyName, suf[fi]);
+                out->skyOuterBox[fi] = DX12_RegisterTexture(tmp);
+            }
+        }
+    }
+    continue;
+}
+
+// All other outer-level directives (deformvertexes, fogparms, etc.) are skipped
 			}
 
 			out->valid = qtrue;

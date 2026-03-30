@@ -572,6 +572,60 @@ void DX12_ShutdownWorld(void)
 }
 
 // ---------------------------------------------------------------------------
+// DX12_ShiftVertColor  (mirrors renderer1's R_ColorShiftLightingBytes)
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Convert a BSP drawVert colour (byte[4]) to the normalised float[4]
+ *        stored in dx12WorldVertex_t, applying the same overbright bit-shift
+ *        that renderer1's R_ColorShiftLightingBytes uses at BSP load time.
+ *
+ * With the default r_mapOverBrightBits=2 / r_overBrightBits=0 the shift is
+ * two bits (×4).  Where that would saturate a channel the three RGB values
+ * are normalised to the brightest channel so the hue is preserved.  Alpha is
+ * passed through unchanged.
+ *
+ * @param[in]  in     Four-byte RGBA from the BSP file.
+ * @param[out] out    Normalised RGBA float[4] for the vertex buffer.
+ * @param[in]  shift  Right-shift count (0 = no shift).  Negative clamped to 0.
+ */
+static void DX12_ShiftVertColor(const byte in[4], float out[4], int shift)
+{
+	int r, g, b, mx;
+
+	if (shift <= 0)
+	{
+		out[0] = in[0] / 255.0f;
+		out[1] = in[1] / 255.0f;
+		out[2] = in[2] / 255.0f;
+		out[3] = in[3] / 255.0f;
+		return;
+	}
+
+	r = (int)in[0] << shift;
+	g = (int)in[1] << shift;
+	b = (int)in[2] << shift;
+
+	/* Normalise to max=255 when any channel overflows, preserving hue. */
+	if ((r | g | b) > 255)
+	{
+		mx = r > g ? r : g;
+		if (b > mx)
+		{
+			mx = b;
+		}
+		r = r * 255 / mx;
+		g = g * 255 / mx;
+		b = b * 255 / mx;
+	}
+
+	out[0] = (float)r / 255.0f;
+	out[1] = (float)g / 255.0f;
+	out[2] = (float)b / 255.0f;
+	out[3] = (float)in[3] / 255.0f;
+}
+
+// ---------------------------------------------------------------------------
 // DX12_LoadWorld
 // ---------------------------------------------------------------------------
 
@@ -1127,6 +1181,47 @@ void DX12_LoadWorld(const char *name)
 		}
 
 		lm_batch_done:
+		// If the BSP has no embedded lightmaps (LUMP_LIGHTMAPS empty), try loading
+		// external lightmap files written by q3map2: maps/<mapname>/lm_NNNN.tga
+		// This matches renderer1's R_FindLightmap which constructs the same path as
+		//   Com_sprintf(fileName, "%s/" EXTERNAL_LIGHTMAP, tr.worldDir, index)
+		// DX12_LoadImage tries .tga / .jpg / .png automatically; if a file does not
+		// exist the returned texture has resource==NULL and we stop the scan.
+		if (dx12World.numLightmaps == 0)
+		{
+			char baseName[MAX_QPATH];
+			char lmPath[MAX_QPATH];
+			int  li;
+
+			COM_StripExtension(dx12World.name, baseName, sizeof(baseName));
+
+			for (li = 0; li < DX12_MAX_LIGHTMAPS; li++)
+			{
+				qhandle_t     h;
+				dx12Texture_t *t;
+
+				Com_sprintf(lmPath, sizeof(lmPath), "%s/lm_%04d", baseName, li);
+
+				h = DX12_RegisterTexture(lmPath);
+				t = DX12_GetTexture(h);
+
+				if (!t || !t->resource)
+				{
+					break; /* no more external lightmaps */
+				}
+
+				dx12World.lightmapHandles[li] = h;
+				dx12World.numLightmaps++;
+			}
+
+			if (dx12World.numLightmaps > 0)
+			{
+				dx12.ri.Printf(PRINT_DEVELOPER,
+				               "DX12_LoadWorld: loaded %d external lightmaps from '%s/'\n",
+				               dx12World.numLightmaps, baseName);
+			}
+		}
+
 		dx12.ri.Printf(PRINT_DEVELOPER, "DX12_LoadWorld: uploaded %d lightmaps\n", dx12World.numLightmaps);
 	}
 
@@ -1360,24 +1455,31 @@ void DX12_LoadWorld(const char *name)
 		int vtxWrite = 0;  // next free vertex slot in stagingVerts
 		int idxWrite = 0;  // next free index  slot in stagingIndexes
 
+		/* Overbright shift for vertex colours – mirrors R_ColorShiftLightingBytes
+		 * in renderer1 so vertex-lit surfaces have the correct brightness. */
+		int lm_ob_shift;
+		{
+			cvar_t *r_mapOB = dx12.ri.Cvar_Get("r_mapOverBrightBits", "2", 0);
+			cvar_t *r_ob    = dx12.ri.Cvar_Get("r_overBrightBits",    "0", 0);
+			int     s       = (r_mapOB ? r_mapOB->integer : 2) - (r_ob ? r_ob->integer : 0);
+			lm_ob_shift = (s >= 0 && s <= 3) ? s : 0;
+		}
+
 		// Convert one drawVert_t → dx12WorldVertex_t
 		// Inline lambda emulated as a local macro for C compatibility
-#define CONVERT_VERT(bv, dv)                                      \
-		do {                                                          \
-			(dv).xyz[0]    = (bv).xyz[0];                             \
-			(dv).xyz[1]    = (bv).xyz[1];                             \
-			(dv).xyz[2]    = (bv).xyz[2];                             \
-			(dv).st[0]     = (bv).st[0];                              \
-			(dv).st[1]     = (bv).st[1];                              \
-			(dv).lm[0]     = (bv).lightmap[0];                        \
-			(dv).lm[1]     = (bv).lightmap[1];                        \
-			(dv).normal[0] = (bv).normal[0];                          \
-			(dv).normal[1] = (bv).normal[1];                          \
-			(dv).normal[2] = (bv).normal[2];                          \
-			(dv).color[0]  = (bv).color[0] / 255.0f;                 \
-			(dv).color[1]  = (bv).color[1] / 255.0f;                 \
-			(dv).color[2]  = (bv).color[2] / 255.0f;                 \
-			(dv).color[3]  = (bv).color[3] / 255.0f;                 \
+#define CONVERT_VERT(bv, dv)                                                   \
+		do {                                                                   \
+			(dv).xyz[0]    = (bv).xyz[0];                                      \
+			(dv).xyz[1]    = (bv).xyz[1];                                      \
+			(dv).xyz[2]    = (bv).xyz[2];                                      \
+			(dv).st[0]     = (bv).st[0];                                       \
+			(dv).st[1]     = (bv).st[1];                                       \
+			(dv).lm[0]     = (bv).lightmap[0];                                 \
+			(dv).lm[1]     = (bv).lightmap[1];                                 \
+			(dv).normal[0] = (bv).normal[0];                                   \
+			(dv).normal[1] = (bv).normal[1];                                   \
+			(dv).normal[2] = (bv).normal[2];                                   \
+			DX12_ShiftVertColor((bv).color, (dv).color, lm_ob_shift);          \
 		} while (0)
 
 		// ----------------------------------------------------------------
@@ -1573,13 +1675,11 @@ patch_overflow:
 		               dx12World.numDrawSurfs, vtxWrite, idxWrite);
 
 		// ----------------------------------------------------------------
-		// 6.  Sort draw surface list
+		// 6.  (Sort removed) Draw surfaces are kept in BSP order so that
+		//     submodel firstSurface/numSurfaces indices remain valid.
+		//     The render loop filters surfaces by category (sky / opaque /
+		//     fog / translucent) on the fly, so sorting is not required.
 		// ----------------------------------------------------------------
-		if (dx12World.numDrawSurfs > 1)
-		{
-			qsort(dx12World.drawSurfs, (size_t)dx12World.numDrawSurfs,
-			      sizeof(dx12DrawSurf_t), WLD_SortSurfs);
-		}
 
 		// ----------------------------------------------------------------
 		// 7.  Upload vertex + index staging arrays to GPU

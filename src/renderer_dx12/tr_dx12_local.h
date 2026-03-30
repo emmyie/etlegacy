@@ -78,6 +78,8 @@ typedef enum
 	DX12_TMOD_SCROLL,
 	DX12_TMOD_ROTATE,
 	DX12_TMOD_STRETCH,
+	DX12_TMOD_SCALE,    ///< tcMod scale sU sV – multiplies UV by (sU, sV) from origin
+	DX12_TMOD_TURB,     ///< tcMod turb base amplitude phase frequency
 } dx12TcModType_t;
 
 /**
@@ -116,6 +118,8 @@ typedef struct
 	float scroll[2];             ///< DX12_TMOD_SCROLL: UV scroll rates (units/s)
 	float rotateSpeed;           ///< DX12_TMOD_ROTATE: degrees per second (+ = CCW)
 	dx12Wave_t stretch;          ///< DX12_TMOD_STRETCH: wave envelope
+	float scale[2];              ///< DX12_TMOD_SCALE: U and V scale factors
+	dx12Wave_t turb;             ///< DX12_TMOD_TURB: wave envelope for turbulence
 } dx12TcMod_t;
 
 /**
@@ -201,6 +205,7 @@ typedef struct
 	qboolean noMip;                    ///< qtrue when mipmaps should be suppressed (RegisterShaderNoMip)
 	qboolean isDoubleSided;            ///< cull none/twosided – render back faces (e.g. fences, foliage)
 	qboolean valid;                    ///< qtrue once successfully built
+	qhandle_t skyOuterBox[6];          ///< skyParms outer-box face textures: [0]=_rt [1]=_bk [2]=_lf [3]=_ft [4]=_up [5]=_dn
 } dx12Material_t;
 
 /**

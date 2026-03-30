@@ -177,7 +177,7 @@ typedef struct
 
 /**
  * @struct dx12PerSurfConstants_t
- * @brief Inline root constants (12×DWORD) for per-draw-surface variation.
+ * @brief Inline root constants (13×DWORD) for per-draw-surface variation.
  *
  * Passed via SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF, …)
  * so the values are embedded directly in the command list and are correct for
@@ -201,6 +201,11 @@ typedef struct
  *   rgbGen wave     → stageColor.rgb = (wave, wave, wave)
  *   alphaGen const  → stageColor.a   = constantColor[3] / 255
  *   alphaGen wave   → stageColor.a   = waveValue
+ *
+ * useLightmap: 1.0 = multiply the diffuse sample by (lightmap * overBrightFactor)
+ * in the PS (correct for the first / only stage of a world surface).  0.0 = skip
+ * lightmap multiplication (correct for subsequent stages that rely on GPU blend
+ * modes to combine with the already-lightmapped framebuffer).
  */
 typedef struct
 {
@@ -213,16 +218,18 @@ typedef struct
 	float alphaTestThreshold;  ///< PS clip threshold (0 = off, +0.5 = GE128, -0.5 = LT128)
 	float isEntity;            ///< 1.0 = use entity ambient/directed light, 0.0 = use lightmap
 	float stageColor[4];       ///< Precomputed rgbGen/alphaGen result (r,g,b,a); default (1,1,1,1)
+	float useLightmap;         ///< 1.0 = apply lightmap*overbright in PS; 0.0 = raw diffuse only
+	float useVertexColor;      ///< 1.0 = multiply diffuse by per-vertex colour (rgbGen vertex); 0.0 = use stageColor only
 } dx12PerSurfConstants_t;
 
 /** Number of 32-bit root constants for dx12PerSurfConstants_t. */
-#define DX12_SCENE_PERSURF_DWORDS  12
+#define DX12_SCENE_PERSURF_DWORDS  14
 
 /** Root signature parameter indices for the 3D pipeline. */
 #define DX12_SCENE_ROOT_PARAM_CB        0  ///< Root CBV at b0 (dx12SceneConstants_t)
 #define DX12_SCENE_ROOT_PARAM_DIFFUSE   1  ///< Descriptor table t0 (diffuse SRV)
 #define DX12_SCENE_ROOT_PARAM_LIGHTMAP  2  ///< Descriptor table t1 (lightmap SRV)
-#define DX12_SCENE_ROOT_PARAM_PERSURF   3  ///< Root constants b1 (dx12PerSurfConstants_t, 12 DWORDs)
+#define DX12_SCENE_ROOT_PARAM_PERSURF   3  ///< Root constants b1 (dx12PerSurfConstants_t, 13 DWORDs)
 
 // ---------------------------------------------------------------------------
 // Per-entity scene entry
@@ -307,6 +314,12 @@ typedef struct
 	// Persistent decal list – cleared only by DX12_ClearDecals(), NOT by DX12_ClearScene()
 	dx12Decal_t decals[DX12_MAX_DECALS]; ///< Decal polygon list
 	int         numDecals;               ///< Active decal count
+
+	// Static sky box geometry – 36-vertex triangle-list (6 faces × 2 tris × 3 verts)
+	// Positions derived from renderer1's MakeSkyVec formula (SKY_BOX_SIZE = 4096 units).
+	// Upload-heap VB, filled once at init.  NULL when sky box rendering is unavailable.
+	ID3D12Resource *skyBoxVB;   ///< Sky box vertex buffer (upload heap)
+	UINT8          *skyBoxVBMapped; ///< Persistently-mapped CPU pointer
 
 	qboolean initialized; ///< qtrue after DX12_SceneInit()
 } dx12SceneState_t;

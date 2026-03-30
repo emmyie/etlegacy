@@ -171,6 +171,16 @@ qboolean DX12_LoadMDC(int slot, const char *name);
 void DX12_DrawEntity(const dx12SceneEntity_t *ent, D3D12_GPU_VIRTUAL_ADDRESS cbGpuVA);
 
 /**
+ * @brief Return the BSP submodel index for a brush model handle, or -1.
+ *
+ * Returns the integer N from a handle that was registered as "*N".
+ * Returns -1 for regular 3D model handles, NULL handles, or out-of-range
+ * handles.  Used by DX12_RenderScene to route brush model entities through
+ * the BSP world-geometry path rather than the per-model VB/IB path.
+ */
+int DX12_GetBrushSubmodelIdx(qhandle_t hModel);
+
+/**
  * @brief Release all GPU model resources (VBs and IBs).
  *
  * Should be called from R_DX12_Shutdown() before releasing the device.

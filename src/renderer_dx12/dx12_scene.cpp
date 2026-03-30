@@ -120,6 +120,8 @@ static const char g_worldShaderSource[] =
 	"    float stageColorG;\n"
 	"    float stageColorB;\n"
 	"    float stageColorA;\n"
+	"    float useLightmap;\n"
+	"    float useVertexColor;\n"
 	"};\n"
 	"\n"
 	"Texture2D    g_diffuse  : register(t0);\n"
@@ -180,15 +182,32 @@ static const char g_worldShaderSource[] =
 	"    if (isEntity > 0.0)\n"
 	"    {\n"
 	"        // Entity shading: ambient + N.L * directed, then overbright.\n"
+	"        // Entity models have no meaningful per-vertex colour; light comes\n"
+	"        // from the light grid sample in entityAmbient / entityDirected.\n"
 	"        float  nDotL  = saturate(dot(input.normal, entityLightDir.xyz));\n"
 	"        float3 light  = entityAmbient.rgb + nDotL * entityDirected.rgb;\n"
-	"        result = diffuse * float4(saturate(light * overBrightFactor), 1.0) * input.color;\n"
+	"        result = diffuse * float4(saturate(light * overBrightFactor), 1.0);\n"
+	"    }\n"
+	"    else if (useLightmap > 0.0)\n"
+	"    {\n"
+	"        // Lightmapped world surface.  renderer1 uses CGEN_IDENTITY for the\n"
+	"        // default implicit lightmap stage, meaning vertex colours are NOT\n"
+	"        // applied here – the lightmap provides all the lighting.\n"
+	"        float4 lightmap = g_lightmap.Sample(g_sampler, input.lm);\n"
+	"        result = diffuse * (lightmap * overBrightFactor);\n"
+	"    }\n"
+	"    else if (useVertexColor > 0.0)\n"
+	"    {\n"
+	"        // Vertex-lit surface (rgbGen vertex / exactVertex).\n"
+	"        // Vertex colours were overbright-shifted at load time to match\n"
+	"        // renderer1's R_ColorShiftLightingBytes, so use them directly.\n"
+	"        result = diffuse * input.color;\n"
 	"    }\n"
 	"    else\n"
 	"    {\n"
-	"        // World surface: lightmap overbright (matches GL1 R_ColorShiftLightingBytes).\n"
-	"        float4 lightmap = g_lightmap.Sample(g_sampler, input.lm);\n"
-	"        result = diffuse * (lightmap * overBrightFactor) * input.color;\n"
+	"        // rgbGen identity / constant / wave / sky stage: no per-vertex colour.\n"
+	"        // Lighting comes entirely from stageColor set by the CPU.\n"
+	"        result = diffuse;\n"
 	"    }\n"
 	"    result = float4(saturate(result.rgb), result.a);\n"
 	"\n"
@@ -204,6 +223,13 @@ static const char g_worldShaderSource[] =
 	"        float viewDist  = length(input.worldPos - cameraPos.xyz);\n"
 	"        float fogFactor = saturate((fogEnd - viewDist) / max(fogEnd - fogStart, 1.0));\n"
 	"        result.rgb      = lerp(fogColor.rgb, result.rgb, fogFactor);\n"
+	"    }\n"
+	"    // Gamma correction: entityLightDir.w holds 1/gamma (set by CPU each frame).\n"
+	"    // A value of 0.0 means no correction (identity).\n"
+	"    float invGamma = entityLightDir.w;\n"
+	"    if (invGamma > 0.01)\n"
+	"    {\n"
+	"        result.rgb = pow(max(result.rgb, float3(0.0001, 0.0001, 0.0001)), invGamma);\n"
 	"    }\n"
 	"    return result;\n"
 	"}\n";
@@ -349,12 +375,14 @@ static const char g_skyShaderSource[] =
 	"{\n"
 	"    VSOut vout;\n"
 	"    // Remove translation from viewProj so sky stays centred on the camera.\n"
-	"    // Build a rotation-only viewProj by zeroing out the translation column.\n"
+	"    // HLSL reads the C row-major matrix as column-major, so the translation\n"
+	"    // terms live in column 3 (rows 0-2) of the HLSL matrix.  Zero those three\n"
+	"    // elements so that the w=1 position component contributes no translation.\n"
 	"    float4x4 vpNoTrans = viewProj;\n"
-	"    vpNoTrans[3][0] = 0.0f;\n"
-	"    vpNoTrans[3][1] = 0.0f;\n"
-	"    vpNoTrans[3][2] = 0.0f;\n"
-	"    float4 clipPos = mul(float4(vin.pos, 1.0f), vpNoTrans);\n"
+	"    vpNoTrans[0][3] = 0.0f;\n"
+	"    vpNoTrans[1][3] = 0.0f;\n"
+	"    vpNoTrans[2][3] = 0.0f;\n"
+	"    float4 clipPos = mul(vpNoTrans, float4(vin.pos, 1.0f));\n"
 	"    // Force depth to far plane (NDC depth = 1.0) by setting w = z.\n"
 	"    vout.pos = clipPos.xyww;\n"
 	"    vout.st  = float2(uvM00 * vin.st.x + uvM01 * vin.st.y + uvOffsetU,\n"
@@ -721,6 +749,32 @@ static void SCN_BuildUVMatrix(dx12PerSurfConstants_t *psc, const dx12MaterialSta
 			m[3] = n[3]; m[4] = n[4]; m[5] = n[5];
 			break;
 		}
+		case DX12_TMOD_SCALE:
+		{
+			// Scale UV from origin: u' = scaleU * u, v' = scaleV * v
+			// Pre-multiply: new_m = S * old_m
+			m[0] *= mod->scale[0];
+			m[1] *= mod->scale[0];
+			m[2] *= mod->scale[0];
+			m[3] *= mod->scale[1];
+			m[4] *= mod->scale[1];
+			m[5] *= mod->scale[1];
+			break;
+		}
+		case DX12_TMOD_TURB:
+		{
+			// tcMod turb: sinusoidal UV distortion matching renderer1's RB_DeformTess.
+			// u' = u + amplitude * sin(v * 2π + phase*2π + time * frequency * 2π)
+			// v' = v + amplitude * sin(u * 2π + phase*2π + time * frequency * 2π)
+			// Approximation as a constant offset evaluated at (0.5, 0.5) since the
+			// exact per-vertex version requires CPU-side vertex processing.
+			// This gives the correct time-varying shimmer without per-vertex work.
+			float phase  = mod->turb.phase + timeSec * mod->turb.frequency;
+			float offset = mod->turb.amplitude * sinf(phase * (float)(2.0 * M_PI));
+			m[2] += offset;
+			m[5] += offset;
+			break;
+		}
 		default:
 			break;
 		}
@@ -1026,6 +1080,9 @@ static void SCN_DrawSurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDRESS 
 
 			psc.alphaTestThreshold = st->alphaTestThreshold;
 			psc.isEntity           = 0.0f; // world surface; entity draws set this to 1.0
+			psc.useLightmap        = (firstDraw && ds->lightmapIndex >= 0) ? 1.0f : 0.0f;
+			psc.useVertexColor     = (st->rgbGen == DX12_CGEN_VERTEX
+			                          || st->rgbGen == DX12_CGEN_EXACT_VERTEX) ? 1.0f : 0.0f;
 
 			// Evaluate rgbGen / alphaGen → stageColor modulator
 			SCN_ComputeStageColor(&psc, st, timeSec);
@@ -1035,7 +1092,7 @@ static void SCN_DrawSurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDRESS 
 			                              mat->isDoubleSided);
 			dx12.commandList->SetPipelineState(stagePso);
 
-			// Per-surface root constants (12 DWORDs)
+			// Per-surface root constants (14 DWORDs)
 			dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
 			                                                DX12_SCENE_PERSURF_DWORDS, &psc, 0);
 
@@ -1073,6 +1130,7 @@ static void SCN_DrawSurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDRESS 
 		psc.stageColor[1]  = 1.0f;
 		psc.stageColor[2]  = 1.0f;
 		psc.stageColor[3]  = 1.0f;
+		psc.useLightmap    = (ds->lightmapIndex >= 0) ? 1.0f : 0.0f;
 
 		dx12.commandList->SetPipelineState(dx12Scene.pso3D);
 		dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
@@ -1093,10 +1151,81 @@ static void SCN_DrawSurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDRESS 
 // DX12_DrawSkySurface
 // ---------------------------------------------------------------------------
 
+/** Size of the procedural sky box cube (camera-centred, used with no-translation view). */
+#define SKY_BOX_SIZE     4096.0f
+/** Number of vertices in the sky box VB (6 faces × 2 triangles × 3 verts, non-indexed). */
+#define SKY_BOX_NUMVERTS 36
+
+/**
+ * @brief Populate a 36-entry dx12WorldVertex_t array with sky box geometry.
+ *
+ * Generates 6 cube faces (non-indexed triangle list) using the same coordinate
+ * mapping as renderer1's MakeSkyVec (st_to_vec table in tr_sky.c).
+ *
+ * UV mapping: U = (s+1)/2, V = (1-t)/2  (matches renderer1 sky_min/sky_max = 0/1).
+ *
+ * The resulting vertices should be rendered with the no-translation sky VS so
+ * the cube stays centred on the camera regardless of world position.
+ */
+static void SCN_BuildSkyBoxVerts(dx12WorldVertex_t *verts)
+{
+	static const float B = SKY_BOX_SIZE;
+
+	/* Face definitions: [face][corner 0..3][x, y, z, u, v]
+	 * Corner order: (s=-1,t=-1), (s=1,t=-1), (s=1,t=1), (s=-1,t=1)
+	 * MakeSkyVec formula per face:
+	 *   Face 0 st_to_vec={3,-1,2} : XYZ = ( B, -s*B,  t*B)
+	 *   Face 1 st_to_vec={-3,1,2} : XYZ = (-B,  s*B,  t*B)
+	 *   Face 2 st_to_vec={1, 3,2} : XYZ = ( s*B, B,  t*B)
+	 *   Face 3 st_to_vec={-1,-3,2}: XYZ = (-s*B,-B,  t*B)
+	 *   Face 4 st_to_vec={-2,-1,3}: XYZ = (-t*B,-s*B, B)
+	 *   Face 5 st_to_vec={2,-1,-3}: XYZ = ( t*B,-s*B,-B)
+	 */
+	static const float fv[6][4][5] =
+	{
+		{ { B,  B, -B, 0.0f, 1.0f }, { B, -B, -B, 1.0f, 1.0f }, { B, -B,  B, 1.0f, 0.0f }, { B,  B,  B, 0.0f, 0.0f } },
+		{ {-B, -B, -B, 0.0f, 1.0f }, {-B,  B, -B, 1.0f, 1.0f }, {-B,  B,  B, 1.0f, 0.0f }, {-B, -B,  B, 0.0f, 0.0f } },
+		{ {-B,  B, -B, 0.0f, 1.0f }, { B,  B, -B, 1.0f, 1.0f }, { B,  B,  B, 1.0f, 0.0f }, {-B,  B,  B, 0.0f, 0.0f } },
+		{ { B, -B, -B, 0.0f, 1.0f }, {-B, -B, -B, 1.0f, 1.0f }, {-B, -B,  B, 1.0f, 0.0f }, { B, -B,  B, 0.0f, 0.0f } },
+		{ { B,  B,  B, 0.0f, 1.0f }, { B, -B,  B, 1.0f, 1.0f }, {-B, -B,  B, 1.0f, 0.0f }, {-B,  B,  B, 0.0f, 0.0f } },
+		{ {-B,  B, -B, 0.0f, 1.0f }, {-B, -B, -B, 1.0f, 1.0f }, { B, -B, -B, 1.0f, 0.0f }, { B,  B, -B, 0.0f, 0.0f } },
+	};
+	static const int triOrder[6] = { 0, 1, 2, 0, 2, 3 };
+
+	int face, vi;
+
+	for (face = 0; face < 6; face++)
+	{
+		for (vi = 0; vi < 6; vi++)
+		{
+			int               ci  = triOrder[vi];
+			dx12WorldVertex_t *v   = verts + face * 6 + vi;
+
+			v->xyz[0]    = fv[face][ci][0];
+			v->xyz[1]    = fv[face][ci][1];
+			v->xyz[2]    = fv[face][ci][2];
+			v->st[0]     = fv[face][ci][3];
+			v->st[1]     = fv[face][ci][4];
+			v->lm[0]     = 0.0f;
+			v->lm[1]     = 0.0f;
+			v->normal[0] = 0.0f;
+			v->normal[1] = 0.0f;
+			v->normal[2] = 1.0f;
+			v->color[0]  = 1.0f;
+			v->color[1]  = 1.0f;
+			v->color[2]  = 1.0f;
+			v->color[3]  = 1.0f;
+		}
+	}
+}
+
 /**
  * @brief Draw a single MST_SKY world surface using the sky PSO.
  *
- * Uses the sky PSO (pso3DSky) which strips view translation so the skybox
+ * First renders the procedural sky box (6 cube faces with skyParms textures if
+ * available), then renders the BSP sky polygon cloud stages on top.
+ *
+ * Uses the sky PSO (pso3DSky) which strips view translation so the sky box
  * stays centred on the camera, and forces NDC depth = 1.0 so sky is always
  * behind world geometry.  Falls back to the opaque PSO when pso3DSky is NULL.
  *
@@ -1122,28 +1251,119 @@ static void DX12_DrawSkySurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDR
 
 	mat = DX12_GetMaterial(ds->materialHandle);
 
-	// Sky PSO applies to all stages of this surface
-	if (dx12Scene.pso3DSky)
-	{
-		dx12.commandList->SetPipelineState(dx12Scene.pso3DSky);
-	}
-
 	dx12.commandList->SetGraphicsRootConstantBufferView(DX12_SCENE_ROOT_PARAM_CB, cbGpuVA);
-	// Sky has no lightmap – bind heap-start as a dummy for all stages
 	dx12.commandList->SetGraphicsRootDescriptorTable(DX12_SCENE_ROOT_PARAM_LIGHTMAP,
 	                                                 dx12.srvHeap->GetGPUDescriptorHandleForHeapStart());
 
+	// -----------------------------------------------------------------------
+	// Pass 1: Procedural sky box (skyParms outer-box faces).
+	// Uses pso3DSky (translation-stripped view + depth forced to 1.0) so the
+	// cube stays centred on the camera regardless of world position.
+	// Drawn BEFORE the BSP cloud stages so the background sky colour shows
+	// through any transparent / alphaTest cloud layers.
+	// -----------------------------------------------------------------------
+	if (mat && dx12Scene.skyBoxVB && dx12Scene.skyBoxVBMapped)
+	{
+		// Check whether this material has at least one sky box face loaded.
+		qboolean hasSkyBox = qfalse;
+		int      fi;
+
+		for (fi = 0; fi < 6; fi++)
+		{
+			if (mat->skyOuterBox[fi]) { hasSkyBox = qtrue; break; }
+		}
+
+		if (hasSkyBox)
+		{
+			// Sky PSO: translation-stripped view + NDC depth forced to 1.0.
+			// Only used for the procedural sky box, NOT for BSP cloud stages.
+			if (dx12Scene.pso3DSky)
+			{
+				dx12.commandList->SetPipelineState(dx12Scene.pso3DSky);
+			}
+			// Renderer1 sky_texorder: face render index → skyOuterBox array index.
+			// Face 0 → [0]=_rt, Face 1 → [2]=_lf, Face 2 → [1]=_bk,
+			// Face 3 → [3]=_ft, Face 4 → [4]=_up, Face 5 → [5]=_dn.
+			static const int skyTexOrder[6] = { 0, 2, 1, 3, 4, 5 };
+			D3D12_VERTEX_BUFFER_VIEW skyVBV  = {};
+
+			skyVBV.BufferLocation = dx12Scene.skyBoxVB->GetGPUVirtualAddress();
+			skyVBV.SizeInBytes    = SKY_BOX_NUMVERTS * (UINT)sizeof(dx12WorldVertex_t);
+			skyVBV.StrideInBytes  = (UINT)sizeof(dx12WorldVertex_t);
+			dx12.commandList->IASetVertexBuffers(0, 1, &skyVBV);
+
+			for (fi = 0; fi < 6; fi++)
+			{
+				qhandle_t                  texHandle = mat->skyOuterBox[skyTexOrder[fi]];
+				dx12Texture_t             *tex       = DX12_GetTexture(texHandle);
+				D3D12_GPU_DESCRIPTOR_HANDLE srvHandle;
+				dx12PerSurfConstants_t      psc;
+
+				srvHandle = (tex && tex->resource)
+				            ? tex->gpuHandle
+				            : dx12.srvHeap->GetGPUDescriptorHandleForHeapStart();
+
+				Com_Memset(&psc, 0, sizeof(psc));
+				psc.uvM00         = 1.0f;
+				psc.uvM11         = 1.0f;
+				psc.stageColor[0] = 1.0f;
+				psc.stageColor[1] = 1.0f;
+				psc.stageColor[2] = 1.0f;
+				psc.stageColor[3] = 1.0f;
+
+				dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
+				                                                DX12_SCENE_PERSURF_DWORDS, &psc, 0);
+				dx12.commandList->SetGraphicsRootDescriptorTable(DX12_SCENE_ROOT_PARAM_DIFFUSE,
+				                                                 srvHandle);
+				// Non-indexed draw: 6 vertices per face (2 triangles)
+				dx12.commandList->DrawInstanced(6, 1, (UINT)(fi * 6), 0);
+			}
+
+			// Restore the world vertex + index buffers for the cloud stage pass.
+			if (dx12World.loaded && dx12World.vertexBuffer && dx12World.indexBuffer)
+			{
+				D3D12_VERTEX_BUFFER_VIEW wvbv = {};
+				D3D12_INDEX_BUFFER_VIEW  wibv = {};
+
+				wvbv.BufferLocation = dx12World.vertexBuffer->GetGPUVirtualAddress();
+				wvbv.SizeInBytes    = dx12World.numVertices * (UINT)sizeof(dx12WorldVertex_t);
+				wvbv.StrideInBytes  = (UINT)sizeof(dx12WorldVertex_t);
+
+				wibv.BufferLocation = dx12World.indexBuffer->GetGPUVirtualAddress();
+				wibv.SizeInBytes    = dx12World.numIndexes * (UINT)sizeof(UINT32);
+				wibv.Format         = DXGI_FORMAT_R32_UINT;
+
+				dx12.commandList->IASetVertexBuffers(0, 1, &wvbv);
+				dx12.commandList->IASetIndexBuffer(&wibv);
+			}
+
+			// Reset to opaque PSO for Pass 2 (BSP cloud stages use regular world PSO).
+			if (dx12Scene.pso3D)
+			{
+				dx12.commandList->SetPipelineState(dx12Scene.pso3D);
+			}
+		}
+	}
+
+	// -----------------------------------------------------------------------
+	// Pass 2: BSP sky polygon cloud stages (tcMod scroll/scale animated layers).
+	// Each stage selects its PSO via SCN_SelectStagePSO using the full world
+	// view transform (no translation stripping) so the polygon renders at its
+	// correct BSP position.  pso3DSky is NOT used here.
+	// -----------------------------------------------------------------------
 	if (mat && mat->numStages > 0)
 	{
-		float timeSec = (float)g_sceneTimeMs / 1000.0f;
+		float    timeSec  = (float)g_sceneTimeMs / 1000.0f;
+		qboolean firstDraw = qtrue;
 
 		for (si = 0; si < mat->numStages; si++)
 		{
-			const dx12MaterialStage_t *st = &mat->stages[si];
-			dx12PerSurfConstants_t     psc;
-			qhandle_t                  diffHandle = 0;
-			dx12Texture_t             *diffTex    = NULL;
+			const dx12MaterialStage_t  *st = &mat->stages[si];
+			dx12PerSurfConstants_t      psc;
+			qhandle_t                   diffHandle = 0;
+			dx12Texture_t              *diffTex    = NULL;
 			D3D12_GPU_DESCRIPTOR_HANDLE srvHandle;
+			ID3D12PipelineState        *stagePso;
 
 			if (!st->active)
 			{
@@ -1167,9 +1387,14 @@ static void DX12_DrawSkySurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDR
 			SCN_BuildUVMatrix(&psc, st, timeSec);
 			psc.alphaTestThreshold = st->alphaTestThreshold;
 			psc.isEntity           = 0.0f;
+			psc.useLightmap        = 0.0f; // sky surfaces have no lightmap
+			psc.useVertexColor     = 0.0f;
 
-			// Evaluate rgbGen / alphaGen → stageColor modulator
 			SCN_ComputeStageColor(&psc, st, timeSec);
+
+			// Select PSO based on blend mode (regular world PSO, NOT sky PSO).
+			stagePso = SCN_SelectStagePSO(st->srcBlend, st->dstBlend, firstDraw, qfalse);
+			dx12.commandList->SetPipelineState(stagePso);
 
 			dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
 			                                                DX12_SCENE_PERSURF_DWORDS, &psc, 0);
@@ -1181,6 +1406,7 @@ static void DX12_DrawSkySurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDR
 
 			dx12.commandList->SetGraphicsRootDescriptorTable(DX12_SCENE_ROOT_PARAM_DIFFUSE, srvHandle);
 			dx12.commandList->DrawIndexedInstanced((UINT)ds->numIndexes, 1, (UINT)ds->firstIndex, 0, 0);
+			firstDraw = qfalse;
 		}
 	}
 	else
@@ -1237,9 +1463,9 @@ qboolean DX12_SceneInit(void)
 	//   Param 0 (DX12_SCENE_ROOT_PARAM_CB):       Root CBV at b0  (VS + PS)
 	//   Param 1 (DX12_SCENE_ROOT_PARAM_DIFFUSE):  Descriptor table – 1 SRV at t0
 	//   Param 2 (DX12_SCENE_ROOT_PARAM_LIGHTMAP): Descriptor table – 1 SRV at t1
-	//   Param 3 (DX12_SCENE_ROOT_PARAM_PERSURF):  32-bit constants at b1 (12 DWORDs)
+	//   Param 3 (DX12_SCENE_ROOT_PARAM_PERSURF):  32-bit constants at b1 (13 DWORDs)
 	//     uvM00, uvM01, uvOffsetU, uvM10, uvM11, uvOffsetV, alphaTestThreshold, isEntity,
-	//     stageColorR, stageColorG, stageColorB, stageColorA
+	//     stageColorR, stageColorG, stageColorB, stageColorA, useLightmap
 	//   Static sampler at s0: linear-wrap
 	// ----------------------------------------------------------------
 	{
@@ -1415,7 +1641,7 @@ qboolean DX12_SceneInit(void)
 		// Rasterizer
 		pso.RasterizerState.FillMode              = D3D12_FILL_MODE_SOLID;
 		pso.RasterizerState.CullMode              = D3D12_CULL_MODE_BACK;
-		pso.RasterizerState.FrontCounterClockwise = TRUE;  // BSP/MD3 geometry uses CCW winding (OpenGL convention)
+		pso.RasterizerState.FrontCounterClockwise = FALSE; // D3D12 viewport flips Y: OpenGL CCW appears CW in D3D12 screen space, so CW=front
 		pso.RasterizerState.DepthBias             = D3D12_DEFAULT_DEPTH_BIAS;
 		pso.RasterizerState.DepthBiasClamp        = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
 		pso.RasterizerState.SlopeScaledDepthBias  = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
@@ -1552,7 +1778,7 @@ qboolean DX12_SceneInit(void)
 
 			psoT.RasterizerState.FillMode              = D3D12_FILL_MODE_SOLID;
 			psoT.RasterizerState.CullMode              = D3D12_CULL_MODE_NONE; // no back-face cull for translucent
-			psoT.RasterizerState.FrontCounterClockwise = TRUE;
+			psoT.RasterizerState.FrontCounterClockwise = FALSE;
 			psoT.RasterizerState.DepthBias             = D3D12_DEFAULT_DEPTH_BIAS;
 			psoT.RasterizerState.DepthBiasClamp        = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
 			psoT.RasterizerState.SlopeScaledDepthBias  = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
@@ -1662,7 +1888,7 @@ qboolean DX12_SceneInit(void)
 
 			psoSky.RasterizerState.FillMode              = D3D12_FILL_MODE_SOLID;
 			psoSky.RasterizerState.CullMode              = D3D12_CULL_MODE_NONE;
-			psoSky.RasterizerState.FrontCounterClockwise = TRUE;
+			psoSky.RasterizerState.FrontCounterClockwise = FALSE;
 			psoSky.RasterizerState.DepthBias             = D3D12_DEFAULT_DEPTH_BIAS;
 			psoSky.RasterizerState.DepthBiasClamp        = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
 			psoSky.RasterizerState.SlopeScaledDepthBias  = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
@@ -1766,7 +1992,7 @@ qboolean DX12_SceneInit(void)
 
 			psoAdd.RasterizerState.FillMode              = D3D12_FILL_MODE_SOLID;
 			psoAdd.RasterizerState.CullMode              = D3D12_CULL_MODE_NONE;
-			psoAdd.RasterizerState.FrontCounterClockwise = TRUE;
+			psoAdd.RasterizerState.FrontCounterClockwise = FALSE;
 			psoAdd.RasterizerState.DepthBias             = D3D12_DEFAULT_DEPTH_BIAS;
 			psoAdd.RasterizerState.DepthBiasClamp        = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
 			psoAdd.RasterizerState.SlopeScaledDepthBias  = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
@@ -1869,7 +2095,7 @@ qboolean DX12_SceneInit(void)
 
 			psoMod.RasterizerState.FillMode              = D3D12_FILL_MODE_SOLID;
 			psoMod.RasterizerState.CullMode              = D3D12_CULL_MODE_NONE;
-			psoMod.RasterizerState.FrontCounterClockwise = TRUE;
+			psoMod.RasterizerState.FrontCounterClockwise = FALSE;
 			psoMod.RasterizerState.DepthBias             = D3D12_DEFAULT_DEPTH_BIAS;
 			psoMod.RasterizerState.DepthBiasClamp        = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
 			psoMod.RasterizerState.SlopeScaledDepthBias  = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
@@ -2030,6 +2256,57 @@ qboolean DX12_SceneInit(void)
 		// If malloc fails the poly pass will be silently skipped
 	}
 
+	// ----------------------------------------------------------------
+	// Static sky box vertex buffer (36 vertices, upload heap, filled once)
+	// ----------------------------------------------------------------
+	{
+		D3D12_HEAP_PROPERTIES heapProps = {};
+		D3D12_RESOURCE_DESC   resDesc   = {};
+		D3D12_RANGE           readRange = { 0, 0 };
+		UINT64                skyVBSize = (UINT64)SKY_BOX_NUMVERTS * sizeof(dx12WorldVertex_t);
+
+		heapProps.Type           = D3D12_HEAP_TYPE_UPLOAD;
+		resDesc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+		resDesc.Width            = skyVBSize;
+		resDesc.Height           = 1;
+		resDesc.DepthOrArraySize = 1;
+		resDesc.MipLevels        = 1;
+		resDesc.Format           = DXGI_FORMAT_UNKNOWN;
+		resDesc.SampleDesc.Count = 1;
+		resDesc.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+		hr = dx12.device->CreateCommittedResource(
+			&heapProps,
+			D3D12_HEAP_FLAG_NONE,
+			&resDesc,
+			D3D12_RESOURCE_STATE_GENERIC_READ,
+			NULL,
+			IID_PPV_ARGS(&dx12Scene.skyBoxVB));
+
+		if (FAILED(hr))
+		{
+			dx12.ri.Printf(PRINT_WARNING,
+			               "DX12_SceneInit: sky box VB creation failed (0x%08lx); sky box disabled\n", hr);
+			dx12Scene.skyBoxVB       = NULL;
+			dx12Scene.skyBoxVBMapped = NULL;
+		}
+		else
+		{
+			hr = dx12Scene.skyBoxVB->Map(0, &readRange, (void **)&dx12Scene.skyBoxVBMapped);
+			if (FAILED(hr))
+			{
+				dx12Scene.skyBoxVB->Release();
+				dx12Scene.skyBoxVB       = NULL;
+				dx12Scene.skyBoxVBMapped = NULL;
+			}
+			else
+			{
+				// Fill in the static sky box geometry once (positions never change)
+				SCN_BuildSkyBoxVerts((dx12WorldVertex_t *)dx12Scene.skyBoxVBMapped);
+			}
+		}
+	}
+
 	dx12Scene.initialized = qtrue;
 	dx12.ri.Printf(PRINT_ALL, "DX12_SceneInit: 3D scene pipeline ready\n");
 	return qtrue;
@@ -2110,6 +2387,14 @@ void DX12_SceneShutdown(void)
 	{
 		dx12.ri.Free(dx12Scene.polyVerts);
 		dx12Scene.polyVerts = NULL;
+	}
+
+	if (dx12Scene.skyBoxVB)
+	{
+		dx12Scene.skyBoxVB->Unmap(0, NULL);
+		dx12Scene.skyBoxVB->Release();
+		dx12Scene.skyBoxVB       = NULL;
+		dx12Scene.skyBoxVBMapped = NULL;
 	}
 
 	Com_Memset(&dx12Scene, 0, sizeof(dx12Scene));
@@ -2238,6 +2523,82 @@ void DX12_AddScenePoly(qhandle_t hShader, int numVerts, const polyVert_t *verts)
 		}
 
 		dx12Scene.numPolyVerts += 3;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SCN_DrawBrushModelEntity
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Draw all world surfaces belonging to BSP submodel @p submodelIdx.
+ *
+ * Brush model entities (doors, platforms, buildings) are stored as BSP
+ * inline models ("*N") and share the world VB/IB.  This function rebinds
+ * those buffers (entity model draws may have displaced them), then iterates
+ * the surfaces in dx12World.models[submodelIdx] and calls SCN_DrawSurface
+ * for each one.
+ *
+ * @p cbGpuVA should point to the entity's dedicated CB slot (populated with
+ * the entity's model matrix, so animated brush entities – doors, platforms –
+ * appear at their current world position).  SCN_DrawSurface hardcodes
+ * psc.isEntity = 0 so brush surfaces always use the lightmap lighting path.
+ *
+ * @param submodelIdx  1-based index into dx12World.models[].
+ * @param cbGpuVA      GPU VA of the entity's constant-buffer slot.
+ */
+static void SCN_DrawBrushModelEntity(int submodelIdx, D3D12_GPU_VIRTUAL_ADDRESS cbGpuVA)
+{
+	const dx12WorldModel_t  *model;
+	int                      i;
+	D3D12_VERTEX_BUFFER_VIEW vbv = {};
+	D3D12_INDEX_BUFFER_VIEW  ibv = {};
+
+	if (!dx12World.loaded)
+	{
+		return;
+	}
+
+	if (submodelIdx <= 0 || submodelIdx >= dx12World.numModels)
+	{
+		return;
+	}
+
+	model = &dx12World.models[submodelIdx];
+
+	if (model->numSurfaces <= 0)
+	{
+		return;
+	}
+
+	if (!dx12World.vertexBuffer || !dx12World.indexBuffer)
+	{
+		return;
+	}
+
+	// Rebind world VB/IB – entity model draws above may have changed
+	// the active input-assembler buffers.
+	vbv.BufferLocation = dx12World.vertexBuffer->GetGPUVirtualAddress();
+	vbv.SizeInBytes    = dx12World.numVertices * (UINT)sizeof(dx12WorldVertex_t);
+	vbv.StrideInBytes  = (UINT)sizeof(dx12WorldVertex_t);
+
+	ibv.BufferLocation = dx12World.indexBuffer->GetGPUVirtualAddress();
+	ibv.SizeInBytes    = dx12World.numIndexes * (UINT)sizeof(int);
+	ibv.Format         = DXGI_FORMAT_R32_UINT;
+
+	dx12.commandList->IASetVertexBuffers(0, 1, &vbv);
+	dx12.commandList->IASetIndexBuffer(&ibv);
+
+	for (i = 0; i < model->numSurfaces; i++)
+	{
+		int dsIdx = model->firstSurface + i;
+
+		if (dsIdx < 0 || dsIdx >= dx12World.numDrawSurfs)
+		{
+			continue;
+		}
+
+		SCN_DrawSurface(&dx12World.drawSurfs[dsIdx], cbGpuVA);
 	}
 }
 
@@ -2400,7 +2761,14 @@ void DX12_RenderScene(const refdef_t *fd)
 	cb.entityDirected[0] = 0.0f; cb.entityDirected[1] = 0.0f;
 	cb.entityDirected[2] = 0.0f; cb.entityDirected[3] = 0.0f;
 	cb.entityLightDir[0] = 0.0f; cb.entityLightDir[1] = 0.0f;
-	cb.entityLightDir[2] = 1.0f; cb.entityLightDir[3] = 0.0f;
+	cb.entityLightDir[2] = 1.0f;
+	// entityLightDir.w stores 1/gamma for the pixel shader gamma correction pass.
+	{
+		cvar_t *r_gamma_cv = dx12.ri.Cvar_Get("r_gamma", "1.3", 0);
+		float   gamma      = (r_gamma_cv && r_gamma_cv->value > 0.1f) ? r_gamma_cv->value : 1.3f;
+
+		cb.entityLightDir[3] = 1.0f / gamma;
+	}
 
 	SCN_UpdateCB(cbBaseSlot, &cb);
 
@@ -2533,21 +2901,24 @@ void DX12_RenderScene(const refdef_t *fd)
 		dx12.commandList->IASetIndexBuffer(&ibv);
 
 		// ----------------------------------------------------------------
-		// 5a. Sky surfaces
-		//
-		// TODO: Implement proper skybox / sky-portal rendering.  Until then
-		// sky surfaces are intentionally skipped so the background clear
-		// colour shows through — this is preferable to a pure-white blob.
-		// ----------------------------------------------------------------
-		/* sky surfaces intentionally not drawn here */
-		// ----------------------------------------------------------------
 		// 5a. Sky surfaces – rendered at far plane using sky PSO.
+		//     Only model[0] (worldspawn) surfaces; brush entities never have sky.
 		// ----------------------------------------------------------------
 		if (dx12Scene.pso3DSky)
 		{
 			int i;
+			int worldFirst = (dx12World.numModels > 0) ? dx12World.models[0].firstSurface : 0;
+			int worldEnd   = (dx12World.numModels > 0 && dx12World.models[0].firstSurface >= 0)
+			                 ? worldFirst + dx12World.models[0].numSurfaces
+			                 : dx12World.numDrawSurfs;
 
-			for (i = 0; i < dx12World.numDrawSurfs; i++)
+			if (worldFirst < 0)
+			{
+				worldFirst = 0;
+				worldEnd   = dx12World.numDrawSurfs;
+			}
+
+			for (i = worldFirst; i < worldEnd && i < dx12World.numDrawSurfs; i++)
 			{
 				const dx12DrawSurf_t *ds  = &dx12World.drawSurfs[i];
 				const dx12Material_t *mat = DX12_GetMaterial(ds->materialHandle);
@@ -2560,12 +2931,26 @@ void DX12_RenderScene(const refdef_t *fd)
 		}
 
 		// ----------------------------------------------------------------
-		// 5b. Opaque world surfaces (not sky, not translucent, not fog)
+		// 5b. Opaque world surfaces (not sky, not translucent, not fog).
+		//     Only model[0] (worldspawn) surfaces are drawn here.
+		//     Brush entity surfaces (models[1..]) are drawn in pass 6
+		//     with their own model matrix, so we must not draw them here
+		//     with the identity model matrix.
 		// ----------------------------------------------------------------
 		{
 			int i;
+			int worldFirst = (dx12World.numModels > 0) ? dx12World.models[0].firstSurface : 0;
+			int worldEnd   = (dx12World.numModels > 0 && dx12World.models[0].firstSurface >= 0)
+			                 ? worldFirst + dx12World.models[0].numSurfaces
+			                 : dx12World.numDrawSurfs;
 
-			for (i = 0; i < dx12World.numDrawSurfs; i++)
+			if (worldFirst < 0)
+			{
+				worldFirst = 0;
+				worldEnd   = dx12World.numDrawSurfs;
+			}
+
+			for (i = worldFirst; i < worldEnd && i < dx12World.numDrawSurfs; i++)
 			{
 				const dx12DrawSurf_t  *ds  = &dx12World.drawSurfs[i];
 				const dx12Material_t  *mat = DX12_GetMaterial(ds->materialHandle);
@@ -2578,12 +2963,22 @@ void DX12_RenderScene(const refdef_t *fd)
 		}
 
 		// ----------------------------------------------------------------
-		// 5c. Fog-tagged surfaces
+		// 5c. Fog-tagged surfaces (model[0] only)
 		// ----------------------------------------------------------------
 		{
 			int i;
+			int worldFirst = (dx12World.numModels > 0) ? dx12World.models[0].firstSurface : 0;
+			int worldEnd   = (dx12World.numModels > 0 && dx12World.models[0].firstSurface >= 0)
+			                 ? worldFirst + dx12World.models[0].numSurfaces
+			                 : dx12World.numDrawSurfs;
 
-			for (i = 0; i < dx12World.numDrawSurfs; i++)
+			if (worldFirst < 0)
+			{
+				worldFirst = 0;
+				worldEnd   = dx12World.numDrawSurfs;
+			}
+
+			for (i = worldFirst; i < worldEnd && i < dx12World.numDrawSurfs; i++)
 			{
 				const dx12DrawSurf_t  *ds  = &dx12World.drawSurfs[i];
 				const dx12Material_t  *mat = DX12_GetMaterial(ds->materialHandle);
@@ -2594,10 +2989,39 @@ void DX12_RenderScene(const refdef_t *fd)
 				}
 			}
 		}
+		// ----------------------------------------------------------------
+		// 5d. Translucent world surfaces (model[0] only).
+		//     Rendered after opaque + fog so alpha blending composites
+		//     correctly over solid geometry.
+		// ----------------------------------------------------------------
+		{
+			int i;
+			int worldFirst = (dx12World.numModels > 0) ? dx12World.models[0].firstSurface : 0;
+			int worldEnd   = (dx12World.numModels > 0 && dx12World.models[0].firstSurface >= 0)
+			                 ? worldFirst + dx12World.models[0].numSurfaces
+			                 : dx12World.numDrawSurfs;
+
+			if (worldFirst < 0)
+			{
+				worldFirst = 0;
+				worldEnd   = dx12World.numDrawSurfs;
+			}
+
+			for (i = worldFirst; i < worldEnd && i < dx12World.numDrawSurfs; i++)
+			{
+				const dx12DrawSurf_t  *ds  = &dx12World.drawSurfs[i];
+				const dx12Material_t  *mat = DX12_GetMaterial(ds->materialHandle);
+
+				if (mat && mat->isTranslucent)
+				{
+					SCN_DrawSurface(ds, cbBaseGpuVA);
+				}
+			}
+		}
 	}
 
 	// ----------------------------------------------------------------
-	// 6.  Entities (sorted back-to-front by distance; Issue #15 fix)
+	// 6.  Entities(sorted back-to-front by distance; Issue #15 fix)
 	//     Each entity uses its own dedicated CB slot so all recorded
 	//     draw commands reference unique CB memory.
 	//     Entity ambient + directed light from light grid (Issue #10).
@@ -2668,26 +3092,44 @@ void DX12_RenderScene(const refdef_t *fd)
 			entCB.entityLightDir[0] = ent->lightDir[0];
 			entCB.entityLightDir[1] = ent->lightDir[1];
 			entCB.entityLightDir[2] = ent->lightDir[2];
-			entCB.entityLightDir[3] = 0.0f;
+			// entityLightDir.w = 1/gamma for pixel shader gamma correction (matches world CB)
+			entCB.entityLightDir[3] = cb.entityLightDir[3];
 
 			// Write to the entity's dedicated slot
 			SCN_UpdateCB(entSlot, &entCB);
 
-			// Per-surface root constants for entity: isEntity=1, identity UV transform, white stageColor
-			entPsc.uvM00              = 1.0f;
-			entPsc.uvM11              = 1.0f;
-			entPsc.alphaTestThreshold = 0.0f;
-			entPsc.isEntity           = 1.0f;
-			entPsc.stageColor[0]      = 1.0f;
-			entPsc.stageColor[1]      = 1.0f;
-			entPsc.stageColor[2]      = 1.0f;
-			entPsc.stageColor[3]      = 1.0f;
+			// Dispatch based on model type:
+			//   - Brush model entity (*N): draw surfaces from the world VB/IB using
+			//     the entity's CB for its model transform.  Lightmap lighting is used
+			//     because SCN_DrawSurface always sets psc.isEntity = 0 for world surfs.
+			//   - Regular 3D model: bind per-model VB/IB via DX12_DrawEntity.
+			{
+				int brushSubmodel = DX12_GetBrushSubmodelIdx(ent->hModel);
 
-			dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
-			                                                DX12_SCENE_PERSURF_DWORDS, &entPsc, 0);
+				if (brushSubmodel > 0)
+				{
+					SCN_DrawBrushModelEntity(brushSubmodel, entCBGpuVA);
+				}
+				else
+				{
+					// Per-surface root constants for entity: isEntity=1, identity UV transform, white stageColor
+					entPsc.uvM00              = 1.0f;
+					entPsc.uvM11              = 1.0f;
+					entPsc.alphaTestThreshold = 0.0f;
+					entPsc.isEntity           = 1.0f;
+					entPsc.useLightmap        = 0.0f; // entities use ambient/directed light, not lightmap
+					entPsc.stageColor[0]      = 1.0f;
+					entPsc.stageColor[1]      = 1.0f;
+					entPsc.stageColor[2]      = 1.0f;
+					entPsc.stageColor[3]      = 1.0f;
 
-			// Draw the entity's model surfaces
-			DX12_DrawEntity(ent, entCBGpuVA);
+					dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
+					                                                DX12_SCENE_PERSURF_DWORDS, &entPsc, 0);
+
+					// Draw the entity's model surfaces
+					DX12_DrawEntity(ent, entCBGpuVA);
+				}
+			}
 		}
 
 		// Reset per-surface root constants back to world defaults after entity pass
@@ -2700,6 +3142,7 @@ void DX12_RenderScene(const refdef_t *fd)
 			pscWorld.stageColor[1] = 1.0f;
 			pscWorld.stageColor[2] = 1.0f;
 			pscWorld.stageColor[3] = 1.0f;
+			pscWorld.useLightmap   = 1.0f; // world default: apply lightmap
 			dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
 			                                                DX12_SCENE_PERSURF_DWORDS, &pscWorld, 0);
 		}
@@ -2806,13 +3249,14 @@ void DX12_RenderScene(const refdef_t *fd)
 
 			dx12.commandList->SetGraphicsRootConstantBufferView(DX12_SCENE_ROOT_PARAM_CB,
 			                                                    cbBaseGpuVA);
-			// Full struct update: identity UV, white stageColor (no-op modulator)
+			// Full struct update: identity UV, white stageColor (no-op modulator), no lightmap
 			polyPsc.uvM00         = 1.0f;
 			polyPsc.uvM11         = 1.0f;
 			polyPsc.stageColor[0] = 1.0f;
 			polyPsc.stageColor[1] = 1.0f;
 			polyPsc.stageColor[2] = 1.0f;
 			polyPsc.stageColor[3] = 1.0f;
+			polyPsc.useLightmap   = 0.0f; // polys have no lightmap – rely on vertex colour
 			dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
 			                                                DX12_SCENE_PERSURF_DWORDS, &polyPsc, 0);
 			dx12.commandList->SetGraphicsRootDescriptorTable(DX12_SCENE_ROOT_PARAM_DIFFUSE,
