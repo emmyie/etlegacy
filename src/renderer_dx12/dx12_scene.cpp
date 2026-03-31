@@ -53,6 +53,14 @@
 #include "dx12_poly.h"
 #include "dx12_model.h"
 
+// Draw-pass counters referenced (extern) from tr_dx12_backend.cpp debug output.
+int dx12DrawCountSky        = 0;
+int dx12DrawCountOpaque     = 0;
+int dx12DrawCountTranslucent = 0;
+int dx12DrawCountFlare      = 0;
+int dx12DrawCountFog        = 0;
+int dx12NumFogVolumes       = 0;
+
 #ifdef _WIN32
 
 #include <math.h>   // tanf, (float)M_PI
@@ -1021,7 +1029,6 @@ static void SCN_DrawSurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDRESS 
 
 	mat = DX12_GetMaterial(ds->materialHandle);
 
-	// Bind the constant buffer once – it is shared across all stages of this surface.
 	dx12.commandList->SetGraphicsRootConstantBufferView(DX12_SCENE_ROOT_PARAM_CB, cbGpuVA);
 
 	// Lightmap handle is the same for all stages – resolve it once here.

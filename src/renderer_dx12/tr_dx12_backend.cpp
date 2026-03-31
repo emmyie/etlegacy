@@ -1173,6 +1173,140 @@ void DX12_InitSwapchain(void)
 	}
 }
 
+// Simple JSON escaper for log output (very minimal, good enough for our dumps)
+static void DX12_EscapeJsonString( const char* in, char* out, size_t outSize )
+{
+	size_t o = 0;
+	for ( size_t i = 0; in[ i ] && o + 2 < outSize; i++ )
+	{
+		unsigned char c = ( unsigned char )in[ i ];
+		if ( c == '\"' || c == '\\' )
+		{
+			out[ o++ ] = '\\';
+			out[ o++ ] = ( char )c;
+		}
+		else if ( c >= 0x20 )
+		{
+			out[ o++ ] = ( char )c;
+		}
+		// control chars are skipped
+	}
+	out[ o ] = '\0';
+}
+
+static void R_DX12_DumpState_f( void )
+{
+	int i;
+	char buf[ 1024 ];
+
+	// Header
+	dx12.ri.Printf( PRINT_ALL, "{\n" );
+
+	// Basic renderer info
+	dx12.ri.Printf( PRINT_ALL, "  \"renderer\": \"dx12\",\n" );
+	dx12.ri.Printf( PRINT_ALL, "  \"num_textures\": %d,\n", dx12NumShaders );
+	dx12.ri.Printf( PRINT_ALL, "  \"num_models\": %d,\n", dx12NumModels );
+
+	// Texture summary
+	int validTextures = 0;
+	int missingTextures = 0;
+
+	for ( i = 0; i < dx12NumShaders; i++ )
+	{
+		if ( !dx12Shaders[ i ].valid )
+			continue;
+
+		if ( dx12Shaders[ i ].tex.resource )
+			validTextures++;
+		else
+			missingTextures++;
+	}
+
+	dx12.ri.Printf( PRINT_ALL, "  \"textures\": {\n" );
+	dx12.ri.Printf( PRINT_ALL, "    \"loaded\": %d,\n", validTextures );
+	dx12.ri.Printf( PRINT_ALL, "    \"missing\": %d\n", missingTextures );
+	dx12.ri.Printf( PRINT_ALL, "  },\n" );
+
+	// List missing textures by name
+	dx12.ri.Printf( PRINT_ALL, "  \"missing_texture_names\": [\n" );
+	qboolean first = qtrue;
+	for ( i = 0; i < dx12NumShaders; i++ )
+	{
+		if ( !dx12Shaders[ i ].valid || dx12Shaders[ i ].tex.resource )
+			continue;
+
+		DX12_EscapeJsonString( dx12Shaders[ i ].name, buf, sizeof( buf ) );
+		dx12.ri.Printf( PRINT_ALL,
+			"    %s\"%s\"\n",
+			first ? "" : ", ",
+			buf );
+		first = qfalse;
+	}
+	dx12.ri.Printf( PRINT_ALL, "  ],\n" );
+
+	// Model summary
+	int validModels = 0;
+	for ( i = 0; i < dx12NumModels; i++ )
+	{
+		if ( dx12ModelData[ i ].valid )
+			validModels++;
+	}
+
+	dx12.ri.Printf( PRINT_ALL, "  \"models\": {\n" );
+	dx12.ri.Printf( PRINT_ALL, "    \"registered\": %d,\n", dx12NumModels );
+	dx12.ri.Printf( PRINT_ALL, "    \"valid\": %d\n", validModels );
+	dx12.ri.Printf( PRINT_ALL, "  },\n" );
+
+	// Per-model bounds (for debugging missing/zero bounds)
+	dx12.ri.Printf( PRINT_ALL, "  \"model_bounds\": [\n" );
+	first = qtrue;
+	for ( i = 0; i < dx12NumModels; i++ )
+	{
+		if ( !dx12ModelData[ i ].valid )
+			continue;
+
+		DX12_EscapeJsonString( dx12ModelNames[ i ], buf, sizeof( buf ) );
+		dx12.ri.Printf( PRINT_ALL,
+			"    %s{\"name\":\"%s\",\"mins\":[%f,%f,%f],\"maxs\":[%f,%f,%f]}\n",
+			first ? "" : ", ",
+			buf,
+			dx12ModelData[ i ].mins[ 0 ],
+			dx12ModelData[ i ].mins[ 1 ],
+			dx12ModelData[ i ].mins[ 2 ],
+			dx12ModelData[ i ].maxs[ 0 ],
+			dx12ModelData[ i ].maxs[ 1 ],
+			dx12ModelData[ i ].maxs[ 2 ] );
+		first = qfalse;
+	}
+	dx12.ri.Printf( PRINT_ALL, "  ],\n" );
+
+	// Draw pass summary – you’ll need to wire these counters into your DX12 backend
+	// (increment them where you actually issue draws for each category).
+	extern int dx12DrawCountSky;
+	extern int dx12DrawCountOpaque;
+	extern int dx12DrawCountTranslucent;
+	extern int dx12DrawCountFlare;
+	extern int dx12DrawCountFog;
+
+	dx12.ri.Printf( PRINT_ALL, "  \"draw_passes\": {\n" );
+	dx12.ri.Printf( PRINT_ALL, "    \"sky\": %d,\n", dx12DrawCountSky );
+	dx12.ri.Printf( PRINT_ALL, "    \"opaque\": %d,\n", dx12DrawCountOpaque );
+	dx12.ri.Printf( PRINT_ALL, "    \"translucent\": %d,\n", dx12DrawCountTranslucent );
+	dx12.ri.Printf( PRINT_ALL, "    \"flare\": %d,\n", dx12DrawCountFlare );
+	dx12.ri.Printf( PRINT_ALL, "    \"fog\": %d\n", dx12DrawCountFog );
+	dx12.ri.Printf( PRINT_ALL, "  },\n" );
+
+	// Fog volumes – you’ll need to expose whatever fog structures you have.
+	// For now, just stub a count so you can see if DX12 is even aware of fog.
+	extern int dx12NumFogVolumes;
+	dx12.ri.Printf( PRINT_ALL, "  \"fog_volumes\": {\n" );
+	dx12.ri.Printf( PRINT_ALL, "    \"count\": %d\n", dx12NumFogVolumes );
+	dx12.ri.Printf( PRINT_ALL, "  }\n" );
+
+	// Footer
+	dx12.ri.Printf( PRINT_ALL, "}\n" );
+}
+
 /**
  * @brief R_DX12_Init
  *
@@ -1187,6 +1321,13 @@ qboolean R_DX12_Init(void)
 	glconfig_t glConfig;
 
 	dx12.ri.Printf(PRINT_ALL, "---- R_DX12_Init ----\n");
+
+	dx12.ri.Cmd_AddSystemCommand(
+		"dx12_dump_state",
+		R_DX12_DumpState_f,
+		"Dump DX12 renderer state as JSON",
+		NULL
+	);
 
 	// ----------------------------------------------------------------
 	// Create the SDL window (without an OpenGL context) via GLimp_Init

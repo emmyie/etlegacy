@@ -374,6 +374,8 @@ void DX12_ClearPerSessionState(void);
 void DX12_StripExtension(const char *in, char *out, int size);
 int DX12_Stricmp(const char *s1, const char *s2);
 
+extern char dx12ModelNames[ 2048 ][ MAX_QPATH ];
+extern int  dx12NumModels;
 
 #endif // _WIN32
 

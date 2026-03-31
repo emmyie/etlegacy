@@ -657,8 +657,8 @@ static char *DX12_CommaParse(char **data_p)
 /** Maximum number of simultaneously registered models (matches classic renderer). */
 #define DX12_MAX_MOD_KNOWN 2048
 
-static char dx12ModelNames[DX12_MAX_MOD_KNOWN][MAX_QPATH];
-static int  dx12NumModels = 0;
+char dx12ModelNames[DX12_MAX_MOD_KNOWN][MAX_QPATH];
+int  dx12NumModels = 0;
 
 // ---------------------------------------------------------------------------
 // DX12_ClearPerSessionState
@@ -1882,7 +1882,7 @@ static void DX12_ChopPolyBehindPlane(int numInPoints, vec3_t inPoints[DX12_MAX_V
  */
 static void DX12_AddMarkFragments(int numClipPoints, vec3_t clipPoints[2][DX12_MAX_VERTS_ON_POLY],
                                   int numPlanes, vec3_t *normals, float *dists,
-                                  int maxPoints, vec3_t pointBuffer,
+                                  int maxPoints, float *pointBuffer,
                                   int maxFragments, markFragment_t *fragmentBuffer,
                                   int *returnedPoints, int *returnedFragments)
 {
@@ -1925,7 +1925,7 @@ static void DX12_AddMarkFragments(int numClipPoints, vec3_t clipPoints[2][DX12_M
 }
 
 static int RE_DX12_MarkFragments(int numPoints, const vec3_t *points, const vec3_t projection,
-                                 int maxPoints, vec3_t pointBuffer, int maxFragments,
+                                 int maxPoints, float *pointBuffer, int maxFragments,
                                  markFragment_t *fragmentBuffer)
 {
 	int      i, j, k;
@@ -2189,9 +2189,11 @@ static void RE_DX12_ProjectDecal(qhandle_t hShader, int numPoints, vec3_t *point
 	int            now, fadeStartTime, fadeEndTime;
 
 	// Buffers for RE_DX12_MarkFragments output
+	// DX12_AddMarkFragments writes xyz + 2 ST floats (stride 5) per point,
+	// so allocate 5 floats per slot to avoid buffer overflow and bad readback.
 #define DX12_PROJ_MAX_POINTS    512
 #define DX12_PROJ_MAX_FRAGS     128
-	vec3_t         markPoints[DX12_PROJ_MAX_POINTS];
+	float          markPoints[DX12_PROJ_MAX_POINTS * 5];
 	markFragment_t markFrags[DX12_PROJ_MAX_FRAGS];
 	vec3_t         scaledProj;
 	int            numFrags;
@@ -2367,7 +2369,7 @@ static void RE_DX12_ProjectDecal(qhandle_t hShader, int numPoints, vec3_t *point
 
 		numFrags = RE_DX12_MarkFragments(numDvPoints, (const vec3_t *)dvXyz,
 		                                 scaledProj,
-		                                 DX12_PROJ_MAX_POINTS, markPoints[0],
+		                                 DX12_PROJ_MAX_POINTS, markPoints,
 		                                 DX12_PROJ_MAX_FRAGS, markFrags);
 	}
 
@@ -2392,7 +2394,7 @@ static void RE_DX12_ProjectDecal(qhandle_t hShader, int numPoints, vec3_t *point
 
 		for (p = 0; p < numV; p++)
 		{
-			float *xyz = markPoints[mf->firstPoint + p];
+			float *xyz = markPoints + 5 * (mf->firstPoint + p);
 
 			verts[p].xyz[0] = xyz[0];
 			verts[p].xyz[1] = xyz[1];

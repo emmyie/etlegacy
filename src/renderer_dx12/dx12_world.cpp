@@ -1400,14 +1400,19 @@ void DX12_LoadWorld(const char *name)
 			bspModelCount = (int)(modelLump->filelen / sizeof(dmodel_t));
 		}
 
-		// Pre-scan patch surfaces to compute exact tessellation sizes.
-		// The previous rough estimate (bspSurfCount * (PATCH_LOD+1)²) only
-		// allocated 25 extra vertices per surface regardless of patch size.
-		// A (pw × ph) control-point grid expands to
-		//   numPW = (pw-1)/2, numPH = (ph-1)/2 sub-patches,
-		//   each producing (PATCH_LOD+1)² verts and PATCH_LOD²×6 indices.
-		// For a common 9×9 patch that is 4×4 = 16 sub-patches → 400 verts,
-		// not 25.  The undercount caused goto patch_overflow for most maps.
+		// Pre-scan ALL surfaces to compute exact staging buffer sizes.
+		//
+		// Problem: using bspIndexCount (total BSP index lump size) as the raw
+		// index budget is wrong. On some maps the triangle-soup surfaces alone
+		// consume the entire index lump, leaving zero space for planar faces.
+		// We must sum only the indices actually needed by non-patch surfaces.
+		//
+		// Patch surfaces: BSP stores control points only (numIndexes==0 in BSP).
+		//   Each (pw×ph) grid → numPW×numPH sub-patches, each producing
+		//   (PATCH_LOD+1)² verts and PATCH_LOD²×6 indices — computed below.
+		// Non-patch surfaces (planar, soup, foliage): use BSP numVerts/numIndexes directly.
+		int neededRawVerts    = 0;
+		int neededRawIndexes  = 0;
 		int patchExtraVerts   = 0;
 		int patchExtraIndexes = 0;
 		{
@@ -1416,7 +1421,8 @@ void DX12_LoadWorld(const char *name)
 
 			for (si = 0; si < bspSurfCount; si++)
 			{
-				if (LittleLong(bspSurfaces[si].surfaceType) == MST_PATCH)
+				int sType = LittleLong(bspSurfaces[si].surfaceType);
+				if (sType == MST_PATCH)
 				{
 					int pw    = LittleLong(bspSurfaces[si].patchWidth);
 					int ph    = LittleLong(bspSurfaces[si].patchHeight);
@@ -1426,11 +1432,16 @@ void DX12_LoadWorld(const char *name)
 					patchExtraVerts   += numPW * numPH * (steps + 1) * (steps + 1);
 					patchExtraIndexes += numPW * numPH * steps * steps * 6;
 				}
+				else if (sType != MST_FLARE)
+				{
+					neededRawVerts   += LittleLong(bspSurfaces[si].numVerts);
+					neededRawIndexes += LittleLong(bspSurfaces[si].numIndexes);
+				}
 			}
 		}
 
-		int maxStagingVerts   = bspVertCount + patchExtraVerts;
-		int maxStagingIndexes = bspIndexCount + patchExtraIndexes;
+		int maxStagingVerts   = neededRawVerts + patchExtraVerts;
+		int maxStagingIndexes = neededRawIndexes + patchExtraIndexes;
 
 		dx12WorldVertex_t *stagingVerts   = (dx12WorldVertex_t *)dx12.ri.Z_Malloc(
 			(size_t)maxStagingVerts * sizeof(dx12WorldVertex_t));
@@ -1670,7 +1681,7 @@ patch_overflow:
 			}
 		}
 
-		dx12.ri.Printf(PRINT_DEVELOPER,
+		dx12.ri.Printf(PRINT_ALL,
 		               "DX12_LoadWorld: %d draw surfaces, %d vertices, %d indices\n",
 		               dx12World.numDrawSurfs, vtxWrite, idxWrite);
 
