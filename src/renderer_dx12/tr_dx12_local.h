@@ -202,6 +202,8 @@ typedef struct
 	qboolean isFog;                    ///< surfaceparm fog
 	qboolean isTranslucent;            ///< surfaceparm trans
 	qboolean isNodraw;                 ///< surfaceparm nodraw
+	qboolean noImpact;                 ///< surfaceparm noimpact – no impact effects
+	qboolean noMarks;                  ///< surfaceparm nomarks  – no decal marks
 	qboolean noMip;                    ///< qtrue when mipmaps should be suppressed (RegisterShaderNoMip)
 	qboolean isDoubleSided;            ///< cull none/twosided – render back faces (e.g. fences, foliage)
 	qboolean valid;                    ///< qtrue once successfully built

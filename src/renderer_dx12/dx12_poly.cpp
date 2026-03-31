@@ -639,8 +639,9 @@ void DX12_DrawStretchPicGradient(float x, float y, float w, float h,
 /**
  * @brief DX12_Add2dPolys
  *
- * Fan-expands a polyVert_t array into TRIANGLELIST quads and appends them
- * to the batch.  Per-vertex colours come from the polyVert_t modulate field.
+ * Fan-expands a polyVert_t array into TRIANGLELIST vertices and appends them
+ * to the 2D batch via DX12_AppendToBatch.  Per-vertex colours come from the
+ * polyVert_t modulate field.
  *
  * @param polys     Array of polyVert_t (xyz[0]/xyz[1] = screen-pixel X/Y).
  * @param numverts  Total vertex count (≥ 3).
@@ -648,14 +649,13 @@ void DX12_DrawStretchPicGradient(float x, float y, float w, float h,
  */
 void DX12_Add2dPolys(polyVert_t *polys, int numverts, qhandle_t hShader)
 {
-	int            numTris;
-	int            numTriVerts;
-	dx12Texture_t *tex;
-	dx12QuadVertex_t *dst;
-	int            i;
-	UINT           startOffset;
+	int               numTris;
+	int               numTriVerts;
+	dx12Texture_t    *tex;
+	dx12QuadVertex_t *expanded;
+	int               i;
 
-	if (!dx12.frameOpen || numverts < 3 || !polys)
+	if (!dx12.frameOpen || !dx12.quadVBMapped || numverts < 3 || !polys)
 	{
 		return;
 	}
@@ -670,52 +670,13 @@ void DX12_Add2dPolys(polyVert_t *polys, int numverts, qhandle_t hShader)
 	numTris     = numverts - 2;
 	numTriVerts = numTris * 3;
 
-	// Ensure space (flush + abort if still not enough)
-	if (dx12.quadVBOffset + (UINT)numTriVerts > DX12_MAX_2D_VERTS)
+	if ((UINT)numTriVerts > DX12_MAX_2D_VERTS)
 	{
-		DX12_Flush2D();
-		if (dx12.quadVBOffset + (UINT)numTriVerts > DX12_MAX_2D_VERTS)
-		{
-			dx12.ri.Printf(PRINT_WARNING, "DX12_Add2dPolys: 2D vertex ring-buffer full\n");
-			return;
-		}
+		dx12.ri.Printf(PRINT_WARNING, "DX12_Add2dPolys: polygon too large (%d verts), dropping\n", numverts);
+		return;
 	}
 
-	// Check if we need to flush before appending
-	if (dx12.batch2DCount > 0)
-	{
-		qboolean flushNeeded = qfalse;
-
-		if (tex->gpuHandle.ptr != dx12.batch2DTexHandle.ptr)
-		{
-			flushNeeded = qtrue;
-		}
-		else if (D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST != dx12.batch2DTopology)
-		{
-			flushNeeded = qtrue;
-		}
-		else if (!DX12_RectsEqual(&dx12.currentScissor, &dx12.batch2DScissor))
-		{
-			flushNeeded = qtrue;
-		}
-
-		if (flushNeeded)
-		{
-			DX12_Flush2D();
-		}
-	}
-
-	// Start a new batch if empty
-	if (dx12.batch2DCount == 0)
-	{
-		dx12.batch2DStart     = dx12.quadVBOffset;
-		dx12.batch2DTexHandle = tex->gpuHandle;
-		dx12.batch2DTopology  = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-		dx12.batch2DScissor   = dx12.currentScissor;
-	}
-
-	startOffset = dx12.quadVBOffset;
-	dst         = (dx12QuadVertex_t *)dx12.quadVBMapped + startOffset;
+	expanded = new dx12QuadVertex_t[numTriVerts];
 
 	for (i = 0; i < numTris; i++)
 	{
@@ -724,25 +685,25 @@ void DX12_Add2dPolys(polyVert_t *polys, int numverts, qhandle_t hShader)
 		for (j = 0; j < 3; j++)
 		{
 			const polyVert_t *pv;
-			int               vi;
+			int               vi  = (j == 0) ? 0 : (i + j);
+			int               out = i * 3 + j;
 
-			vi = (j == 0) ? 0 : (i + j);
 			pv = &polys[vi];
 
-			dst->pos[0]   = NDC_X(pv->xyz[0]);
-			dst->pos[1]   = NDC_Y(pv->xyz[1]);
-			dst->uv[0]    = pv->st[0];
-			dst->uv[1]    = pv->st[1];
-			dst->color[0] = pv->modulate[0] / 255.0f;
-			dst->color[1] = pv->modulate[1] / 255.0f;
-			dst->color[2] = pv->modulate[2] / 255.0f;
-			dst->color[3] = pv->modulate[3] / 255.0f;
-			dst++;
+			expanded[out].pos[0]   = NDC_X(pv->xyz[0]);
+			expanded[out].pos[1]   = NDC_Y(pv->xyz[1]);
+			expanded[out].uv[0]    = pv->st[0];
+			expanded[out].uv[1]    = pv->st[1];
+			expanded[out].color[0] = pv->modulate[0] / 255.0f;
+			expanded[out].color[1] = pv->modulate[1] / 255.0f;
+			expanded[out].color[2] = pv->modulate[2] / 255.0f;
+			expanded[out].color[3] = pv->modulate[3] / 255.0f;
 		}
 	}
 
-	dx12.quadVBOffset += (UINT)numTriVerts;
-	dx12.batch2DCount += (UINT)numTriVerts;
+	DX12_AppendToBatch(expanded, numTriVerts, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, tex);
+
+	delete[] expanded;
 }
 
 // ---------------------------------------------------------------------------

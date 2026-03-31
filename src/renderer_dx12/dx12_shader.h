@@ -93,6 +93,19 @@ const char *DX12_GetRemappedShader(const char *name);
 qboolean DX12_RegisterMaterialFromText(const char *name, const char *shadertext);
 
 /**
+ * @brief Look up the texture/material handle for a named surface in a skin.
+ *
+ * Searches the skin's surface table for an entry whose name matches @p surfName
+ * (case-insensitive).  Returns the matHandle stored in the matching entry, or 0
+ * if the skin handle is invalid or no matching surface is found.
+ *
+ * @param skinHandle  1-based skin handle returned by RE_DX12_RegisterSkin().
+ * @param surfName    MD3 surface name to look up (matched case-insensitively).
+ * @return            Material / texture handle, or 0 if not found.
+ */
+qhandle_t DX12_GetSkinTexture(qhandle_t skinHandle, const char *surfName);
+
+/**
  * @brief Copy a sub-region of the current back-buffer render target into a
  *        DX12 texture slot, (re-)allocating the texture resource if its
  *        dimensions do not match (w × h).  Mirrors glCopyTexImage2D.

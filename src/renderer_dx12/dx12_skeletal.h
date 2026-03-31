@@ -47,6 +47,7 @@
 #ifdef _WIN32
 
 #include "tr_dx12_local.h"
+#include "dx12_world.h"         // dx12WorldVertex_t
 
 extern "C" {
 #include "../qcommon/qfiles.h"   // mdsHeader_t, mdmHeader_t, mdxHeader_t
@@ -144,6 +145,35 @@ int DX12_GetBoneTagMDM(orientation_t *outTag, mdmHeader_t *mdm,
                        mdxHeader_t *mdxFrame, mdxHeader_t *mdxOldFrame,
                        mdxHeader_t *mdxTorso, mdxHeader_t *mdxOldTorso,
                        const refEntity_t *refent, const char *tagName, int startTagIndex);
+
+/**
+ * @brief Compute MDS bones and skin one MDS surface into a dx12WorldVertex_t array.
+ *
+ * @param[in]  mds      MDS header (raw data).
+ * @param[in]  surf     The specific surface to skin.
+ * @param[in]  refent   Animation frame data (frame, oldframe, backlerp, torsoAxis…).
+ * @param[out] outVerts Output vertex array (must have surf->numVerts entries).
+ * @return Number of vertices written (= surf->numVerts), or 0 on error.
+ */
+int DX12_SkinMDSSurface(mdsHeader_t *mds, mdsSurface_t *surf,
+                        const refEntity_t *refent, dx12WorldVertex_t *outVerts);
+
+/**
+ * @brief Compute MDX bones and skin one MDM surface into a dx12WorldVertex_t array.
+ *
+ * @param[in]  surf         MDM surface to skin.
+ * @param[in]  refent       Animation frame data.
+ * @param[in]  mdxFrame     MDX data for refent->frameModel.
+ * @param[in]  mdxOldFrame  MDX data for refent->oldframeModel.
+ * @param[in]  mdxTorso     MDX data for refent->torsoFrameModel.
+ * @param[in]  mdxOldTorso  MDX data for refent->oldTorsoFrameModel.
+ * @param[out] outVerts     Output vertex array (must have surf->numVerts entries).
+ * @return Number of vertices written (= surf->numVerts), or 0 on error.
+ */
+int DX12_SkinMDMSurface(mdmSurface_t *surf, const refEntity_t *refent,
+                        mdxHeader_t *mdxFrame, mdxHeader_t *mdxOldFrame,
+                        mdxHeader_t *mdxTorso, mdxHeader_t *mdxOldTorso,
+                        dx12WorldVertex_t *outVerts);
 
 #endif // _WIN32
 #endif // DX12_SKELETAL_H

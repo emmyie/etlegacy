@@ -427,7 +427,11 @@ qboolean DX12_LoadMD3(int slot, const char *name)
 		ms->numVertices = numVerts;
 		ms->numIndices  = numTris * 3;
 
-		// Register the surface's diffuse texture / shader
+		// Store the surface name (lower-cased) for skin lookup at draw time
+		Q_strncpyz(ms->surfName, surf->name, sizeof(ms->surfName));
+		Q_strlwr(ms->surfName);
+
+		// Register the surface's diffuse texture / shader (fallback when no skin)
 		if (surf->numShaders > 0 && shaders[0].name[0])
 		{
 			ms->texHandle = DX12_RegisterTexture(shaders[0].name);
@@ -674,6 +678,10 @@ qboolean DX12_LoadMDC(int slot, const char *name)
 		ms->numVertices = numVerts;
 		ms->numIndices  = numTris * 3;
 
+		// Store the surface name (lower-cased) for skin lookup at draw time
+		Q_strncpyz(ms->surfName, surf->name, sizeof(ms->surfName));
+		Q_strlwr(ms->surfName);
+
 		if (surf->numShaders > 0 && shaders[0].name[0])
 		{
 			ms->texHandle = DX12_RegisterTexture(shaders[0].name);
@@ -700,6 +708,115 @@ qboolean DX12_LoadMDC(int slot, const char *name)
 	}
 
 	return entry->valid;
+}
+
+// ---------------------------------------------------------------------------
+// DX12_ApplyTagTransform
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Row-major 4×4 matrix multiply used internally by DX12_ApplyTagTransform.
+ *        out = a * b.  out may NOT alias a or b.
+ */
+static void MDL_Mat4Mul(float out[4][4], const float a[4][4], const float b[4][4])
+{
+	int i, j, k;
+
+	for (i = 0; i < 4; i++)
+	{
+		for (j = 0; j < 4; j++)
+		{
+			float s = 0.0f;
+
+			for (k = 0; k < 4; k++)
+			{
+				s += a[i][k] * b[k][j];
+			}
+			out[i][j] = s;
+		}
+	}
+}
+
+/**
+ * @brief Compute the child model's world matrix by concatenating a parent
+ *        world matrix with a tag local matrix.
+ *
+ * A tag (md3Tag_t) stores a local-space origin and axis that are in the
+ * same Q3 coordinate convention as an entity's origin/axis:
+ *   tag.axis[0] = tag local forward (+X)
+ *   tag.axis[1] = tag local left    (+Y)
+ *   tag.axis[2] = tag local up      (+Z)
+ *
+ * The tag local matrix M_tag has exactly the same form as the model matrix
+ * built by BuildModelMatrix in dx12_scene.cpp.  The child world matrix is:
+ *   M_child = M_parent * M_tag
+ *
+ * The result is a row-major math matrix ready for Mat4Transpose + CB upload.
+ *
+ * @param[out] out     Child world matrix (row-major, pre-transpose).
+ * @param[in]  parent  Parent world matrix (row-major, pre-transpose).
+ * @param[in]  tag     Tag whose origin and axis are in parent-local space.
+ */
+void DX12_ApplyTagTransform(float out[4][4], const float parent[4][4], const md3Tag_t *tag)
+{
+	float tagLocal[4][4];
+
+	// Build tag local matrix – same column layout as BuildModelMatrix:
+	//   col 0 = tag.axis[0]  (local +X → parent forward)
+	//   col 1 = tag.axis[1]  (local +Y → parent left)
+	//   col 2 = tag.axis[2]  (local +Z → parent up)
+	//   col 3 = tag.origin   (translation in parent-local space)
+	tagLocal[0][0] = tag->axis[0][0]; tagLocal[0][1] = tag->axis[1][0]; tagLocal[0][2] = tag->axis[2][0]; tagLocal[0][3] = tag->origin[0];
+	tagLocal[1][0] = tag->axis[0][1]; tagLocal[1][1] = tag->axis[1][1]; tagLocal[1][2] = tag->axis[2][1]; tagLocal[1][3] = tag->origin[1];
+	tagLocal[2][0] = tag->axis[0][2]; tagLocal[2][1] = tag->axis[1][2]; tagLocal[2][2] = tag->axis[2][2]; tagLocal[2][3] = tag->origin[2];
+	tagLocal[3][0] = 0.0f;           tagLocal[3][1] = 0.0f;           tagLocal[3][2] = 0.0f;           tagLocal[3][3] = 1.0f;
+
+	// child_world = parent_world * tag_local
+	MDL_Mat4Mul(out, parent, tagLocal);
+}
+
+// ---------------------------------------------------------------------------
+// DX12_BuildSkeletalSurfaceIB
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief DX12_BuildSkeletalSurfaceIB – upload a static index buffer for a skeletal surface.
+ */
+qboolean DX12_BuildSkeletalSurfaceIB(dx12ModelSurface_t *ms, const int *triIndexes, int numTriangles)
+{
+	if (!ms || !triIndexes || numTriangles <= 0)
+	{
+		return qfalse;
+	}
+
+	if (!MDL_UploadBuffer(triIndexes, (UINT64)numTriangles * 3 * sizeof(int), &ms->indexBuffer))
+	{
+		return qfalse;
+	}
+
+	ms->numIndices = (UINT)(numTriangles * 3);
+	return qtrue;
+}
+
+// ---------------------------------------------------------------------------
+// DX12_AllocSkeletalVerts
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Allocate numVerts contiguous slots in the frame-scope skeletal scratch VB.
+ * Returns a CPU pointer to write into and sets *outGpuVA to the GPU VA for binding.
+ * Returns NULL if the scratch buffer is full or unavailable.
+ */
+static UINT8 *DX12_AllocSkeletalVerts(int numVerts, D3D12_GPU_VIRTUAL_ADDRESS *outGpuVA)
+{
+	int offset;
+
+	if (!dx12Scene.skelVB || !dx12Scene.skelVBMapped) { *outGpuVA = 0; return NULL; }
+	if (dx12Scene.skelVBWriteOffset + numVerts > DX12_MAX_SKELETAL_VERTS) { *outGpuVA = 0; return NULL; }
+	offset = dx12Scene.skelVBWriteOffset;
+	dx12Scene.skelVBWriteOffset += numVerts;
+	*outGpuVA = dx12Scene.skelVB->GetGPUVirtualAddress() + (UINT64)offset * sizeof(dx12WorldVertex_t);
+	return dx12Scene.skelVBMapped + (size_t)offset * sizeof(dx12WorldVertex_t);
 }
 
 // ---------------------------------------------------------------------------
@@ -743,6 +860,231 @@ void DX12_DrawEntity(const dx12SceneEntity_t *ent, D3D12_GPU_VIRTUAL_ADDRESS cbG
 	// Bind constant buffer (root param 0) – already set by caller but be explicit
 	dx12.commandList->SetGraphicsRootConstantBufferView(0, cbGpuVA);
 
+	// -------------------------------------------------------------------------
+	// MDS – skeletal mesh with embedded animation
+	// -------------------------------------------------------------------------
+	if (entry->modelType == DX12_MOD_MDS)
+	{
+		mdsHeader_t  *mds;
+		mdsLOD_t     *lod;
+		mdsSurface_t *rawSurf;
+		refEntity_t   refent;
+
+		if (!entry->rawData)
+		{
+			return;
+		}
+
+		mds     = (mdsHeader_t *)entry->rawData;
+		lod     = (mdsLOD_t *)((byte *)mds + mds->ofsSurfaces);
+		rawSurf = (mdsSurface_t *)((byte *)lod + lod->ofsSurfaces);
+
+		Com_Memset(&refent, 0, sizeof(refent));
+		refent.frame          = ent->frame;
+		refent.oldframe       = ent->oldframe;
+		refent.backlerp       = ent->backlerp;
+		refent.torsoFrame     = ent->torsoFrame;
+		refent.oldTorsoFrame  = ent->oldTorsoFrame;
+		refent.torsoBacklerp  = ent->torsoBacklerp;
+		refent.torsoAxis[0][0] = ent->torsoAxis[0][0]; refent.torsoAxis[0][1] = ent->torsoAxis[0][1]; refent.torsoAxis[0][2] = ent->torsoAxis[0][2];
+		refent.torsoAxis[1][0] = ent->torsoAxis[1][0]; refent.torsoAxis[1][1] = ent->torsoAxis[1][1]; refent.torsoAxis[1][2] = ent->torsoAxis[1][2];
+		refent.torsoAxis[2][0] = ent->torsoAxis[2][0]; refent.torsoAxis[2][1] = ent->torsoAxis[2][1]; refent.torsoAxis[2][2] = ent->torsoAxis[2][2];
+
+		for (s = 0; s < entry->numSurfaces; s++)
+		{
+			dx12ModelSurface_t         *ms = &entry->surfaces[s];
+			dx12Texture_t              *tex;
+			D3D12_VERTEX_BUFFER_VIEW    vbv = {};
+			D3D12_INDEX_BUFFER_VIEW     ibv = {};
+			D3D12_GPU_DESCRIPTOR_HANDLE srvDiffuse;
+			UINT8                      *cpuPtr;
+			D3D12_GPU_VIRTUAL_ADDRESS   gpuVA;
+			qhandle_t                   resolvedHandle = 0;
+
+			if (!ms->indexBuffer || ms->numIndices == 0 || ms->numVertices == 0)
+			{
+				rawSurf = (mdsSurface_t *)((byte *)rawSurf + rawSurf->ofsEnd);
+				continue;
+			}
+
+			if (ent->customSkin)
+			{
+				resolvedHandle = DX12_GetSkinTexture(ent->customSkin, ms->surfName);
+			}
+			if (!resolvedHandle)
+			{
+				resolvedHandle = ms->texHandle;
+			}
+			if (!resolvedHandle)
+			{
+				rawSurf = (mdsSurface_t *)((byte *)rawSurf + rawSurf->ofsEnd);
+				continue;
+			}
+
+			tex = DX12_GetTexture(resolvedHandle);
+			if (tex && tex->resource)
+			{
+				srvDiffuse = tex->gpuHandle;
+			}
+			else
+			{
+				srvDiffuse = dx12.srvHeap->GetGPUDescriptorHandleForHeapStart();
+			}
+
+			cpuPtr = DX12_AllocSkeletalVerts((int)ms->numVertices, &gpuVA);
+			if (!cpuPtr)
+			{
+				rawSurf = (mdsSurface_t *)((byte *)rawSurf + rawSurf->ofsEnd);
+				continue;
+			}
+
+			DX12_SkinMDSSurface(mds, rawSurf, &refent, (dx12WorldVertex_t *)cpuPtr);
+
+			{
+				D3D12_GPU_DESCRIPTOR_HANDLE srvWhite;
+				srvWhite.ptr = dx12.srvHeap->GetGPUDescriptorHandleForHeapStart().ptr;
+				dx12.commandList->SetGraphicsRootDescriptorTable(1, srvDiffuse);
+				dx12.commandList->SetGraphicsRootDescriptorTable(2, srvWhite);
+			}
+
+			vbv.BufferLocation = gpuVA;
+			vbv.SizeInBytes    = ms->numVertices * (UINT)sizeof(dx12WorldVertex_t);
+			vbv.StrideInBytes  = (UINT)sizeof(dx12WorldVertex_t);
+
+			ibv.BufferLocation = ms->indexBuffer->GetGPUVirtualAddress();
+			ibv.SizeInBytes    = ms->numIndices * (UINT)sizeof(int);
+			ibv.Format         = DXGI_FORMAT_R32_UINT;
+
+			dx12.commandList->IASetVertexBuffers(0, 1, &vbv);
+			dx12.commandList->IASetIndexBuffer(&ibv);
+			dx12.commandList->DrawIndexedInstanced(ms->numIndices, 1, 0, 0, 0);
+
+			rawSurf = (mdsSurface_t *)((byte *)rawSurf + rawSurf->ofsEnd);
+		}
+		return;
+	}
+
+	// -------------------------------------------------------------------------
+	// MDM – skeletal mesh with separate MDX animation
+	// -------------------------------------------------------------------------
+	if (entry->modelType == DX12_MOD_MDM)
+	{
+		mdmHeader_t  *mdm;
+		mdmSurface_t *rawSurf;
+		refEntity_t   refent;
+		mdxHeader_t  *mdxFrame, *mdxOldFrame, *mdxTorso, *mdxOldTorso;
+
+		if (!entry->rawData)
+		{
+			return;
+		}
+
+		mdxFrame    = (ent->frameModel        > 0) ? (mdxHeader_t *)dx12ModelData[(int)ent->frameModel        - 1].rawData : NULL;
+		mdxOldFrame = (ent->oldframeModel     > 0) ? (mdxHeader_t *)dx12ModelData[(int)ent->oldframeModel     - 1].rawData : NULL;
+		mdxTorso    = (ent->torsoFrameModel   > 0) ? (mdxHeader_t *)dx12ModelData[(int)ent->torsoFrameModel   - 1].rawData : NULL;
+		mdxOldTorso = (ent->oldTorsoFrameModel > 0) ? (mdxHeader_t *)dx12ModelData[(int)ent->oldTorsoFrameModel - 1].rawData : NULL;
+
+		if (!mdxFrame || !mdxOldFrame || !mdxTorso || !mdxOldTorso)
+		{
+			dx12.ri.Printf(PRINT_DEVELOPER, "DX12: MDM entity missing MDX companion(s), skipping draw\n");
+			return;
+		}
+
+		mdm     = (mdmHeader_t *)entry->rawData;
+		rawSurf = (mdmSurface_t *)((byte *)mdm + mdm->ofsSurfaces);
+
+		Com_Memset(&refent, 0, sizeof(refent));
+		refent.frame              = ent->frame;
+		refent.oldframe           = ent->oldframe;
+		refent.backlerp           = ent->backlerp;
+		refent.torsoFrame         = ent->torsoFrame;
+		refent.oldTorsoFrame      = ent->oldTorsoFrame;
+		refent.torsoBacklerp      = ent->torsoBacklerp;
+		refent.frameModel         = ent->frameModel;
+		refent.oldframeModel      = ent->oldframeModel;
+		refent.torsoFrameModel    = ent->torsoFrameModel;
+		refent.oldTorsoFrameModel = ent->oldTorsoFrameModel;
+		refent.torsoAxis[0][0] = ent->torsoAxis[0][0]; refent.torsoAxis[0][1] = ent->torsoAxis[0][1]; refent.torsoAxis[0][2] = ent->torsoAxis[0][2];
+		refent.torsoAxis[1][0] = ent->torsoAxis[1][0]; refent.torsoAxis[1][1] = ent->torsoAxis[1][1]; refent.torsoAxis[1][2] = ent->torsoAxis[1][2];
+		refent.torsoAxis[2][0] = ent->torsoAxis[2][0]; refent.torsoAxis[2][1] = ent->torsoAxis[2][1]; refent.torsoAxis[2][2] = ent->torsoAxis[2][2];
+
+		for (s = 0; s < entry->numSurfaces; s++)
+		{
+			dx12ModelSurface_t         *ms = &entry->surfaces[s];
+			dx12Texture_t              *tex;
+			D3D12_VERTEX_BUFFER_VIEW    vbv = {};
+			D3D12_INDEX_BUFFER_VIEW     ibv = {};
+			D3D12_GPU_DESCRIPTOR_HANDLE srvDiffuse;
+			UINT8                      *cpuPtr;
+			D3D12_GPU_VIRTUAL_ADDRESS   gpuVA;
+			qhandle_t                   resolvedHandle = 0;
+
+			if (!ms->indexBuffer || ms->numIndices == 0 || ms->numVertices == 0)
+			{
+				rawSurf = (mdmSurface_t *)((byte *)rawSurf + rawSurf->ofsEnd);
+				continue;
+			}
+
+			if (ent->customSkin)
+			{
+				resolvedHandle = DX12_GetSkinTexture(ent->customSkin, ms->surfName);
+			}
+			if (!resolvedHandle)
+			{
+				resolvedHandle = ms->texHandle;
+			}
+			if (!resolvedHandle)
+			{
+				rawSurf = (mdmSurface_t *)((byte *)rawSurf + rawSurf->ofsEnd);
+				continue;
+			}
+
+			tex = DX12_GetTexture(resolvedHandle);
+			if (tex && tex->resource)
+			{
+				srvDiffuse = tex->gpuHandle;
+			}
+			else
+			{
+				srvDiffuse = dx12.srvHeap->GetGPUDescriptorHandleForHeapStart();
+			}
+
+			cpuPtr = DX12_AllocSkeletalVerts((int)ms->numVertices, &gpuVA);
+			if (!cpuPtr)
+			{
+				rawSurf = (mdmSurface_t *)((byte *)rawSurf + rawSurf->ofsEnd);
+				continue;
+			}
+
+			DX12_SkinMDMSurface(rawSurf, &refent, mdxFrame, mdxOldFrame, mdxTorso, mdxOldTorso, (dx12WorldVertex_t *)cpuPtr);
+
+			{
+				D3D12_GPU_DESCRIPTOR_HANDLE srvWhite;
+				srvWhite.ptr = dx12.srvHeap->GetGPUDescriptorHandleForHeapStart().ptr;
+				dx12.commandList->SetGraphicsRootDescriptorTable(1, srvDiffuse);
+				dx12.commandList->SetGraphicsRootDescriptorTable(2, srvWhite);
+			}
+
+			vbv.BufferLocation = gpuVA;
+			vbv.SizeInBytes    = ms->numVertices * (UINT)sizeof(dx12WorldVertex_t);
+			vbv.StrideInBytes  = (UINT)sizeof(dx12WorldVertex_t);
+
+			ibv.BufferLocation = ms->indexBuffer->GetGPUVirtualAddress();
+			ibv.SizeInBytes    = ms->numIndices * (UINT)sizeof(int);
+			ibv.Format         = DXGI_FORMAT_R32_UINT;
+
+			dx12.commandList->IASetVertexBuffers(0, 1, &vbv);
+			dx12.commandList->IASetIndexBuffer(&ibv);
+			dx12.commandList->DrawIndexedInstanced(ms->numIndices, 1, 0, 0, 0);
+
+			rawSurf = (mdmSurface_t *)((byte *)rawSurf + rawSurf->ofsEnd);
+		}
+		return;
+	}
+
+	// -------------------------------------------------------------------------
+	// MD3 / MDC – rigid mesh (static GPU VB/IB)
+	// -------------------------------------------------------------------------
 	for (s = 0; s < entry->numSurfaces; s++)
 	{
 		dx12ModelSurface_t         *ms = &entry->surfaces[s];
@@ -756,8 +1098,34 @@ void DX12_DrawEntity(const dx12SceneEntity_t *ent, D3D12_GPU_VIRTUAL_ADDRESS cbG
 			continue;
 		}
 
-		// Resolve diffuse texture
-		tex = DX12_GetTexture(ms->texHandle);
+		// Resolve diffuse texture: skin override → MD3 embedded → skip surface
+		{
+			qhandle_t resolvedHandle = 0;
+
+			// 1. Custom skin overrides the MD3's embedded shader
+			if (ent->customSkin)
+			{
+				resolvedHandle = DX12_GetSkinTexture(ent->customSkin, ms->surfName);
+			}
+
+			// 2. Fall back to the texture registered at model-load time
+			if (!resolvedHandle)
+			{
+				resolvedHandle = ms->texHandle;
+			}
+
+			// 3. No texture at all – skip to avoid rendering opaque white
+			if (!resolvedHandle)
+			{
+				dx12.ri.Printf(PRINT_DEVELOPER,
+				               "DX12: Missing skin entry for surface '%s' (skin %d)\n",
+				               ms->surfName, (int)ent->customSkin);
+				continue;
+			}
+
+			tex = DX12_GetTexture(resolvedHandle);
+		}
+
 		if (tex && tex->resource)
 		{
 			srvDiffuse = tex->gpuHandle;

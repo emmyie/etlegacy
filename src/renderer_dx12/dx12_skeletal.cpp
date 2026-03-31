@@ -47,6 +47,7 @@
 
 #include "dx12_skeletal.h"
 #include "tr_dx12_local.h"
+#include "dx12_world.h"   // dx12WorldVertex_t
 
 #include <math.h>
 #include <string.h>
@@ -1461,6 +1462,153 @@ void DX12_FreeSkeletal(void *data)
 	{
 		dx12.ri.Free(data);
 	}
+}
+
+// ---------------------------------------------------------------------------
+// DX12_SkinMDSSurface
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Compute MDS bones for the given surface and skin one surface into outVerts.
+ */
+int DX12_SkinMDSSurface(mdsHeader_t *mds, mdsSurface_t *surf,
+                        const refEntity_t *refent, dx12WorldVertex_t *outVerts)
+{
+	int            i, k;
+	int           *boneRefs;
+	mdsVertex_t   *v;
+	vec3_t         tempVert, tempNormal;
+
+	if (!mds || !surf || !refent || !outVerts || surf->numVerts <= 0)
+	{
+		return 0;
+	}
+
+	boneRefs = (int *)((byte *)surf + surf->ofsBoneReferences);
+	MDS_CalcBones(mds, refent, boneRefs, surf->numBoneReferences);
+
+	v = (mdsVertex_t *)((byte *)surf + surf->ofsVerts);
+	for (i = 0; i < surf->numVerts; i++)
+	{
+		int globalPrimary;
+
+		VectorClear(tempVert);
+		for (k = 0; k < v->numWeights; k++)
+		{
+			mdsWeight_t *w = &v->weights[k];
+			int g = w->boneIndex;  // global bone index directly (boneRefs is for CalcBones only)
+			if (g < 0 || g >= MDS_MAX_BONES)
+			{
+				continue;
+			}
+			SKL_LocalAddScaledMatrixTransformVectorTranslate(
+				w->offset, w->boneWeight,
+				mds_bones[g].matrix, mds_bones[g].translation, tempVert);
+		}
+
+		globalPrimary = v->weights[0].boneIndex;  // global bone index directly
+		if (globalPrimary < 0 || globalPrimary >= MDS_MAX_BONES)
+		{
+			globalPrimary = 0;
+		}
+		SKL_LocalMatrixTransformVector(v->normal, mds_bones[globalPrimary].matrix, tempNormal);
+
+		outVerts[i].xyz[0]    = tempVert[0];
+		outVerts[i].xyz[1]    = tempVert[1];
+		outVerts[i].xyz[2]    = tempVert[2];
+		outVerts[i].st[0]     = v->texCoords[0];
+		outVerts[i].st[1]     = v->texCoords[1];
+		outVerts[i].lm[0]     = 0.0f;
+		outVerts[i].lm[1]     = 0.0f;
+		outVerts[i].normal[0] = tempNormal[0];
+		outVerts[i].normal[1] = tempNormal[1];
+		outVerts[i].normal[2] = tempNormal[2];
+		outVerts[i].color[0]  = 1.0f;
+		outVerts[i].color[1]  = 1.0f;
+		outVerts[i].color[2]  = 1.0f;
+		outVerts[i].color[3]  = 1.0f;
+
+		// Advance to next vertex (variable size due to weights[])
+		v = (mdsVertex_t *)&v->weights[v->numWeights];
+	}
+	return surf->numVerts;
+}
+
+// ---------------------------------------------------------------------------
+// DX12_SkinMDMSurface
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Compute MDX bones for the given MDM surface and skin it into outVerts.
+ */
+int DX12_SkinMDMSurface(mdmSurface_t *surf, const refEntity_t *refent,
+                        mdxHeader_t *mdxFrame, mdxHeader_t *mdxOldFrame,
+                        mdxHeader_t *mdxTorso, mdxHeader_t *mdxOldTorso,
+                        dx12WorldVertex_t *outVerts)
+{
+	int            i, k;
+	int           *boneRefs;
+	mdmVertex_t   *v;
+	vec3_t         tempVert, tempNormal;
+
+	if (!surf || !refent || !outVerts || surf->numVerts <= 0)
+	{
+		return 0;
+	}
+	if (!mdxFrame || !mdxOldFrame || !mdxTorso || !mdxOldTorso)
+	{
+		return 0;
+	}
+
+	boneRefs = (int *)((byte *)surf + surf->ofsBoneReferences);
+	MDX_CalcBones(refent, mdxFrame, mdxOldFrame, mdxTorso, mdxOldTorso,
+	              boneRefs, surf->numBoneReferences);
+
+	v = (mdmVertex_t *)((byte *)surf + surf->ofsVerts);
+	for (i = 0; i < surf->numVerts; i++)
+	{
+		int globalPrimary;
+
+		VectorClear(tempVert);
+		for (k = 0; k < v->numWeights; k++)
+		{
+			mdmWeight_t *w = &v->weights[k];
+			int g = w->boneIndex;  // global bone index directly (boneRefs is for CalcBones only)
+			if (g < 0 || g >= MDX_MAX_BONES)
+			{
+				continue;
+			}
+			SKL_LocalAddScaledMatrixTransformVectorTranslate(
+				w->offset, w->boneWeight,
+				mdx_bones[g].matrix, mdx_bones[g].translation, tempVert);
+		}
+
+		globalPrimary = v->weights[0].boneIndex;  // global bone index directly
+		if (globalPrimary < 0 || globalPrimary >= MDX_MAX_BONES)
+		{
+			globalPrimary = 0;
+		}
+		SKL_LocalMatrixTransformVector(v->normal, mdx_bones[globalPrimary].matrix, tempNormal);
+
+		outVerts[i].xyz[0]    = tempVert[0];
+		outVerts[i].xyz[1]    = tempVert[1];
+		outVerts[i].xyz[2]    = tempVert[2];
+		outVerts[i].st[0]     = v->texCoords[0];
+		outVerts[i].st[1]     = v->texCoords[1];
+		outVerts[i].lm[0]     = 0.0f;
+		outVerts[i].lm[1]     = 0.0f;
+		outVerts[i].normal[0] = tempNormal[0];
+		outVerts[i].normal[1] = tempNormal[1];
+		outVerts[i].normal[2] = tempNormal[2];
+		outVerts[i].color[0]  = 1.0f;
+		outVerts[i].color[1]  = 1.0f;
+		outVerts[i].color[2]  = 1.0f;
+		outVerts[i].color[3]  = 1.0f;
+
+		// Advance to next vertex (variable size due to weights[])
+		v = (mdmVertex_t *)&v->weights[v->numWeights];
+	}
+	return surf->numVerts;
 }
 
 #endif // _WIN32

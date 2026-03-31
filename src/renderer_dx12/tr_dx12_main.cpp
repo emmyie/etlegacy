@@ -247,6 +247,12 @@ static void RE_DX12_BeginRegistration(glconfig_t *config)
 
 	dx12.vidWidth  = config->vidWidth;
 	dx12.vidHeight = config->vidHeight;
+
+	// Mirror GL's RE_ClearScene() call: explicitly reset the per-frame entity,
+	// poly, dlight, and corona lists.  This is always correct regardless of
+	// which init path was taken above, and guards against stale scene data if
+	// BeginRegistration is ever called without a preceding Shutdown.
+	DX12_ClearScene();
 }
 
 /**
@@ -355,9 +361,12 @@ static void RE_DX12_UploadCinematic(int w, int h, int cols, int rows,
 		return;
 	}
 
-	// Release the old GPU resource before (re-)creating the texture
+	// Flush the GPU pipeline before releasing the old resource.
+	// Matches glFinish() in the GL renderer: ensures no in-flight draw commands
+	// are still reading the resource before we Release() it.
 	if (scratch->resource)
 	{
+		DX12_FlushGpu();
 		scratch->resource->Release();
 		scratch->resource = NULL;
 		scratch->valid    = qfalse;
@@ -415,34 +424,47 @@ static void RE_DX12_DrawStretchRaw(int x, int y, int w, int h, int cols, int row
 	nx2 = ((float)(x + w) / (float)dx12.vidWidth) * 2.0f - 1.0f;
 	ny2 = 1.0f - ((float)(y + h) / (float)dx12.vidHeight) * 2.0f;
 
-	r = dx12.color2D[0];
-	g = dx12.color2D[1];
-	b = dx12.color2D[2];
-	a = dx12.color2D[3];
+	// Cinematic frames are always drawn at identity white, matching the GL
+	// renderer's glColor3f(tr.identityLight, ...).  Using dx12.color2D here
+	// would tint the video with whatever color a prior UI call left behind.
+	r = 1.0f;
+	g = 1.0f;
+	b = 1.0f;
+	a = 1.0f;
 
-	// TL (top-left)
-	corners[0].pos[0]   = nx1; corners[0].pos[1] = ny1;
-	corners[0].uv[0]    = 0.0f; corners[0].uv[1] = 0.0f;
-	corners[0].color[0] = r; corners[0].color[1] = g;
-	corners[0].color[2] = b; corners[0].color[3] = a;
+	// Half-texel UV inset: matches GL's (0.5/cols) … ((cols-0.5)/cols) offsets
+	// which prevent the hardware sampler from bleeding into adjacent texels at
+	// the texture edges.
+	{
+		float u0 = 0.5f / (float)cols;
+		float v0 = 0.5f / (float)rows;
+		float u1 = ((float)cols - 0.5f) / (float)cols;
+		float v1 = ((float)rows - 0.5f) / (float)rows;
 
-	// TR (top-right)
-	corners[1].pos[0]   = nx2; corners[1].pos[1] = ny1;
-	corners[1].uv[0]    = 1.0f; corners[1].uv[1] = 0.0f;
-	corners[1].color[0] = r; corners[1].color[1] = g;
-	corners[1].color[2] = b; corners[1].color[3] = a;
+		// TL (top-left)
+		corners[0].pos[0]   = nx1; corners[0].pos[1] = ny1;
+		corners[0].uv[0]    = u0;  corners[0].uv[1]  = v0;
+		corners[0].color[0] = r;   corners[0].color[1] = g;
+		corners[0].color[2] = b;   corners[0].color[3] = a;
 
-	// BL (bottom-left)
-	corners[2].pos[0]   = nx1; corners[2].pos[1] = ny2;
-	corners[2].uv[0]    = 0.0f; corners[2].uv[1] = 1.0f;
-	corners[2].color[0] = r; corners[2].color[1] = g;
-	corners[2].color[2] = b; corners[2].color[3] = a;
+		// TR (top-right)
+		corners[1].pos[0]   = nx2; corners[1].pos[1] = ny1;
+		corners[1].uv[0]    = u1;  corners[1].uv[1]  = v0;
+		corners[1].color[0] = r;   corners[1].color[1] = g;
+		corners[1].color[2] = b;   corners[1].color[3] = a;
 
-	// BR (bottom-right)
-	corners[3].pos[0]   = nx2; corners[3].pos[1] = ny2;
-	corners[3].uv[0]    = 1.0f; corners[3].uv[1] = 1.0f;
-	corners[3].color[0] = r; corners[3].color[1] = g;
-	corners[3].color[2] = b; corners[3].color[3] = a;
+		// BL (bottom-left)
+		corners[2].pos[0]   = nx1; corners[2].pos[1] = ny2;
+		corners[2].uv[0]    = u0;  corners[2].uv[1]  = v1;
+		corners[2].color[0] = r;   corners[2].color[1] = g;
+		corners[2].color[2] = b;   corners[2].color[3] = a;
+
+		// BR (bottom-right)
+		corners[3].pos[0]   = nx2; corners[3].pos[1] = ny2;
+		corners[3].uv[0]    = u1;  corners[3].uv[1]  = v1;
+		corners[3].color[0] = r;   corners[3].color[1] = g;
+		corners[3].color[2] = b;   corners[3].color[3] = a;
+	}
 
 	DX12_Begin2DBatch(scratch->gpuHandle, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 	DX12_AddQuadToBatch(corners);
@@ -661,6 +683,28 @@ char dx12ModelNames[DX12_MAX_MOD_KNOWN][MAX_QPATH];
 int  dx12NumModels = 0;
 
 // ---------------------------------------------------------------------------
+// Font registry – mirrors RE_RegisterFont / R_GetFont
+// ---------------------------------------------------------------------------
+
+/** Maximum simultaneously loaded fonts (matches GL's MAX_FONTS). */
+#define DX12_MAX_FONTS 16
+
+/**
+ * @struct dx12FontCache_t
+ * @brief Caches a registered font keyed by name+pointSize so repeated calls
+ *        don't re-read and re-parse the .dat file from disk.
+ */
+typedef struct
+{
+	char       fontName[MAX_QPATH]; ///< Base font name (e.g. "arialnb")
+	int        pointSize;           ///< Point size registered
+	fontInfo_t font;                ///< Parsed fontInfo_t written to caller
+} dx12FontCache_t;
+
+static dx12FontCache_t dx12FontCache[DX12_MAX_FONTS];
+static int             dx12NumFonts = 0;
+
+// ---------------------------------------------------------------------------
 // DX12_ClearPerSessionState
 // ---------------------------------------------------------------------------
 
@@ -682,6 +726,9 @@ void DX12_ClearPerSessionState(void)
 
 	Com_Memset(dx12Skins, 0, sizeof(dx12Skins));
 	dx12NumSkins = 0;
+
+	Com_Memset(dx12FontCache, 0, sizeof(dx12FontCache));
+	dx12NumFonts = 0;
 
 	// Reset shader remaps so that remaps from the previous map cannot bleed
 	// into a newly loaded map's shader lookups.
@@ -708,9 +755,25 @@ static qhandle_t RE_DX12_RegisterModel(const char *name)
 		return 0;
 	}
 
+	// Mirror GL: reject names that would overflow MAX_QPATH.
+	if (strlen(name) >= MAX_QPATH)
+	{
+		dx12.ri.Printf(PRINT_WARNING, "RE_DX12_RegisterModel: name too long '%s'\n", name);
+		return 0;
+	}
+
 	Q_strncpyz(fixedName, name, sizeof(fixedName));
 	DX12_FixPath(fixedName);
 	name = fixedName;
+
+	// Mirror GL: report the model to the asset-cache gathering system when active.
+	{
+		cvar_t *r_cacheGathering = dx12.ri.Cvar_Get("cl_cacheGathering", "0", 0);
+		if (r_cacheGathering && r_cacheGathering->integer)
+		{
+			dx12.ri.Cmd_ExecuteText(EXEC_NOW, va("cache_usedfile model %s\n", name));
+		}
+	}
 
 	// Inline BSP sub-models are referenced as "*N" (e.g. "*1", "*2" for brush
 	// entities like doors).  Register a stub handle – the scene will draw these
@@ -735,11 +798,17 @@ static qhandle_t RE_DX12_RegisterModel(const char *name)
 		return 0;
 	}
 
-	// Return an existing handle if already registered
+	// Return an existing handle if already registered.
+	// Mirror GL MOD_BAD: if a previous registration attempt failed for this
+	// name, return 0 immediately instead of handing back a broken handle.
 	for (i = 0; i < dx12NumModels; i++)
 	{
 		if (!Q_stricmp(dx12ModelNames[i], name))
 		{
+			if (dx12ModelData[i].isBad)
+			{
+				return 0;
+			}
 			return (qhandle_t)(i + 1);
 		}
 	}
@@ -793,6 +862,26 @@ static qhandle_t RE_DX12_RegisterModel(const char *name)
 					mdsFrame_t  *frame0 = (mdsFrame_t *)((byte *)mds + mds->ofsFrames);
 					VectorCopy(frame0->bounds[0], dx12ModelData[slot].mins);
 					VectorCopy(frame0->bounds[1], dx12ModelData[slot].maxs);
+
+					// Pre-register surface textures and build static IBs for LOD0 surfaces
+					{
+						mdsLOD_t     *lod  = (mdsLOD_t *)((byte *)mds + mds->ofsSurfaces);
+						mdsSurface_t *surf = (mdsSurface_t *)((byte *)lod + lod->ofsSurfaces);
+						int           s;
+						for (s = 0; s < lod->numSurfaces && s < DX12_MAX_MODEL_SURFACES; s++)
+						{
+							dx12ModelSurface_t *ms = &dx12ModelData[slot].surfaces[dx12ModelData[slot].numSurfaces];
+							Q_strncpyz(ms->surfName, surf->name, MAX_QPATH);
+							if (surf->shader[0])
+							{
+								ms->texHandle = DX12_RegisterTexture(surf->shader);
+							}
+							ms->numVertices = (UINT)surf->numVerts;
+							DX12_BuildSkeletalSurfaceIB(ms, (const int *)((byte *)surf + surf->ofsTriangles), surf->numTriangles);
+							dx12ModelData[slot].numSurfaces++;
+							surf = (mdsSurface_t *)((byte *)surf + surf->ofsEnd);
+						}
+					}
 				}
 			}
 			else if (!Q_stricmp(ext, ".mdx"))
@@ -819,6 +908,26 @@ static qhandle_t RE_DX12_RegisterModel(const char *name)
 					dx12ModelData[slot].rawDataSize = rawSize;
 					dx12ModelData[slot].modelType   = DX12_MOD_MDM;
 					dx12ModelData[slot].valid       = qtrue;
+
+					// Pre-register surface textures and build static IBs for MDM surfaces
+					{
+						mdmHeader_t  *mdm  = (mdmHeader_t *)rawData;
+						mdmSurface_t *surf = (mdmSurface_t *)((byte *)mdm + mdm->ofsSurfaces);
+						int           s;
+						for (s = 0; s < mdm->numSurfaces && s < DX12_MAX_MODEL_SURFACES; s++)
+						{
+							dx12ModelSurface_t *ms = &dx12ModelData[slot].surfaces[dx12ModelData[slot].numSurfaces];
+							Q_strncpyz(ms->surfName, surf->name, MAX_QPATH);
+							if (surf->shader[0])
+							{
+								ms->texHandle = DX12_RegisterTexture(surf->shader);
+							}
+							ms->numVertices = (UINT)surf->numVerts;
+							DX12_BuildSkeletalSurfaceIB(ms, (const int *)((byte *)surf + surf->ofsTriangles), surf->numTriangles);
+							dx12ModelData[slot].numSurfaces++;
+							surf = (mdmSurface_t *)((byte *)surf + surf->ofsEnd);
+						}
+					}
 				}
 			}
 			else if (!Q_stricmp(ext, ".mdc"))
@@ -955,6 +1064,20 @@ static qhandle_t RE_DX12_RegisterModelAllLODs(const char *name)
 		return 0;
 	}
 
+	if (strlen(name) >= MAX_QPATH)
+	{
+		ri.Printf(PRINT_WARNING, "RE_DX12_RegisterModelAllLODs: model name exceeds MAX_QPATH: %s\n", name);
+		return 0;
+	}
+
+	{
+		cvar_t *r_cacheGathering = dx12.ri.Cvar_Get("cl_cacheGathering", "0", 0);
+		if (r_cacheGathering->integer)
+		{
+			dx12.ri.Cmd_ExecuteText(EXEC_NOW, va("cache_usedfile model %s\n", name));
+		}
+	}
+
 	// Skeletal formats (.mds / .mdx / .mdm) carry their own multi-frame data
 	// and have no per-LOD file variants – fall back to the single-model path.
 	{
@@ -1060,14 +1183,21 @@ static qhandle_t RE_DX12_RegisterSkin(const char *name)
 
 	if (strlen(name) >= MAX_QPATH)
 	{
-		dx12.ri.Printf(PRINT_DEVELOPER, "RE_DX12_RegisterSkin: name exceeds MAX_QPATH, truncating: '%s'\n", name);
+		dx12.ri.Printf(PRINT_WARNING, "RE_DX12_RegisterSkin: skin name exceeds MAX_QPATH: '%s'\n", name);
+		return 0;
 	}
 
-	// Deduplicate: return existing handle (1-based)
+	// Deduplicate: return existing handle (1-based).
+	// Return 0 for slots that previously failed to load (numSurfaces == 0),
+	// matching GL's behaviour of not handing out a handle for a known-bad skin.
 	for (i = 0; i < dx12NumSkins; i++)
 	{
 		if (!DX12_Stricmp(dx12Skins[i].name, name))
 		{
+			if (dx12Skins[i].numSurfaces == 0)
+			{
+				return 0;
+			}
 			return (qhandle_t)(i + 1);
 		}
 	}
@@ -1090,8 +1220,8 @@ static qhandle_t RE_DX12_RegisterSkin(const char *name)
 	if (!text_v)
 	{
 		dx12.ri.Printf(PRINT_DEVELOPER, "RE_DX12_RegisterSkin: '%s' not found\n", name);
-		// Return a valid handle for the empty skin so cgame doesn't spam "Failed to load skin"
-		return (qhandle_t)(slot + 1);
+		// Leave the slot with numSurfaces == 0 so future dedup lookups return 0.
+		return 0;
 	}
 
 	text_p = (char *)text_v;
@@ -1106,6 +1236,9 @@ static qhandle_t RE_DX12_RegisterSkin(const char *name)
 		{
 			break;
 		}
+
+		// Lowercase early so all comparisons below use consistent case.
+		Q_strlwr(surfName);
 
 		// Advance past comma
 		if (*text_p == ',')
@@ -1123,7 +1256,13 @@ static qhandle_t RE_DX12_RegisterSkin(const char *name)
 		// Model-part entry: "md3_lower,models/…/lower.md3"
 		if (strstr(surfName, "md3_") || strstr(surfName, "mdc_"))
 		{
-			if (skin->numModels < DX12_MAX_PART_MODELS)
+			if (skin->numModels >= DX12_MAX_PART_MODELS)
+			{
+				dx12.ri.Printf(PRINT_WARNING, "RE_DX12_RegisterSkin: ignoring models in '%s', max is %d\n",
+				               name, DX12_MAX_PART_MODELS);
+				break;
+			}
+
 			{
 				dx12SkinModel_t *mdl = &skin->models[skin->numModels];
 				Q_strncpyz(mdl->type, surfName, sizeof(mdl->type));
@@ -1142,8 +1281,7 @@ static qhandle_t RE_DX12_RegisterSkin(const char *name)
 		if (totalSurfaces < DX12_MAX_SKIN_SURFACES && skin->numSurfaces < DX12_MAX_SKIN_SURFACES)
 		{
 			dx12SkinSurface_t *ss = &skin->surfaces[skin->numSurfaces];
-			Q_strncpyz(ss->name, surfName, sizeof(ss->name));
-			Q_strlwr(ss->name);
+			Q_strncpyz(ss->name, surfName, sizeof(ss->name)); // already lowercased above
 			ss->hash      = DX12_HashKey(ss->name, sizeof(ss->name));
 			ss->matHandle = DX12_RegisterMaterial(token);
 			skin->numSurfaces++;
@@ -1180,6 +1318,12 @@ static qhandle_t RE_DX12_RegisterShader(const char *name)
 		return 0;
 	}
 
+	if (strlen(name) >= MAX_QPATH)
+	{
+		dx12.ri.Printf(PRINT_WARNING, "RE_DX12_RegisterShader: shader name exceeds MAX_QPATH\n");
+		return 0;
+	}
+
 	// Apply remap table (set by RE_DX12_RemapShader / BSP loading).
 	resolvedName = DX12_GetRemappedShader(name);
 	if (!resolvedName)
@@ -1190,8 +1334,8 @@ static qhandle_t RE_DX12_RegisterShader(const char *name)
 	h = DX12_RegisterMaterial(resolvedName);
 	if (!h)
 	{
-		// Fallback to "noshader" sentinel, mirroring the GL renderer.
-		h = DX12_RegisterMaterial("noshader");
+		dx12.ri.Printf(PRINT_WARNING, "RE_DX12_RegisterShader: shader '%s' not found\n", name);
+		return 0;
 	}
 	return h;
 }
@@ -1207,6 +1351,12 @@ static qhandle_t RE_DX12_RegisterShaderNoMip(const char *name)
 		return 0;
 	}
 
+	if (strlen(name) >= MAX_QPATH)
+	{
+		dx12.ri.Printf(PRINT_WARNING, "RE_DX12_RegisterShaderNoMip: shader name exceeds MAX_QPATH\n");
+		return 0;
+	}
+
 	// Apply remap table.
 	resolvedName = DX12_GetRemappedShader(name);
 	if (!resolvedName)
@@ -1217,7 +1367,8 @@ static qhandle_t RE_DX12_RegisterShaderNoMip(const char *name)
 	h = DX12_RegisterMaterial(resolvedName);
 	if (!h)
 	{
-		h = DX12_RegisterMaterial("noshader");
+		dx12.ri.Printf(PRINT_DEVELOPER, "RE_DX12_RegisterShaderNoMip: shader '%s' not found\n", name);
+		return 0;
 	}
 
 	// Mark the material so the upload path can skip mipmap generation.
@@ -1229,7 +1380,6 @@ static qhandle_t RE_DX12_RegisterShaderNoMip(const char *name)
 	return h;
 }
 
-// ---------------------------------------------------------------------------
 // RE_DX12_RegisterFont helpers
 // ---------------------------------------------------------------------------
 
@@ -1273,6 +1423,33 @@ static void RE_DX12_RegisterFont(const char *fontName, int pointSize, void *font
 
 	if (!fi || !fontName || !fontName[0])
 	{
+		return;
+	}
+
+	// Clamp degenerate point sizes, matching GL's RE_RegisterFont.
+	if (pointSize <= 0)
+	{
+		pointSize = 12;
+	}
+
+	// Deduplication: if this font+size was already loaded, copy cached data.
+	{
+		int ci;
+		for (ci = 0; ci < dx12NumFonts; ci++)
+		{
+			if (dx12FontCache[ci].pointSize == pointSize &&
+			    !Q_stricmp(dx12FontCache[ci].fontName, fontName))
+			{
+				Com_Memcpy(fi, &dx12FontCache[ci].font, sizeof(fontInfo_t));
+				return;
+			}
+		}
+	}
+
+	// Enforce registration cap, matching GL's MAX_FONTS.
+	if (dx12NumFonts >= DX12_MAX_FONTS)
+	{
+		dx12.ri.Printf(PRINT_WARNING, "RE_DX12_RegisterFont: too many fonts registered (max %d)\n", DX12_MAX_FONTS);
 		return;
 	}
 
@@ -1357,6 +1534,14 @@ static void RE_DX12_RegisterFont(const char *fontName, int pointSize, void *font
 	dx12.ri.Printf(PRINT_DEVELOPER,
 	               "RE_DX12_RegisterFont: loaded '%s' (scale %.3f)\n",
 	               datName, fi->glyphScale);
+
+	// Store in cache so subsequent calls with the same name+size skip disk I/O.
+	{
+		dx12FontCache_t *ce = &dx12FontCache[dx12NumFonts++];
+		Q_strncpyz(ce->fontName, fontName, sizeof(ce->fontName));
+		ce->pointSize = pointSize;
+		Com_Memcpy(&ce->font, fi, sizeof(fontInfo_t));
+	}
 }
 
 static void RE_DX12_LoadWorld(const char *name)
@@ -1392,6 +1577,45 @@ static qboolean RE_DX12_GetSkinModel(qhandle_t skinid, const char *type, char *n
 	}
 
 	return qfalse;
+}
+
+/**
+ * @brief DX12_GetSkinTexture
+ *
+ * Returns the material/texture handle stored in @p skinHandle for the MD3
+ * surface named @p surfName (case-insensitive match).  Returns 0 when the
+ * skin handle is out of range or no entry matches.
+ */
+qhandle_t DX12_GetSkinTexture(qhandle_t skinHandle, const char *surfName)
+{
+	dx12Skin_t *skin;
+	char        lower[MAX_QPATH];
+	int         hash, i;
+
+	if (skinHandle < 1 || skinHandle > dx12NumSkins)
+	{
+		return 0;
+	}
+
+	skin = &dx12Skins[skinHandle - 1];
+
+	Q_strncpyz(lower, surfName, sizeof(lower));
+	Q_strlwr(lower);
+	hash = DX12_HashKey(lower, (int)strlen(lower));
+
+	for (i = 0; i < skin->numSurfaces; i++)
+	{
+		if (skin->surfaces[i].hash != hash)
+		{
+			continue;
+		}
+		if (!Q_stricmp(skin->surfaces[i].name, lower))
+		{
+			return skin->surfaces[i].matHandle;
+		}
+	}
+
+	return 0;
 }
 
 static qhandle_t RE_DX12_GetShaderFromModel(qhandle_t modelid, int surfnum, int withlightmap)
@@ -2005,11 +2229,17 @@ static int RE_DX12_MarkFragments(int numPoints, const vec3_t *points, const vec3
 
 		for (i = 0; i < wm->numSurfaces; i++)
 		{
-			const dx12DrawSurf_t  *ds     = &dx12World.drawSurfs[wm->firstSurface + i];
-			const dx12Material_t  *dsMat  = DX12_GetMaterial(ds->materialHandle);
+			const dx12DrawSurf_t *ds    = &dx12World.drawSurfs[wm->firstSurface + i];
+			const dx12Material_t *dsMat = DX12_GetMaterial(ds->materialHandle);
 
-			// Skip non-triangle surfaces (sky, flares) and empty surfaces
-			if ((dsMat && dsMat->isSky) || ds->surfaceType == MST_FLARE || ds->numIndexes < 3)
+			// Skip sky, flares, and surfaces that explicitly reject decals/impacts.
+			// Matches GL R_BoxSurfaces_r: SURF_NOIMPACT|SURF_NOMARKS and CONTENTS_FOG
+			// are excluded before the surface is even considered for clipping.
+			if (ds->surfaceType == MST_FLARE || ds->numIndexes < 3)
+			{
+				continue;
+			}
+			if (dsMat && (dsMat->isSky || dsMat->isFog || dsMat->noImpact || dsMat->noMarks))
 			{
 				continue;
 			}
@@ -2028,6 +2258,7 @@ static int RE_DX12_MarkFragments(int numPoints, const vec3_t *points, const vec3
 				float  texCoordScale;
 				float  epsilon = 0.5f;
 				float  dot;
+				float  planeDist;
 				int    lnumPlanes;
 
 				// Derive surface normal from the first triangle
@@ -2046,22 +2277,28 @@ static int RE_DX12_MarkFragments(int numPoints, const vec3_t *points, const vec3
 					}
 				}
 
+				planeDist = DotProduct(surfnormal, dx12World.cpuVerts[dx12World.cpuIndexes[ds->firstIndex]].xyz);
+
+				dot = DotProduct(center, surfnormal) - planeDist;
+				if (dot < -epsilon && DotProduct(surfnormal, projectionDir) >= 0.01f)
 				{
-					float planeDist = DotProduct(surfnormal,
-					                             dx12World.cpuVerts[dx12World.cpuIndexes[ds->firstIndex]].xyz);
+					continue;
+				}
+				if (Q_fabs(dot) > radius)
+				{
+					continue;
+				}
 
-					dot = DotProduct(center, surfnormal) - planeDist;
-					if (dot < -epsilon && DotProduct(surfnormal, projectionDir) >= 0.01f)
-					{
-						continue;
-					}
-					if (Q_fabs(dot) > radius)
-					{
-						continue;
-					}
+				// Step 1: project center along projectionDir (matches GL:
+				//   VectorMA(center, -dot, bestnormal, newCenter) where bestnormal==projectionDir
+				//   in the !oldMapping branch after VectorNegate(bestnormal, bestnormal)).
+				VectorMA(center, -dot, projectionDir, newCenter);
 
-					// Project mark centre onto the surface plane
-					VectorMA(center, -dot, surfnormal, newCenter);
+				// Step 2: snap newCenter exactly onto the surface plane along surfnormal
+				// (matches GL's secondary correction step).
+				{
+					float dot2 = DotProduct(newCenter, surfnormal) - planeDist;
+					VectorMA(newCenter, -dot2, surfnormal, newCenter);
 				}
 
 				// Build local texture axis (matching GL SF_FACE path)
@@ -2135,10 +2372,88 @@ static int RE_DX12_MarkFragments(int numPoints, const vec3_t *points, const vec3
 					}
 				}
 			}
+			else if (!oldMapping && ds->surfaceType == MST_TRIANGLE_SOUP)
+			{
+				// Triangle soup, new-mapping: negate the clip planes to match
+				// GL's SF_TRIANGLES !oldMapping behavior (inverted clip convention).
+				vec3_t lnormals[DX12_MAX_VERTS_ON_POLY + 2];
+				float  ldists[DX12_MAX_VERTS_ON_POLY + 2];
+
+				for (k = 0; k < numberPoints; k++)
+				{
+					VectorNegate(normals[k], lnormals[k]);
+					ldists[k] = -dists[k];
+				}
+				VectorNegate(normals[numberPoints], lnormals[numberPoints]);
+				ldists[numberPoints] = dists[numberPoints + 1];
+				VectorNegate(normals[numberPoints + 1], lnormals[numberPoints + 1]);
+				ldists[numberPoints + 1] = dists[numberPoints];
+
+				for (k = 0; k < ds->numIndexes; k += 3)
+				{
+					for (j = 0; j < 3; j++)
+					{
+						const dx12WorldVertex_t *vtx =
+							&dx12World.cpuVerts[dx12World.cpuIndexes[ds->firstIndex + k + j]];
+						VectorCopy(vtx->xyz, clipPoints[0][j]);
+					}
+
+					DX12_AddMarkFragments(3, clipPoints,
+					                      numPlanes, lnormals, ldists,
+					                      maxPoints, pointBuffer,
+					                      maxFragments, fragmentBuffer,
+					                      &returnedPoints, &returnedFragments);
+
+					if (returnedFragments == maxFragments)
+					{
+						return returnedFragments;
+					}
+				}
+			}
+			else if (ds->surfaceType == MST_PATCH)
+			{
+				// Tessellated patch: clip triangles against the global projection
+				// planes, back-face culling each triangle to avoid projecting onto
+				// reverse-facing patch geometry (matches GL SF_GRID behavior).
+				for (k = 0; k < ds->numIndexes; k += 3)
+				{
+					vec3_t triNormal;
+					vec3_t e0, e1;
+
+					for (j = 0; j < 3; j++)
+					{
+						const dx12WorldVertex_t *vtx =
+							&dx12World.cpuVerts[dx12World.cpuIndexes[ds->firstIndex + k + j]];
+						VectorCopy(vtx->xyz, clipPoints[0][j]);
+					}
+
+					// Back-face cull: skip triangles whose normal opposes the
+					// projection direction (threshold matches GL SF_GRID: < -0.1f).
+					VectorSubtract(clipPoints[0][0], clipPoints[0][1], e0);
+					VectorSubtract(clipPoints[0][2], clipPoints[0][1], e1);
+					CrossProduct(e0, e1, triNormal);
+					VectorNormalize(triNormal);
+					if (DotProduct(triNormal, projectionDir) < -0.1f)
+					{
+						continue;
+					}
+
+					DX12_AddMarkFragments(3, clipPoints,
+					                      numPlanes, normals, dists,
+					                      maxPoints, pointBuffer,
+					                      maxFragments, fragmentBuffer,
+					                      &returnedPoints, &returnedFragments);
+
+					if (returnedFragments == maxFragments)
+					{
+						return returnedFragments;
+					}
+				}
+			}
 			else
 			{
-				// Old-mapping path, or non-planar triangle soup: clip each triangle
-				// directly against the original projection planes.
+				// Old-mapping path (any surface type): clip each triangle directly
+				// against the original projection planes.
 				for (k = 0; k < ds->numIndexes; k += 3)
 				{
 					for (j = 0; j < 3; j++)

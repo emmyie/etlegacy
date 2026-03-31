@@ -263,6 +263,17 @@ static int g_vbWarnCount = 0;
 static int g_sceneTimeMs = 0;
 
 // ---------------------------------------------------------------------------
+// Debug pass-disable flags (set via VS debugger: g_dbgDisableXxx = 1)
+// ---------------------------------------------------------------------------
+static int g_dbgDisableSky           = 0; // 1 = skip pass 5a (sky)
+static int g_dbgDisableWorldBSP      = 0; // 1 = skip passes 5b/5c/5d (opaque+fog world)
+static int g_dbgDisableEntities      = 0; // 1 = skip pass 6 (entities)
+static int g_dbgDisableBrushEntities = 0; // 1 = skip brush model sub-path within pass 6
+static int g_dbgDisableModelEntities = 0; // 1 = skip regular model sub-path within pass 6
+static int g_dbgDisableDecals        = 0; // 1 = skip passes 7a/7b (decals+polys)
+static int g_dbgDisableTranslucent   = 0; // 1 = skip pass 7c (translucent world surfs)
+
+// ---------------------------------------------------------------------------
 // Matrix helpers
 // ---------------------------------------------------------------------------
 
@@ -296,6 +307,20 @@ static void Mat4Mul(float out[4][4], const float a[4][4], const float b[4][4])
 				sum += a[i][k] * b[k][j];
 			}
 			out[i][j] = sum;
+		}
+	}
+}
+
+/** Transpose: out = in^T.  Safe when out != in. */
+static void Mat4Transpose(float out[4][4], const float in[4][4])
+{
+	int i, j;
+
+	for (i = 0; i < 4; i++)
+	{
+		for (j = 0; j < 4; j++)
+		{
+			out[i][j] = in[j][i];
 		}
 	}
 }
@@ -407,10 +432,82 @@ static const char g_skyShaderSource[] =
 	"    return col;\n"
 	"}\n";
 
+// ---------------------------------------------------------------------------
+// Shader compile helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Build the full path to an .hlsl file next to this source file.
+ *
+ * Uses the compile-time path from __FILE__ to locate the renderer_dx12
+ * source directory where dx12_world.hlsl / dx12_sky.hlsl live.
+ */
+static void SCN_GetHlslPath(wchar_t *out, int outLen, const wchar_t *hlslName)
+{
+	wchar_t srcPath[1024];
+	wchar_t *last;
+
+	MultiByteToWideChar(CP_ACP, 0, __FILE__, -1, srcPath, 1024);
+	last = wcsrchr(srcPath, L'\\');
+	if (!last) last = wcsrchr(srcPath, L'/');
+	if (last)
+		last[1] = L'\0';
+	else
+		srcPath[0] = L'\0';
+
+	_snwprintf(out, outLen, L"%s%s", srcPath, hlslName);
+}
+
+/**
+ * @brief Compile world shader (dx12_world.hlsl), falling back to the
+ *        embedded string if the file is not found.
+ */
+static HRESULT SCN_CompileWorldShader(LPCSTR entryPoint, LPCSTR target,
+                                      UINT flags,
+                                      ID3DBlob **ppCode, ID3DBlob **ppErr)
+{
+	wchar_t hlslPath[1024];
+	HRESULT hr;
+
+	SCN_GetHlslPath(hlslPath, 1024, L"dx12_world.hlsl");
+	hr = D3DCompileFromFile(hlslPath, NULL, D3D_COMPILE_STANDARD_FILE_INCLUDE,
+	                        entryPoint, target, flags, 0, ppCode, ppErr);
+	if (SUCCEEDED(hr))
+		return hr;
+
+	/* File not found / compile error from file – fall back to embedded string. */
+	if (*ppErr) { (*ppErr)->Release(); *ppErr = NULL; }
+	return D3DCompile(g_worldShaderSource, strlen(g_worldShaderSource),
+	                  "dx12_world_shader", NULL, NULL,
+	                  entryPoint, target, flags, 0, ppCode, ppErr);
+}
+
+/**
+ * @brief Compile sky shader (dx12_sky.hlsl), falling back to the
+ *        embedded string if the file is not found.
+ */
+static HRESULT SCN_CompileSkyShader(LPCSTR entryPoint, LPCSTR target,
+                                    UINT flags,
+                                    ID3DBlob **ppCode, ID3DBlob **ppErr)
+{
+	wchar_t hlslPath[1024];
+	HRESULT hr;
+
+	SCN_GetHlslPath(hlslPath, 1024, L"dx12_sky.hlsl");
+	hr = D3DCompileFromFile(hlslPath, NULL, D3D_COMPILE_STANDARD_FILE_INCLUDE,
+	                        entryPoint, target, flags, 0, ppCode, ppErr);
+	if (SUCCEEDED(hr))
+		return hr;
+
+	if (*ppErr) { (*ppErr)->Release(); *ppErr = NULL; }
+	return D3DCompile(g_skyShaderSource, strlen(g_skyShaderSource),
+	                  "dx12_sky_shader", NULL, NULL,
+	                  entryPoint, target, flags, 0, ppCode, ppErr);
+}
+
 static void BuildViewMatrix(float m[4][4], const vec3_t origin, const vec3_t axis[3])
 {
 	float rx[3], ry[3], rz[3];
-	int   i;
 
 	// Camera right = -left
 	rx[0] = -axis[1][0];
@@ -427,21 +524,18 @@ static void BuildViewMatrix(float m[4][4], const vec3_t origin, const vec3_t axi
 	rz[1] = axis[0][1];
 	rz[2] = axis[0][2];
 
-	// Build row-major view matrix
-	for (i = 0; i < 4; i++)
-	{
-		m[i][0] = m[i][1] = m[i][2] = m[i][3] = 0.0f;
-	}
+	// Math matrix M_view: row i = basis vector i, translation in last column.
+	// CPU rule: store M_view here; caller transposes into the constant buffer.
+	m[0][0] = rx[0]; m[0][1] = rx[1]; m[0][2] = rx[2];
+	m[0][3] = -(rx[0] * origin[0] + rx[1] * origin[1] + rx[2] * origin[2]);
 
-	m[0][0] = rx[0]; m[0][1] = ry[0]; m[0][2] = rz[0]; m[0][3] = 0.0f;
-	m[1][0] = rx[1]; m[1][1] = ry[1]; m[1][2] = rz[1]; m[1][3] = 0.0f;
-	m[2][0] = rx[2]; m[2][1] = ry[2]; m[2][2] = rz[2]; m[2][3] = 0.0f;
+	m[1][0] = ry[0]; m[1][1] = ry[1]; m[1][2] = ry[2];
+	m[1][3] = -(ry[0] * origin[0] + ry[1] * origin[1] + ry[2] * origin[2]);
 
-	// Translation: -dot(row, eye)
-	m[3][0] = -(rx[0] * origin[0] + rx[1] * origin[1] + rx[2] * origin[2]);
-	m[3][1] = -(ry[0] * origin[0] + ry[1] * origin[1] + ry[2] * origin[2]);
-	m[3][2] = -(rz[0] * origin[0] + rz[1] * origin[1] + rz[2] * origin[2]);
-	m[3][3] = 1.0f;
+	m[2][0] = rz[0]; m[2][1] = rz[1]; m[2][2] = rz[2];
+	m[2][3] = -(rz[0] * origin[0] + rz[1] * origin[1] + rz[2] * origin[2]);
+
+	m[3][0] = 0.0f; m[3][1] = 0.0f; m[3][2] = 0.0f; m[3][3] = 1.0f;
 }
 
 /**
@@ -466,8 +560,6 @@ static void BuildProjMatrix(float m[4][4],
 	float q       = zFar / (zFar - zNear);
 	int   i, j;
 
-	(void)fovXDeg; // used via fovXRad
-
 	for (i = 0; i < 4; i++)
 	{
 		for (j = 0; j < 4; j++)
@@ -476,12 +568,18 @@ static void BuildProjMatrix(float m[4][4],
 		}
 	}
 
-	// Row-major, left-handed, [0,1] depth
+	// Math matrix M_proj (column-vector, LH, [0,1] depth):
+	//   clip = M_proj * v_view
+	//   row 0: [w, 0, 0,      0     ] → clip.x = w*x
+	//   row 1: [0, h, 0,      0     ] → clip.y = h*y
+	//   row 2: [0, 0, q,     -q*near] → clip.z = q*z - q*near
+	//   row 3: [0, 0, 1,      0     ] → clip.w = z  (perspective divide)
+	// CPU rule: store M_proj here; caller transposes into the constant buffer.
 	m[0][0] = w;
 	m[1][1] = h;
 	m[2][2] = q;
-	m[2][3] = 1.0f;
-	m[3][2] = -q * zNear;
+	m[2][3] = -q * zNear;
+	m[3][2] = 1.0f;
 }
 
 /**
@@ -493,13 +591,24 @@ static void BuildProjMatrix(float m[4][4],
  */
 static void BuildModelMatrix(float m[4][4], const vec3_t org, const vec3_t axis[3])
 {
-	// Column vectors of the rotation part are the world-space axes.
-	// row-major layout: m[row][col]
-	// First three rows are the basis vectors (transposed for row-major).
-	m[0][0] = axis[0][0]; m[0][1] = axis[1][0]; m[0][2] = axis[2][0]; m[0][3] = 0.0f;
-	m[1][0] = axis[0][1]; m[1][1] = axis[1][1]; m[1][2] = axis[2][1]; m[1][3] = 0.0f;
-	m[2][0] = axis[0][2]; m[2][1] = axis[1][2]; m[2][2] = axis[2][2]; m[2][3] = 0.0f;
-	m[3][0] = org[0];     m[3][1] = org[1];     m[3][2] = org[2];     m[3][3] = 1.0f;
+	// Q3 model-local convention: +X = forward, +Y = left, +Z = up.
+	// The math matrix M_model transforms local → Q3 world (column-vector form):
+	//   worldPos = M_model * localPos
+	//
+	// Columns of the rotation block hold the world-space images of the local
+	// basis vectors:
+	//   col 0 = axis[0]  (local +X → world forward)
+	//   col 1 = axis[1]  (local +Y → world left)
+	//   col 2 = axis[2]  (local +Z → world up)
+	//   col 3 = org      (world translation)
+	//
+	// Stored ROW-MAJOR on the CPU.  Caller calls Mat4Transpose before writing
+	// into the constant buffer so that HLSL (default column-major CB packing)
+	// reconstructs the original math matrix and executes mul(M_model, v).
+	m[0][0] = axis[0][0]; m[0][1] = axis[1][0]; m[0][2] = axis[2][0]; m[0][3] = org[0];
+	m[1][0] = axis[0][1]; m[1][1] = axis[1][1]; m[1][2] = axis[2][1]; m[1][3] = org[1];
+	m[2][0] = axis[0][2]; m[2][1] = axis[1][2]; m[2][2] = axis[2][2]; m[2][3] = org[2];
+	m[3][0] = 0.0f;       m[3][1] = 0.0f;       m[3][2] = 0.0f;       m[3][3] = 1.0f;
 }
 
 // ---------------------------------------------------------------------------
@@ -1589,10 +1698,7 @@ qboolean DX12_SceneInit(void)
 		flags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
 #endif
 
-		SIZE_T srcLen = strlen(g_worldShaderSource);
-
-		hr = D3DCompile(g_worldShaderSource, srcLen, "dx12_world_shader", NULL, NULL,
-		                "VSMain", "vs_5_0", flags, 0, &vs, &errBlob);
+		hr = SCN_CompileWorldShader("VSMain", "vs_5_0", flags, &vs, &errBlob);
 		if (FAILED(hr))
 		{
 			if (errBlob)
@@ -1609,8 +1715,7 @@ qboolean DX12_SceneInit(void)
 		}
 		if (errBlob) { errBlob->Release(); errBlob = NULL; }
 
-		hr = D3DCompile(g_worldShaderSource, srcLen, "dx12_world_shader", NULL, NULL,
-		                "PSMain", "ps_5_0", flags, 0, &ps, &errBlob);
+		hr = SCN_CompileWorldShader("PSMain", "ps_5_0", flags, &ps, &errBlob);
 		if (FAILED(hr))
 		{
 			if (errBlob)
@@ -1741,15 +1846,11 @@ qboolean DX12_SceneInit(void)
 		flags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
 #endif
 
-		SIZE_T srcLen2 = strlen(g_worldShaderSource);
-
-		hr = D3DCompile(g_worldShaderSource, srcLen2, "dx12_world_shader_translucent", NULL, NULL,
-		                "VSMain", "vs_5_0", flags, 0, &vs, &errBlob);
+		hr = SCN_CompileWorldShader("VSMain", "vs_5_0", flags, &vs, &errBlob);
 		if (SUCCEEDED(hr))
 		{
 			if (errBlob) { errBlob->Release(); errBlob = NULL; }
-			hr = D3DCompile(g_worldShaderSource, srcLen2, "dx12_world_shader_translucent", NULL, NULL,
-			                "PSMain", "ps_5_0", flags, 0, &ps, &errBlob);
+			hr = SCN_CompileWorldShader("PSMain", "ps_5_0", flags, &ps, &errBlob);
 		}
 
 		if (FAILED(hr) || !vs || !ps)
@@ -1853,15 +1954,11 @@ qboolean DX12_SceneInit(void)
 		flags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
 #endif
 
-		SIZE_T skyLen = strlen(g_skyShaderSource);
-
-		hr = D3DCompile(g_skyShaderSource, skyLen, "dx12_sky_shader", NULL, NULL,
-		                "VSMain", "vs_5_0", flags, 0, &vs, &errBlob);
+		hr = SCN_CompileSkyShader("VSMain", "vs_5_0", flags, &vs, &errBlob);
 		if (SUCCEEDED(hr))
 		{
 			if (errBlob) { errBlob->Release(); errBlob = NULL; }
-			hr = D3DCompile(g_skyShaderSource, skyLen, "dx12_sky_shader", NULL, NULL,
-			                "PSMain", "ps_5_0", flags, 0, &ps, &errBlob);
+			hr = SCN_CompileSkyShader("PSMain", "ps_5_0", flags, &ps, &errBlob);
 		}
 
 		if (FAILED(hr) || !vs || !ps)
@@ -1958,15 +2055,11 @@ qboolean DX12_SceneInit(void)
 		flags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
 #endif
 
-		SIZE_T addLen = strlen(g_worldShaderSource);
-
-		hr = D3DCompile(g_worldShaderSource, addLen, "dx12_world_shader_additive", NULL, NULL,
-		                "VSMain", "vs_5_0", flags, 0, &vs, &errBlob);
+		hr = SCN_CompileWorldShader("VSMain", "vs_5_0", flags, &vs, &errBlob);
 		if (SUCCEEDED(hr))
 		{
 			if (errBlob) { errBlob->Release(); errBlob = NULL; }
-			hr = D3DCompile(g_worldShaderSource, addLen, "dx12_world_shader_additive", NULL, NULL,
-			                "PSMain", "ps_5_0", flags, 0, &ps, &errBlob);
+			hr = SCN_CompileWorldShader("PSMain", "ps_5_0", flags, &ps, &errBlob);
 		}
 
 		if (FAILED(hr) || !vs || !ps)
@@ -2061,15 +2154,11 @@ qboolean DX12_SceneInit(void)
 		flags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
 #endif
 
-		SIZE_T modLen = strlen(g_worldShaderSource);
-
-		hr = D3DCompile(g_worldShaderSource, modLen, "dx12_world_shader_modulate", NULL, NULL,
-		                "VSMain", "vs_5_0", flags, 0, &vs, &errBlob);
+		hr = SCN_CompileWorldShader("VSMain", "vs_5_0", flags, &vs, &errBlob);
 		if (SUCCEEDED(hr))
 		{
 			if (errBlob) { errBlob->Release(); errBlob = NULL; }
-			hr = D3DCompile(g_worldShaderSource, modLen, "dx12_world_shader_modulate", NULL, NULL,
-			                "PSMain", "ps_5_0", flags, 0, &ps, &errBlob);
+			hr = SCN_CompileWorldShader("PSMain", "ps_5_0", flags, &ps, &errBlob);
 		}
 
 		if (FAILED(hr) || !vs || !ps)
@@ -2264,6 +2353,55 @@ qboolean DX12_SceneInit(void)
 	}
 
 	// ----------------------------------------------------------------
+	// Per-frame skeletal vertex scratch buffer (upload heap)
+	// ----------------------------------------------------------------
+	{
+		D3D12_HEAP_PROPERTIES heapProps = {};
+		D3D12_RESOURCE_DESC   resDesc   = {};
+		D3D12_RANGE           readRange = { 0, 0 };
+		UINT64                skelVBSize;
+
+		skelVBSize = (UINT64)DX12_MAX_SKELETAL_VERTS * sizeof(dx12WorldVertex_t);
+
+		heapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+		resDesc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+		resDesc.Width            = skelVBSize;
+		resDesc.Height           = 1;
+		resDesc.DepthOrArraySize = 1;
+		resDesc.MipLevels        = 1;
+		resDesc.Format           = DXGI_FORMAT_UNKNOWN;
+		resDesc.SampleDesc.Count = 1;
+		resDesc.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+		hr = dx12.device->CreateCommittedResource(
+			&heapProps,
+			D3D12_HEAP_FLAG_NONE,
+			&resDesc,
+			D3D12_RESOURCE_STATE_GENERIC_READ,
+			NULL,
+			IID_PPV_ARGS(&dx12Scene.skelVB));
+
+		if (FAILED(hr))
+		{
+			dx12.ri.Printf(PRINT_WARNING,
+			               "DX12_SceneInit: skeletal VB creation failed (0x%08lx); skeletal rendering disabled\n", hr);
+			dx12Scene.skelVB       = NULL;
+			dx12Scene.skelVBMapped = NULL;
+		}
+		else
+		{
+			hr = dx12Scene.skelVB->Map(0, &readRange, (void **)&dx12Scene.skelVBMapped);
+			if (FAILED(hr))
+			{
+				dx12Scene.skelVB->Release();
+				dx12Scene.skelVB       = NULL;
+				dx12Scene.skelVBMapped = NULL;
+			}
+		}
+	}
+
+	// ----------------------------------------------------------------
 	// Static sky box vertex buffer (36 vertices, upload heap, filled once)
 	// ----------------------------------------------------------------
 	{
@@ -2404,6 +2542,14 @@ void DX12_SceneShutdown(void)
 		dx12Scene.skyBoxVBMapped = NULL;
 	}
 
+	if (dx12Scene.skelVB)
+	{
+		dx12Scene.skelVB->Unmap(0, NULL);
+		dx12Scene.skelVB->Release();
+		dx12Scene.skelVB       = NULL;
+		dx12Scene.skelVBMapped = NULL;
+	}
+
 	Com_Memset(&dx12Scene, 0, sizeof(dx12Scene));
 }
 
@@ -2421,6 +2567,7 @@ void DX12_ClearScene(void)
 	dx12Scene.numPolyBatches = 0;
 	dx12Scene.numDLights     = 0;
 	dx12Scene.numCoronas     = 0;
+	dx12Scene.skelVBWriteOffset = 0;
 }
 
 /**
@@ -2437,13 +2584,27 @@ void DX12_AddEntityToScene(const refEntity_t *re)
 	}
 
 	ent           = &dx12Scene.entities[dx12Scene.numEntities++];
-	ent->hModel   = re->hModel;
+	ent->hModel    = re->hModel;
+	ent->customSkin = re->customSkin;
 	ent->origin[0] = re->origin[0];
 	ent->origin[1] = re->origin[1];
 	ent->origin[2] = re->origin[2];
 	ent->axis[0][0] = re->axis[0][0]; ent->axis[0][1] = re->axis[0][1]; ent->axis[0][2] = re->axis[0][2];
 	ent->axis[1][0] = re->axis[1][0]; ent->axis[1][1] = re->axis[1][1]; ent->axis[1][2] = re->axis[1][2];
 	ent->axis[2][0] = re->axis[2][0]; ent->axis[2][1] = re->axis[2][1]; ent->axis[2][2] = re->axis[2][2];
+	ent->frame              = re->frame;
+	ent->oldframe           = re->oldframe;
+	ent->backlerp           = re->backlerp;
+	ent->torsoFrame         = re->torsoFrame;
+	ent->oldTorsoFrame      = re->oldTorsoFrame;
+	ent->torsoBacklerp      = re->torsoBacklerp;
+	ent->torsoAxis[0][0]    = re->torsoAxis[0][0]; ent->torsoAxis[0][1] = re->torsoAxis[0][1]; ent->torsoAxis[0][2] = re->torsoAxis[0][2];
+	ent->torsoAxis[1][0]    = re->torsoAxis[1][0]; ent->torsoAxis[1][1] = re->torsoAxis[1][1]; ent->torsoAxis[1][2] = re->torsoAxis[1][2];
+	ent->torsoAxis[2][0]    = re->torsoAxis[2][0]; ent->torsoAxis[2][1] = re->torsoAxis[2][1]; ent->torsoAxis[2][2] = re->torsoAxis[2][2];
+	ent->frameModel         = re->frameModel;
+	ent->oldframeModel      = re->oldframeModel;
+	ent->torsoFrameModel    = re->torsoFrameModel;
+	ent->oldTorsoFrameModel = re->oldTorsoFrameModel;
 }
 
 // ---------------------------------------------------------------------------
@@ -2635,7 +2796,7 @@ static void SCN_DrawBrushModelEntity(int submodelIdx, D3D12_GPU_VIRTUAL_ADDRESS 
 void DX12_RenderScene(const refdef_t *fd)
 {
 	dx12SceneConstants_t cb;
-	float view[4][4], proj[4][4], viewProj[4][4];
+	float view[4][4], proj[4][4], viewProjRaw[4][4];
 	D3D12_GPU_VIRTUAL_ADDRESS cbBaseGpuVA; // GPU VA of slot 0 in this frame
 	UINT  cbBaseSlot;                      // Index of the world CB slot
 
@@ -2691,10 +2852,13 @@ void DX12_RenderScene(const refdef_t *fd)
 
 	// ----------------------------------------------------------------
 	// 1.  Build view and projection matrices
+	//     Rule: each Build* function produces the normal math matrix.
+	//     Mat4Transpose stores the transpose into the CB so HLSL sees
+	//     the correct column-major matrix via mul(M, v).
 	// ----------------------------------------------------------------
 	BuildViewMatrix(view, fd->vieworg, (const vec3_t *)fd->viewaxis);
 	BuildProjMatrix(proj, fd->fov_x, fd->fov_y, DX12_SCENE_NEAR, DX12_SCENE_FAR);
-	Mat4Mul(viewProj, view, proj);
+	Mat4Mul(viewProjRaw, proj, view);   // M_proj * M_view (math order)
 
 	// ----------------------------------------------------------------
 	// 2.  Update the world/identity constant-buffer slot
@@ -2705,21 +2869,11 @@ void DX12_RenderScene(const refdef_t *fd)
 	cbBaseGpuVA = dx12Scene.constantBuffer->GetGPUVirtualAddress()
 	              + (D3D12_GPU_VIRTUAL_ADDRESS)cbBaseSlot * dx12Scene.cbSlotSize;
 
-	// Identity model matrix for world geometry
+	// Identity model matrix for world geometry (I^T = I, so no-op)
 	Mat4Identity(cb.modelMatrix);
 
-	// Copy viewProj
-	{
-		int i, j;
-
-		for (i = 0; i < 4; i++)
-		{
-			for (j = 0; j < 4; j++)
-			{
-				cb.viewProj[i][j] = viewProj[i][j];
-			}
-		}
-	}
+	// Transpose viewProj into the CB so HLSL sees M_proj * M_view
+	Mat4Transpose(cb.viewProj, viewProjRaw);
 
 	cb.cameraPos[0] = fd->vieworg[0];
 	cb.cameraPos[1] = fd->vieworg[1];
@@ -2911,7 +3065,7 @@ void DX12_RenderScene(const refdef_t *fd)
 		// 5a. Sky surfaces – rendered at far plane using sky PSO.
 		//     Only model[0] (worldspawn) surfaces; brush entities never have sky.
 		// ----------------------------------------------------------------
-		if (dx12Scene.pso3DSky)
+		if (dx12Scene.pso3DSky && !g_dbgDisableSky)
 		{
 			int i;
 			int worldFirst = (dx12World.numModels > 0) ? dx12World.models[0].firstSurface : 0;
@@ -2944,6 +3098,7 @@ void DX12_RenderScene(const refdef_t *fd)
 		//     with their own model matrix, so we must not draw them here
 		//     with the identity model matrix.
 		// ----------------------------------------------------------------
+		if (!g_dbgDisableWorldBSP)
 		{
 			int i;
 			int worldFirst = (dx12World.numModels > 0) ? dx12World.models[0].firstSurface : 0;
@@ -2967,24 +3122,10 @@ void DX12_RenderScene(const refdef_t *fd)
 					SCN_DrawSurface(ds, cbBaseGpuVA);
 				}
 			}
-		}
 
-		// ----------------------------------------------------------------
-		// 5c. Fog-tagged surfaces (model[0] only)
-		// ----------------------------------------------------------------
-		{
-			int i;
-			int worldFirst = (dx12World.numModels > 0) ? dx12World.models[0].firstSurface : 0;
-			int worldEnd   = (dx12World.numModels > 0 && dx12World.models[0].firstSurface >= 0)
-			                 ? worldFirst + dx12World.models[0].numSurfaces
-			                 : dx12World.numDrawSurfs;
-
-			if (worldFirst < 0)
-			{
-				worldFirst = 0;
-				worldEnd   = dx12World.numDrawSurfs;
-			}
-
+			// ----------------------------------------------------------------
+			// 5c. Fog-tagged surfaces (model[0] only)
+			// ----------------------------------------------------------------
 			for (i = worldFirst; i < worldEnd && i < dx12World.numDrawSurfs; i++)
 			{
 				const dx12DrawSurf_t  *ds  = &dx12World.drawSurfs[i];
@@ -2995,25 +3136,10 @@ void DX12_RenderScene(const refdef_t *fd)
 					SCN_DrawSurface(ds, cbBaseGpuVA);
 				}
 			}
-		}
-		// ----------------------------------------------------------------
-		// 5d. Translucent world surfaces (model[0] only).
-		//     Rendered after opaque + fog so alpha blending composites
-		//     correctly over solid geometry.
-		// ----------------------------------------------------------------
-		{
-			int i;
-			int worldFirst = (dx12World.numModels > 0) ? dx12World.models[0].firstSurface : 0;
-			int worldEnd   = (dx12World.numModels > 0 && dx12World.models[0].firstSurface >= 0)
-			                 ? worldFirst + dx12World.models[0].numSurfaces
-			                 : dx12World.numDrawSurfs;
 
-			if (worldFirst < 0)
-			{
-				worldFirst = 0;
-				worldEnd   = dx12World.numDrawSurfs;
-			}
-
+			// ----------------------------------------------------------------
+			// 5d. Translucent world surfaces (model[0] only).
+			// ----------------------------------------------------------------
 			for (i = worldFirst; i < worldEnd && i < dx12World.numDrawSurfs; i++)
 			{
 				const dx12DrawSurf_t  *ds  = &dx12World.drawSurfs[i];
@@ -3033,6 +3159,7 @@ void DX12_RenderScene(const refdef_t *fd)
 	//     draw commands reference unique CB memory.
 	//     Entity ambient + directed light from light grid (Issue #10).
 	// ----------------------------------------------------------------
+	if (!g_dbgDisableEntities)
 	{
 		int i;
 
@@ -3055,9 +3182,13 @@ void DX12_RenderScene(const refdef_t *fd)
 			entCBGpuVA = dx12Scene.constantBuffer->GetGPUVirtualAddress()
 			             + (D3D12_GPU_VIRTUAL_ADDRESS)entSlot * dx12Scene.cbSlotSize;
 
-			// Build per-entity model matrix
-			BuildModelMatrix(entCB.modelMatrix, ent->origin,
-			                 (const vec3_t *)ent->axis);
+			// Build per-entity model matrix and transpose into CB
+			{
+				float rawModel[4][4];
+
+				BuildModelMatrix(rawModel, ent->origin, (const vec3_t *)ent->axis);
+				Mat4Transpose(entCB.modelMatrix, rawModel);
+			}
 
 			// Copy the shared viewProj and cameraPos
 			{
@@ -3115,26 +3246,32 @@ void DX12_RenderScene(const refdef_t *fd)
 
 				if (brushSubmodel > 0)
 				{
-					SCN_DrawBrushModelEntity(brushSubmodel, entCBGpuVA);
+					if (!g_dbgDisableBrushEntities)
+					{
+						SCN_DrawBrushModelEntity(brushSubmodel, entCBGpuVA);
+					}
 				}
 				else
 				{
-					// Per-surface root constants for entity: isEntity=1, identity UV transform, white stageColor
-					entPsc.uvM00              = 1.0f;
-					entPsc.uvM11              = 1.0f;
-					entPsc.alphaTestThreshold = 0.0f;
-					entPsc.isEntity           = 1.0f;
-					entPsc.useLightmap        = 0.0f; // entities use ambient/directed light, not lightmap
-					entPsc.stageColor[0]      = 1.0f;
-					entPsc.stageColor[1]      = 1.0f;
-					entPsc.stageColor[2]      = 1.0f;
-					entPsc.stageColor[3]      = 1.0f;
+					if (!g_dbgDisableModelEntities)
+					{
+						// Per-surface root constants for entity: isEntity=1, identity UV transform, white stageColor
+						entPsc.uvM00              = 1.0f;
+						entPsc.uvM11              = 1.0f;
+						entPsc.alphaTestThreshold = 0.0f;
+						entPsc.isEntity           = 1.0f;
+						entPsc.useLightmap        = 0.0f; // entities use ambient/directed light, not lightmap
+						entPsc.stageColor[0]      = 1.0f;
+						entPsc.stageColor[1]      = 1.0f;
+						entPsc.stageColor[2]      = 1.0f;
+						entPsc.stageColor[3]      = 1.0f;
 
-					dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
-					                                                DX12_SCENE_PERSURF_DWORDS, &entPsc, 0);
+						dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
+						                                                DX12_SCENE_PERSURF_DWORDS, &entPsc, 0);
 
-					// Draw the entity's model surfaces
-					DX12_DrawEntity(ent, entCBGpuVA);
+						// Draw the entity's model surfaces
+						DX12_DrawEntity(ent, entCBGpuVA);
+					}
 				}
 			}
 		}
@@ -3158,6 +3295,7 @@ void DX12_RenderScene(const refdef_t *fd)
 	// ----------------------------------------------------------------
 	// 7a. Persistent decals – re-submitted every frame with time-based fade.
 	// ----------------------------------------------------------------
+	if (!g_dbgDisableDecals)
 	{
 		int i, p;
 
@@ -3298,7 +3436,7 @@ void DX12_RenderScene(const refdef_t *fd)
 	// 7c. Translucent / alpha world surfaces (back-to-front order)
 	//     Switch to the translucent PSO (alpha-blend, no depth-write).
 	// ----------------------------------------------------------------
-	if (dx12World.loaded && dx12World.vertexBuffer && dx12World.indexBuffer
+	if (!g_dbgDisableTranslucent && dx12World.loaded && dx12World.vertexBuffer && dx12World.indexBuffer
 	    && dx12World.numVertices > 0 && dx12World.numIndexes > 0)
 	{
 		int i;

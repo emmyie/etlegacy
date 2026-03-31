@@ -78,11 +78,12 @@ extern "C" {
  */
 typedef struct
 {
-	ID3D12Resource *vertexBuffer; ///< Default-heap VB (dx12WorldVertex_t[])
-	ID3D12Resource *indexBuffer;  ///< Default-heap IB (UINT32[])
+	ID3D12Resource *vertexBuffer;          ///< Default-heap VB (dx12WorldVertex_t[])
+	ID3D12Resource *indexBuffer;           ///< Default-heap IB (UINT32[])
 	UINT            numVertices;
 	UINT            numIndices;
-	qhandle_t       texHandle;    ///< Diffuse texture / material handle
+	qhandle_t       texHandle;             ///< Diffuse texture / material handle (from MD3 shader name)
+	char            surfName[MAX_QPATH];   ///< MD3 surface name (lower-cased), used for skin lookup
 } dx12ModelSurface_t;
 
 /**
@@ -98,6 +99,8 @@ typedef struct
 	float              mins[3]; ///< Frame-0 AABB minimum (local space)
 	float              maxs[3]; ///< Frame-0 AABB maximum (local space)
 	qboolean           valid;   ///< qtrue when GPU buffers are ready
+	qboolean           isBad;   ///< qtrue when every load attempt failed – mirrors GL MOD_BAD.
+	                            ///<   Dedup scan returns 0 for bad slots so callers don't use stale handles.
 
 	// MD3 tag data (all frames × all tags) – used by DX12_LerpTag.
 	// Allocated by DX12_LoadMD3, freed by DX12_ShutdownModels.
@@ -131,6 +134,14 @@ extern dx12ModelEntry_t dx12ModelData[DX12_MAX_MODELS];
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+/**
+ * @brief Pre-build a static index buffer for a skeletal surface (MDS or MDM).
+ * The index data is an array of numTriangles*3 int values.
+ * Call at model load time; stores IB in ms->indexBuffer and sets ms->numIndices.
+ * @return qtrue on success.
+ */
+qboolean DX12_BuildSkeletalSurfaceIB(dx12ModelSurface_t *ms, const int *triIndexes, int numTriangles);
 
 /**
  * @brief Attempt to load an MD3 model from the VFS into GPU buffers.
@@ -201,5 +212,44 @@ void DX12_ShutdownModels(void);
  */
 int DX12_LerpTag(orientation_t *tag, const refEntity_t *refent,
                  const char *tagName, int startIndex);
+
+/**
+ * @brief Concatenate a parent world matrix with a tag local matrix to produce
+ *        the child model's world matrix.
+ *
+ * Usage in DX12_DrawEntity (or the scene entity loop) when a child model
+ * must be positioned relative to a parent model tag:
+ *
+ *   // 1. Build parent world matrix (pre-transpose form)
+ *   float parentRaw[4][4];
+ *   BuildModelMatrix(parentRaw, parentEnt->origin, parentEnt->axis);
+ *
+ *   // 2. Find the tag on the parent model
+ *   orientation_t tagOrient;
+ *   DX12_LerpTag(&tagOrient, parentRefEnt, "tag_torso", 0);
+ *
+ *   // 3. Synthesise an md3Tag_t from the orientation_t
+ *   md3Tag_t tag;
+ *   VectorCopy(tagOrient.origin, tag.origin);
+ *   VectorCopy(tagOrient.axis[0], tag.axis[0]);
+ *   VectorCopy(tagOrient.axis[1], tag.axis[1]);
+ *   VectorCopy(tagOrient.axis[2], tag.axis[2]);
+ *
+ *   // 4. Compute child world matrix and transpose into CB
+ *   float childRaw[4][4];
+ *   DX12_ApplyTagTransform(childRaw, parentRaw, &tag);
+ *   Mat4Transpose(childCB.modelMatrix, childRaw);
+ *
+ * In practice ET's cgame resolves tag attachment before submitting entities
+ * to the renderer (trap_R_LerpTag → AxisMultiply / VectorAdd on the client
+ * side), so each entity already has pre-baked world-space origin/axis by the
+ * time it reaches DX12_DrawEntity.  DX12_ApplyTagTransform is provided for
+ * renderer-side assembly (e.g. inline sub-model attachment or future work).
+ *
+ * @param[out] out     Child world matrix (row-major, pre-transpose).
+ * @param[in]  parent  Parent world matrix (row-major, pre-transpose).
+ * @param[in]  tag     Tag in parent-local Q3 space.
+ */
+void DX12_ApplyTagTransform(float out[4][4], const float parent[4][4], const md3Tag_t *tag);
 
 #endif // _WIN32

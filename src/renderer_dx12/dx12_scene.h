@@ -109,6 +109,9 @@ typedef struct
 /** Maximum ref-entities buffered between ClearScene and RenderScene. */
 #define DX12_MAX_SCENE_ENTITIES 1024
 
+/** Maximum skeletal vertices that can be skinned per frame (scratch VB). */
+#define DX12_MAX_SKELETAL_VERTS 65536
+
 /** Maximum distinct poly draw-batches per scene (one per unique shader call). */
 #define DX12_MAX_SCENE_POLY_BATCHES 1024
 
@@ -244,11 +247,20 @@ typedef struct
 	vec3_t    origin;          ///< World-space origin
 	vec3_t    axis[3];         ///< Rotation axes: [0]=forward [1]=left [2]=up
 	qhandle_t hModel;          ///< Model handle (0 = no model)
+	qhandle_t customSkin;      ///< Skin handle (0 = use MD3 embedded shaders)
 	// Light grid sample – filled by DX12_RenderScene before the entity draw loop
 	vec3_t    ambientLight;    ///< Trilinearly sampled ambient light from light grid
 	vec3_t    directedLight;   ///< Trilinearly sampled directed light from light grid
 	vec3_t    lightDir;        ///< Normalised direction of directed light
 	float     distSq;          ///< Squared distance from camera (for sort)
+	// Skeletal animation frame data
+	int       frame, oldframe;
+	float     backlerp;
+	int       torsoFrame, oldTorsoFrame;
+	float     torsoBacklerp;
+	vec3_t    torsoAxis[3];
+	qhandle_t frameModel, oldframeModel;
+	qhandle_t torsoFrameModel, oldTorsoFrameModel;
 } dx12SceneEntity_t;
 
 // ---------------------------------------------------------------------------
@@ -302,6 +314,11 @@ typedef struct
 	int                  numPolyBatches;                   ///< Active batch count
 	ID3D12Resource      *polyVertexBuffer;                 ///< GPU upload-heap VB (persistent)
 	UINT8               *polyVBMapped;                     ///< Persistently-mapped CPU pointer
+
+	// Per-frame skeletal vertex scratch buffer (upload heap, reset each ClearScene)
+	ID3D12Resource *skelVB;            ///< Upload-heap VB for skinned vertices
+	UINT8          *skelVBMapped;      ///< Persistently-mapped CPU pointer
+	int             skelVBWriteOffset; ///< Next free vertex slot (reset to 0 each ClearScene)
 
 	// Per-frame dynamic lights
 	dx12DLight_t dlights[DX12_MAX_DLIGHTS]; ///< Dynamic light list

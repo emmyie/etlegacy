@@ -888,6 +888,14 @@ dx12Texture_t *DX12_GetTexture(qhandle_t handle)
 
 	if (idx >= 0 && idx < dx12NumShaders && dx12Shaders[idx].valid)
 	{
+		// Alias entries (failed-load stand-ins) have resource==NULL but gpuHandle
+		// pointing to the noshader checkerboard.  Return the real noshader slot so
+		// callers that check resource!=NULL still get a valid GPU handle.
+		if (!dx12Shaders[idx].tex.resource && idx != 2
+		    && dx12NumShaders > 2 && dx12Shaders[2].valid && dx12Shaders[2].tex.resource)
+		{
+			return &dx12Shaders[2].tex;
+		}
 		return &dx12Shaders[idx].tex;
 	}
 
@@ -1504,6 +1512,14 @@ static qboolean SH_ParseMaterialInBuffer(const char *buf, int bufLen,
 					else if (!DX12_Stricmp(sparm, "nodraw"))
 					{
 						out->isNodraw = qtrue;
+					}
+					else if (!DX12_Stricmp(sparm, "noimpact"))
+					{
+						out->noImpact = qtrue;
+					}
+					else if (!DX12_Stricmp(sparm, "nomarks"))
+					{
+						out->noMarks = qtrue;
 					}
 					continue;
 				}

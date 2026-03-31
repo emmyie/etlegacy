@@ -59,6 +59,7 @@
 
 extern "C" {
 #include "../qcommon/qfiles.h"
+#include "../game/surfaceflags.h"
 }
 
 #include <string.h>  // memcpy, memset
@@ -921,6 +922,30 @@ void DX12_LoadWorld(const char *name)
 		for (i = 0; i < dx12World.numShaders; i++)
 		{
 			dx12World.shaderHandles[i] = DX12_RegisterMaterial(in[i].shader);
+
+			// Propagate BSP-compiled surface/content flags to the material so
+			// that MarkFragments can filter SURF_NOIMPACT, SURF_NOMARKS and fog.
+			{
+				dx12Material_t *mat = DX12_GetMaterial(dx12World.shaderHandles[i]);
+				if (mat)
+				{
+					int sf = LittleLong(in[i].surfaceFlags);
+					int cf = LittleLong(in[i].contentFlags);
+
+					if (sf & SURF_NOIMPACT)
+					{
+						mat->noImpact = qtrue;
+					}
+					if (sf & SURF_NOMARKS)
+					{
+						mat->noMarks = qtrue;
+					}
+					if (cf & CONTENTS_FOG)
+					{
+						mat->isFog = qtrue;
+					}
+				}
+			}
 		}
 
 		dx12.ri.Printf(PRINT_DEVELOPER, "DX12_LoadWorld: registered %d BSP shaders\n",
