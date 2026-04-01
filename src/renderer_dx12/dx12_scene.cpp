@@ -274,6 +274,16 @@ static int g_dbgDisableDecals        = 0; // 1 = skip passes 7a/7b (decals+polys
 static int g_dbgDisableTranslucent   = 0; // 1 = skip pass 7c (translucent world surfs)
 
 // ---------------------------------------------------------------------------
+// Persistent corona flare state (keyed by id, persists across frames)
+// ---------------------------------------------------------------------------
+
+/** Flare pool – indexed by id lookup in SCN_FindOrCreateFlare(). */
+static dx12Flare_t dx12FlarePool[DX12_MAX_FLARES];
+
+/** Monotonically increasing frame counter used for stale-flare detection. */
+static int dx12FlareFrameCount = 0;
+
+// ---------------------------------------------------------------------------
 // Matrix helpers
 // ---------------------------------------------------------------------------
 
@@ -2137,6 +2147,23 @@ qboolean DX12_SceneInit(void)
 				               "DX12_SceneInit: CreateGraphicsPipelineState (additive) failed (0x%08lx)\n", hr);
 				dx12Scene.pso3DAdditive = NULL;
 			}
+
+			// Wireframe debug PSO: additive ONE/ONE blend + D3D12_FILL_MODE_WIREFRAME
+			// + depth test disabled (replicates GL's glDepthRange(0,0) always-on-top effect).
+			// Non-fatal: debug polygons fall back to solid rendering if this fails.
+			{
+				D3D12_GRAPHICS_PIPELINE_STATE_DESC psoWF = psoAdd;
+				psoWF.RasterizerState.FillMode      = D3D12_FILL_MODE_WIREFRAME;
+				psoWF.RasterizerState.CullMode      = D3D12_CULL_MODE_NONE;
+				psoWF.DepthStencilState.DepthEnable = FALSE;
+				hr = dx12.device->CreateGraphicsPipelineState(&psoWF, IID_PPV_ARGS(&dx12Scene.pso3DWireframe));
+				if (FAILED(hr))
+				{
+					dx12.ri.Printf(PRINT_DEVELOPER,
+					               "DX12_SceneInit: CreateGraphicsPipelineState (wireframe) failed (0x%08lx)\n", hr);
+					dx12Scene.pso3DWireframe = NULL;
+				}
+			}
 		}
 	}
 
@@ -2453,6 +2480,7 @@ qboolean DX12_SceneInit(void)
 	}
 
 	dx12Scene.initialized = qtrue;
+	DX12_ClearFlares();
 	dx12.ri.Printf(PRINT_ALL, "DX12_SceneInit: 3D scene pipeline ready\n");
 	return qtrue;
 }
@@ -2506,6 +2534,12 @@ void DX12_SceneShutdown(void)
 	{
 		dx12Scene.pso3DAdditive->Release();
 		dx12Scene.pso3DAdditive = NULL;
+	}
+
+	if (dx12Scene.pso3DWireframe)
+	{
+		dx12Scene.pso3DWireframe->Release();
+		dx12Scene.pso3DWireframe = NULL;
 	}
 
 	if (dx12Scene.pso3DModulate)
@@ -2626,6 +2660,7 @@ void DX12_AddScenePoly(qhandle_t hShader, int numVerts, const polyVert_t *verts)
 	int numTris;
 	int expandedVerts;
 	int i;
+	int fogIndex = 0;
 
 	if (numVerts < 3 || !verts || !dx12Scene.polyVerts)
 	{
@@ -2638,19 +2673,48 @@ void DX12_AddScenePoly(qhandle_t hShader, int numVerts, const polyVert_t *verts)
 
 	if (dx12Scene.numPolyVerts + expandedVerts > DX12_MAX_SCENE_POLYVERTS)
 	{
-		dx12.ri.Printf(PRINT_DEVELOPER, "DX12_AddScenePoly: poly vertex buffer full\n");
+		dx12.ri.Printf(PRINT_WARNING, "WARNING DX12_AddScenePoly: poly vertex buffer full (%d)\n",
+		               DX12_MAX_SCENE_POLYVERTS);
 		return;
 	}
 
 	if (dx12Scene.numPolyBatches >= DX12_MAX_SCENE_POLY_BATCHES)
 	{
-		dx12.ri.Printf(PRINT_DEVELOPER, "DX12_AddScenePoly: poly batch buffer full\n");
+		dx12.ri.Printf(PRINT_WARNING, "WARNING DX12_AddScenePoly: poly batch buffer full (%d)\n",
+		               DX12_MAX_SCENE_POLY_BATCHES);
 		return;
 	}
 
-	// Merge with the current batch if the shader is identical
+	// Determine which BSP fog volume this poly belongs to (mirrors GL RE_AddPolysToScene)
+	if (dx12World.numFogs > 1)
+	{
+		vec3_t bounds[2];
+		int    f;
+
+		VectorCopy(verts[0].xyz, bounds[0]);
+		VectorCopy(verts[0].xyz, bounds[1]);
+		for (i = 1; i < numVerts; i++)
+		{
+			AddPointToBounds(verts[i].xyz, bounds[0], bounds[1]);
+		}
+
+		for (f = 1; f < dx12World.numFogs; f++)
+		{
+			const dx12WorldFog_t *fog = &dx12World.fogs[f];
+			if (bounds[1][0] >= fog->mins[0] && bounds[1][1] >= fog->mins[1] && bounds[1][2] >= fog->mins[2] &&
+			    bounds[0][0] <= fog->maxs[0] && bounds[0][1] <= fog->maxs[1] && bounds[0][2] <= fog->maxs[2])
+			{
+				fogIndex = f;
+				break;
+			}
+		}
+	}
+
+	// Merge with the current batch if the shader and fog are identical, and both are non-wireframe
 	if (dx12Scene.numPolyBatches > 0 &&
-	    dx12Scene.polyBatches[dx12Scene.numPolyBatches - 1].shaderHandle == hShader)
+	    dx12Scene.polyBatches[dx12Scene.numPolyBatches - 1].shaderHandle == hShader &&
+	    dx12Scene.polyBatches[dx12Scene.numPolyBatches - 1].fogIndex == fogIndex &&
+	    !dx12Scene.polyBatches[dx12Scene.numPolyBatches - 1].wireframe)
 	{
 		dx12Scene.polyBatches[dx12Scene.numPolyBatches - 1].numVerts += expandedVerts;
 	}
@@ -2660,6 +2724,8 @@ void DX12_AddScenePoly(qhandle_t hShader, int numVerts, const polyVert_t *verts)
 		batch->shaderHandle = hShader;
 		batch->firstVert    = dx12Scene.numPolyVerts;
 		batch->numVerts     = expandedVerts;
+		batch->wireframe    = qfalse;
+		batch->fogIndex     = fogIndex;
 	}
 
 	// Expand fan → triangle list and write into the CPU staging buffer
@@ -2695,7 +2761,91 @@ void DX12_AddScenePoly(qhandle_t hShader, int numVerts, const polyVert_t *verts)
 }
 
 // ---------------------------------------------------------------------------
-// SCN_DrawBrushModelEntity
+// DX12_AddScenePolyWireframe
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief DX12_AddScenePolyWireframe – identical to DX12_AddScenePoly but marks
+ * the batch as wireframe so the rendering loop uses pso3DWireframe.
+ * Matches GL's second debug-polygon pass: wireframe fill + additive ONE/ONE
+ * blend + depth test disabled (glDepthRange(0,0) effect – always on top).
+ */
+void DX12_AddScenePolyWireframe(qhandle_t hShader, int numVerts, const polyVert_t *verts)
+{
+	int numTris;
+	int expandedVerts;
+	int i;
+
+	if (numVerts < 3 || !verts || !dx12Scene.polyVerts)
+	{
+		return;
+	}
+
+	numTris       = numVerts - 2;
+	expandedVerts = numTris * 3;
+
+	if (dx12Scene.numPolyVerts + expandedVerts > DX12_MAX_SCENE_POLYVERTS)
+	{
+		dx12.ri.Printf(PRINT_WARNING, "WARNING DX12_AddScenePolyWireframe: poly vertex buffer full (%d)\n",
+		               DX12_MAX_SCENE_POLYVERTS);
+		return;
+	}
+
+	if (dx12Scene.numPolyBatches >= DX12_MAX_SCENE_POLY_BATCHES)
+	{
+		dx12.ri.Printf(PRINT_WARNING, "WARNING DX12_AddScenePolyWireframe: poly batch buffer full (%d)\n",
+		               DX12_MAX_SCENE_POLY_BATCHES);
+		return;
+	}
+
+	// Merge only with the previous batch if it is also wireframe and same shader
+	if (dx12Scene.numPolyBatches > 0 &&
+	    dx12Scene.polyBatches[dx12Scene.numPolyBatches - 1].shaderHandle == hShader &&
+	    dx12Scene.polyBatches[dx12Scene.numPolyBatches - 1].wireframe)
+	{
+		dx12Scene.polyBatches[dx12Scene.numPolyBatches - 1].numVerts += expandedVerts;
+	}
+	else
+	{
+		dx12ScenePolyBatch_t *batch = &dx12Scene.polyBatches[dx12Scene.numPolyBatches++];
+		batch->shaderHandle = hShader;
+		batch->firstVert    = dx12Scene.numPolyVerts;
+		batch->numVerts     = expandedVerts;
+		batch->wireframe    = qtrue;
+		batch->fogIndex     = 0; // wireframe debug polys don't need fog
+	}
+
+	// Expand fan → triangle list (same as DX12_AddScenePoly)
+	for (i = 1; i <= numTris; i++)
+	{
+		const polyVert_t  *v0  = &verts[0];
+		const polyVert_t  *v1  = &verts[i];
+		const polyVert_t  *v2  = &verts[i + 1];
+		dx12WorldVertex_t *dst = &dx12Scene.polyVerts[dx12Scene.numPolyVerts];
+		int                k;
+		const polyVert_t  *src[3] = { v0, v1, v2 };
+
+		for (k = 0; k < 3; k++)
+		{
+			dst[k].xyz[0]    = src[k]->xyz[0];
+			dst[k].xyz[1]    = src[k]->xyz[1];
+			dst[k].xyz[2]    = src[k]->xyz[2];
+			dst[k].st[0]     = src[k]->st[0];
+			dst[k].st[1]     = src[k]->st[1];
+			dst[k].lm[0]     = 0.0f;
+			dst[k].lm[1]     = 0.0f;
+			dst[k].normal[0] = 0.0f;
+			dst[k].normal[1] = 0.0f;
+			dst[k].normal[2] = 1.0f;
+			dst[k].color[0]  = src[k]->modulate[0] / 255.0f;
+			dst[k].color[1]  = src[k]->modulate[1] / 255.0f;
+			dst[k].color[2]  = src[k]->modulate[2] / 255.0f;
+			dst[k].color[3]  = src[k]->modulate[3] / 255.0f;
+		}
+
+		dx12Scene.numPolyVerts += 3;
+	}
+}
 // ---------------------------------------------------------------------------
 
 /**
@@ -2774,6 +2924,9 @@ static void SCN_DrawBrushModelEntity(int submodelIdx, D3D12_GPU_VIRTUAL_ADDRESS 
 // DX12_RenderScene
 // ---------------------------------------------------------------------------
 
+/** Forward declaration – defined after DX12_RenderScene (see DX12_RenderCoronas). */
+static void DX12_RenderCoronas(const refdef_t *fd, const float vp[4][4]);
+
 /**
  * @brief DX12_RenderScene – render a full 3D scene from a refdef_t.
  * @param[in] fd  Frame parameters: view origin/axis, FOV, and entity list.
@@ -2851,6 +3004,15 @@ void DX12_RenderScene(const refdef_t *fd)
 	}
 
 	// ----------------------------------------------------------------
+	// 0c. Apply scripted fog (from RE_DX12_SetFog / cgame).
+	//     Mirrors GL's R_SetupFog().  Writes into dx12World.globalFog*
+	//     so the CB population below picks it up automatically.
+	//     Scripted fog has higher priority than the BSP world-fog
+	//     transition ticked in step 0b.
+	// ----------------------------------------------------------------
+	DX12_SetupFog();
+
+	// ----------------------------------------------------------------
 	// 1.  Build view and projection matrices
 	//     Rule: each Build* function produces the normal math matrix.
 	//     Mat4Transpose stores the transpose into the CB so HLSL sees
@@ -2887,7 +3049,7 @@ void DX12_RenderScene(const refdef_t *fd)
 		cb.fogColor[1] = dx12World.globalFogColor[1];
 		cb.fogColor[2] = dx12World.globalFogColor[2];
 		cb.fogColor[3] = 1.0f;
-		cb.fogStart    = 0.0f;
+		cb.fogStart    = dx12World.globalFogStart;
 		cb.fogEnd      = dx12World.globalFogDepth;
 		cb.fogEnabled  = 1.0f;
 	}
@@ -2969,6 +3131,13 @@ void DX12_RenderScene(const refdef_t *fd)
 			{
 				const dx12DLight_t *dl = &dx12Scene.dlights[j];
 				float dlDx, dlDy, dlDz, distSqDl, rSq, atten;
+
+				// Mirror GL tr_light.c:445 – dlights with a custom shader perform
+				// arbitrary effects and must NOT contribute to entity ambient light.
+				if (dl->hasShader)
+				{
+					continue;
+				}
 
 				dlDx    = ent->origin[0] - dl->origin[0];
 				dlDy    = ent->origin[1] - dl->origin[1];
@@ -3381,6 +3550,15 @@ void DX12_RenderScene(const refdef_t *fd)
 				continue;
 			}
 
+			// Select PSO: wireframe batches use pso3DWireframe (no depth, additive+wireframe fill)
+			{
+				ID3D12PipelineState *batchPSO =
+				    (batch->wireframe && dx12Scene.pso3DWireframe) ? dx12Scene.pso3DWireframe :
+				    dx12Scene.pso3DAdditive                        ? dx12Scene.pso3DAdditive :
+				                                                     dx12Scene.pso3D;
+				dx12.commandList->SetPipelineState(batchPSO);
+			}
+
 			// Resolve poly texture; fall back to white if missing
 			polyTex = DX12_GetTexture(batch->shaderHandle);
 			if (polyTex && polyTex->resource)
@@ -3481,6 +3659,11 @@ void DX12_RenderScene(const refdef_t *fd)
 	}
 
 	// ----------------------------------------------------------------
+	// 7d. Corona / lens-flare pass (screen-space quads, 2D pipeline)
+	// ----------------------------------------------------------------
+	DX12_RenderCoronas(fd, viewProjRaw);
+
+	// ----------------------------------------------------------------
 	// 8.  Restore 2D pipeline for subsequent UI rendering
 	// ----------------------------------------------------------------
 	dx12.commandList->SetGraphicsRootSignature(dx12.rootSignature);
@@ -3540,6 +3723,282 @@ void DX12_AddDecalToScene(qhandle_t hShader, int numVerts, const polyVert_t *ver
 void DX12_ClearDecals(void)
 {
 	dx12Scene.numDecals = 0;
+}
+
+// ---------------------------------------------------------------------------
+// DX12_ClearFlares / DX12_RenderCoronas
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief DX12_ClearFlares – reset all persistent corona flare state.
+ * Called once at DX12_SceneInit and on full renderer shutdown.
+ */
+void DX12_ClearFlares(void)
+{
+	memset(dx12FlarePool, 0, sizeof(dx12FlarePool));
+	dx12FlareFrameCount = 0;
+}
+
+/**
+ * @brief Find or allocate a persistent flare slot for the given corona id.
+ * Returns NULL only when the pool is exhausted (DX12_MAX_FLARES active slots).
+ */
+static dx12Flare_t *SCN_FindOrCreateFlare(int id)
+{
+	int i;
+	int  freeIdx = -1;
+
+	for (i = 0; i < DX12_MAX_FLARES; i++)
+	{
+		if (dx12FlarePool[i].active && dx12FlarePool[i].id == id)
+		{
+			return &dx12FlarePool[i];
+		}
+		if (!dx12FlarePool[i].active && freeIdx < 0)
+		{
+			freeIdx = i;
+		}
+	}
+
+	if (freeIdx < 0)
+	{
+		return NULL; // pool full
+	}
+
+	memset(&dx12FlarePool[freeIdx], 0, sizeof(dx12Flare_t));
+	dx12FlarePool[freeIdx].active = qtrue;
+	dx12FlarePool[freeIdx].id    = id;
+	return &dx12FlarePool[freeIdx];
+}
+
+/**
+ * @brief DX12_RenderCoronas – project, fade, and draw all buffered coronas.
+ *
+ * Called at the end of DX12_RenderScene (before restoring the 2D pipeline).
+ * Mirrors GL's RB_AddCoronasToScene → RB_AddFlare → RB_TestFlare → RB_RenderFlare
+ * but without depth-buffer occlusion testing.  Flares fade in/out via the
+ * per-id dx12FlarePool so that intensity is smooth across frames.
+ *
+ * @param fd  Scene refdef (viewport, time).
+ * @param vp  Row-major view-projection matrix (viewProjRaw from DX12_RenderScene).
+ */
+static void DX12_RenderCoronas(const refdef_t *fd, const float vp[4][4])
+{
+	static cvar_t    *r_flares    = NULL;
+	static cvar_t    *r_flareSize = NULL;
+	static cvar_t    *r_flareFade = NULL;
+	static qhandle_t  flareTexHandle = 0;
+	int i;
+
+	if (!r_flares)
+	{
+		r_flares = dx12.ri.Cvar_Get("r_flares", "1", 0);
+	}
+	if (!r_flareSize)
+	{
+		r_flareSize = dx12.ri.Cvar_Get("r_flareSize", "40", 0);
+	}
+	if (!r_flareFade)
+	{
+		r_flareFade = dx12.ri.Cvar_Get("r_flareFade", "7", 0);
+	}
+
+	if (!r_flares || r_flares->integer == 0)
+	{
+		return;
+	}
+
+	if (dx12Scene.numCoronas == 0 && dx12FlareFrameCount == 0)
+	{
+		return;
+	}
+
+	// Lazy-load the flare texture (registered after world load)
+	if (!flareTexHandle)
+	{
+		flareTexHandle = DX12_RegisterTexture("flareShader");
+	}
+
+	// Advance the frame counter
+	dx12FlareFrameCount++;
+
+	// ---------------------------------------------------------------------------
+	// Project each submitted corona, find/create its persistent flare, update fade
+	// ---------------------------------------------------------------------------
+	for (i = 0; i < dx12Scene.numCoronas; i++)
+	{
+		const dx12Corona_t *cor = &dx12Scene.coronas[i];
+		float  clipX, clipY, clipW;
+		float  ndcX, ndcY;
+		float  screenX, screenY;
+		float  eyeZ;
+		dx12Flare_t *f;
+		float  fade;
+		float  flareFadeRate;
+
+		// Project world position to clip space using M_VP (column-vector math)
+		clipX = vp[0][0] * cor->origin[0] + vp[0][1] * cor->origin[1]
+		        + vp[0][2] * cor->origin[2] + vp[0][3];
+		clipY = vp[1][0] * cor->origin[0] + vp[1][1] * cor->origin[1]
+		        + vp[1][2] * cor->origin[2] + vp[1][3];
+		clipW = vp[3][0] * cor->origin[0] + vp[3][1] * cor->origin[1]
+		        + vp[3][2] * cor->origin[2] + vp[3][3];
+
+		// Cull behind the near plane
+		if (clipW <= 0.0f)
+		{
+			continue;
+		}
+
+		ndcX = clipX / clipW;
+		ndcY = clipY / clipW;
+
+		// Generous frustum cull (coronas can be large; exact clip happens per-quad)
+		if (ndcX < -2.0f || ndcX > 2.0f || ndcY < -2.0f || ndcY > 2.0f)
+		{
+			continue;
+		}
+
+		// Convert NDC to full-window pixel coords (matching the 2D NDC helpers)
+		screenX = (float)fd->x + (ndcX * 0.5f + 0.5f) * (float)fd->width;
+		screenY = (float)fd->y + (1.0f - (ndcY * 0.5f + 0.5f)) * (float)fd->height;
+		eyeZ    = clipW;   // D3D projection: clip.w = view-space Z (positive = in front)
+
+		f = SCN_FindOrCreateFlare(cor->id);
+		if (!f)
+		{
+			continue;
+		}
+
+		f->color[0]    = cor->color[0];
+		f->color[1]    = cor->color[1];
+		f->color[2]    = cor->color[2];
+		f->scale       = cor->scale;
+		f->windowX     = screenX;
+		f->windowY     = screenY;
+		f->eyeZ        = eyeZ;
+		f->addedFrame  = dx12FlareFrameCount;
+
+		// Fade in/out (mirrors GL RB_TestFlare; coronas are always cgvisible=qtrue here)
+		flareFadeRate = r_flareFade ? r_flareFade->value : 7.0f;
+		if (cor->visible)
+		{
+			if (!f->visible)
+			{
+				f->visible  = qtrue;
+				f->fadeTime = fd->time - 1;
+			}
+			fade = ((fd->time - f->fadeTime) / 1000.0f) * flareFadeRate;
+		}
+		else
+		{
+			if (f->visible)
+			{
+				f->visible  = qfalse;
+				f->fadeTime = fd->time - 1;
+			}
+			fade = 1.0f - ((fd->time - f->fadeTime) / 1000.0f) * flareFadeRate;
+		}
+		if (fade < 0.0f) { fade = 0.0f; }
+		if (fade > 1.0f) { fade = 1.0f; }
+		f->drawIntensity = fade;
+	}
+
+	// Retire flares not submitted this frame (pop off; no fade-out like GL)
+	for (i = 0; i < DX12_MAX_FLARES; i++)
+	{
+		if (dx12FlarePool[i].active && dx12FlarePool[i].addedFrame < dx12FlareFrameCount)
+		{
+			dx12FlarePool[i].active       = qfalse;
+			dx12FlarePool[i].drawIntensity = 0.0f;
+		}
+	}
+
+	// ---------------------------------------------------------------------------
+	// Draw all active flares using the 2D pipeline
+	// ---------------------------------------------------------------------------
+	{
+		dx12Texture_t             *tex = flareTexHandle ? DX12_GetTexture(flareTexHandle) : NULL;
+		D3D12_GPU_DESCRIPTOR_HANDLE texGpuHandle;
+		float                       flareSizeBase;
+
+		if (tex)
+		{
+			texGpuHandle = tex->gpuHandle;
+		}
+		else
+		{
+			// Fallback: white texture (slot 0)
+			texGpuHandle = dx12.srvHeap->GetGPUDescriptorHandleForHeapStart();
+		}
+
+		flareSizeBase = r_flareSize ? r_flareSize->value : 40.0f;
+
+		DX12_Begin2DBatch(texGpuHandle, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+		for (i = 0; i < DX12_MAX_FLARES; i++)
+		{
+			dx12Flare_t     *f = &dx12FlarePool[i];
+			float            size;
+			float            nx1, ny1, nx2, ny2;
+			dx12QuadVertex_t corners[4];
+			float            r_col, g_col, b_col, alpha;
+
+			if (!f->active || f->drawIntensity <= 0.0f)
+			{
+				continue;
+			}
+			if (f->eyeZ <= 0.0f)
+			{
+				continue;
+			}
+
+			// GL formula: viewport_width * (r_flareSize * scale / 640 + 8 / -eyeZ)
+			// In D3D eyeZ is positive for objects in front of camera, so +eyeZ here.
+			size = (float)dx12.vidWidth * (flareSizeBase * f->scale / 640.0f + 8.0f / f->eyeZ);
+			if (size <= 0.0f)
+			{
+				continue;
+			}
+
+			r_col = f->color[0];
+			g_col = f->color[1];
+			b_col = f->color[2];
+			alpha = f->drawIntensity;
+
+			// Convert corner pixel positions to 2D NDC (matches dx12_poly.cpp NDC_X/Y)
+			nx1 = ((f->windowX - size) / (float)dx12.vidWidth)  * 2.0f - 1.0f;
+			ny1 = 1.0f - ((f->windowY - size) / (float)dx12.vidHeight) * 2.0f;
+			nx2 = ((f->windowX + size) / (float)dx12.vidWidth)  * 2.0f - 1.0f;
+			ny2 = 1.0f - ((f->windowY + size) / (float)dx12.vidHeight) * 2.0f;
+
+			// TL
+			corners[0].pos[0] = nx1; corners[0].pos[1] = ny1;
+			corners[0].uv[0]  = 0.0f; corners[0].uv[1] = 0.0f;
+			corners[0].color[0] = r_col; corners[0].color[1] = g_col;
+			corners[0].color[2] = b_col; corners[0].color[3] = alpha;
+			// TR
+			corners[1].pos[0] = nx2; corners[1].pos[1] = ny1;
+			corners[1].uv[0]  = 1.0f; corners[1].uv[1] = 0.0f;
+			corners[1].color[0] = r_col; corners[1].color[1] = g_col;
+			corners[1].color[2] = b_col; corners[1].color[3] = alpha;
+			// BL
+			corners[2].pos[0] = nx1; corners[2].pos[1] = ny2;
+			corners[2].uv[0]  = 0.0f; corners[2].uv[1] = 1.0f;
+			corners[2].color[0] = r_col; corners[2].color[1] = g_col;
+			corners[2].color[2] = b_col; corners[2].color[3] = alpha;
+			// BR
+			corners[3].pos[0] = nx2; corners[3].pos[1] = ny2;
+			corners[3].uv[0]  = 1.0f; corners[3].uv[1] = 1.0f;
+			corners[3].color[0] = r_col; corners[3].color[1] = g_col;
+			corners[3].color[2] = b_col; corners[3].color[3] = alpha;
+
+			DX12_AddQuadToBatch(corners);
+			dx12DrawCountFlare++;
+		}
+
+		DX12_Flush2DBatch();
+	}
 }
 
 #endif // _WIN32

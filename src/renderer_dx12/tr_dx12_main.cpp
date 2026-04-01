@@ -166,6 +166,141 @@ void DX12_ShutdownScratchTextures(void)
 }
 
 // ---------------------------------------------------------------------------
+// DX12_UpdateScratchTexture
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief DX12_UpdateScratchTexture
+ *
+ * In-place upload of new pixel data into mip level 0 of an existing scratch
+ * texture resource (equivalent to GL's glTexSubImage2D path).  The resource
+ * must already be in D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.
+ *
+ * Uses the dedicated upload command list so it is independent of the current
+ * per-frame rendering command list.  Blocks until the copy is complete via
+ * DX12_WaitForUpload before returning.
+ *
+ * @param scratch  Scratch slot whose resource to update (must be valid).
+ * @param data     New RGBA pixel data (cols * rows * 4 bytes).
+ * @param cols     Texture width  (must match scratch->width).
+ * @param rows     Texture height (must match scratch->height).
+ */
+static void DX12_UpdateScratchTexture(dx12ScratchTex_t *scratch, const byte *data,
+                                      int cols, int rows)
+{
+	HRESULT                        hr;
+	D3D12_RESOURCE_DESC            texDesc;
+	D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+	UINT                           numRows;
+	UINT64                         rowSize, uploadSize;
+	ID3D12Resource                *uploadBuffer = NULL;
+	UINT8                         *pMapped;
+	D3D12_RANGE                    readRange    = { 0, 0 };
+	D3D12_RESOURCE_BARRIER         barriers[2];
+	D3D12_TEXTURE_COPY_LOCATION    srcLoc, dstLoc;
+	D3D12_HEAP_PROPERTIES          uploadHeap   = {};
+	D3D12_RESOURCE_DESC            uploadDesc   = {};
+	UINT                           row;
+
+	// Query the footprint for subresource 0 (mip level 0) only
+	texDesc = scratch->resource->GetDesc();
+	dx12.device->GetCopyableFootprints(&texDesc, 0, 1, 0,
+	                                   &footprint, &numRows, &rowSize, &uploadSize);
+
+	// Allocate a temporary staging (UPLOAD heap) buffer
+	uploadHeap.Type           = D3D12_HEAP_TYPE_UPLOAD;
+	uploadDesc.Dimension      = D3D12_RESOURCE_DIMENSION_BUFFER;
+	uploadDesc.Width          = uploadSize;
+	uploadDesc.Height         = 1;
+	uploadDesc.DepthOrArraySize = 1;
+	uploadDesc.MipLevels      = 1;
+	uploadDesc.Format         = DXGI_FORMAT_UNKNOWN;
+	uploadDesc.SampleDesc.Count = 1;
+	uploadDesc.Layout         = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+	hr = dx12.device->CreateCommittedResource(
+		&uploadHeap, D3D12_HEAP_FLAG_NONE, &uploadDesc,
+		D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+		IID_PPV_ARGS(&uploadBuffer));
+	if (FAILED(hr))
+	{
+		dx12.ri.Printf(PRINT_WARNING,
+		               "DX12_UpdateScratchTexture: staging buffer alloc failed (0x%08lx)\n", hr);
+		return;
+	}
+
+	// Copy pixel data into the staging buffer respecting the D3D12 row pitch
+	uploadBuffer->Map(0, &readRange, (void **)&pMapped);
+	for (row = 0; row < numRows; row++)
+	{
+		memcpy(pMapped + footprint.Offset + (UINT64)row * footprint.Footprint.RowPitch,
+		       data    + (UINT64)row * (UINT)cols * 4,
+		       (size_t)cols * 4);
+	}
+	uploadBuffer->Unmap(0, NULL);
+
+	// Record upload commands on the dedicated upload command list
+	hr = dx12.uploadCmdAllocator->Reset();
+	if (FAILED(hr))
+	{
+		dx12.ri.Printf(PRINT_WARNING,
+		               "DX12_UpdateScratchTexture: cmdAllocator->Reset failed (0x%08lx)\n", hr);
+		uploadBuffer->Release();
+		return;
+	}
+
+	hr = dx12.uploadCmdList->Reset(dx12.uploadCmdAllocator, NULL);
+	if (FAILED(hr))
+	{
+		dx12.ri.Printf(PRINT_WARNING,
+		               "DX12_UpdateScratchTexture: cmdList->Reset failed (0x%08lx)\n", hr);
+		uploadBuffer->Release();
+		return;
+	}
+
+	// Transition all subresources: PIXEL_SHADER_RESOURCE → COPY_DEST
+	Com_Memset(&barriers[0], 0, sizeof(barriers[0]));
+	barriers[0].Type                         = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	barriers[0].Transition.pResource         = scratch->resource;
+	barriers[0].Transition.StateBefore       = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+	barriers[0].Transition.StateAfter        = D3D12_RESOURCE_STATE_COPY_DEST;
+	barriers[0].Transition.Subresource       = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	dx12.uploadCmdList->ResourceBarrier(1, &barriers[0]);
+
+	// Copy mip level 0 from staging buffer into the texture
+	Com_Memset(&srcLoc, 0, sizeof(srcLoc));
+	srcLoc.pResource       = uploadBuffer;
+	srcLoc.Type            = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+	srcLoc.PlacedFootprint = footprint;
+
+	Com_Memset(&dstLoc, 0, sizeof(dstLoc));
+	dstLoc.pResource        = scratch->resource;
+	dstLoc.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	dstLoc.SubresourceIndex = 0;
+
+	dx12.uploadCmdList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, NULL);
+
+	// Transition back: COPY_DEST → PIXEL_SHADER_RESOURCE
+	Com_Memset(&barriers[0], 0, sizeof(barriers[0]));
+	barriers[0].Type                         = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	barriers[0].Transition.pResource         = scratch->resource;
+	barriers[0].Transition.StateBefore       = D3D12_RESOURCE_STATE_COPY_DEST;
+	barriers[0].Transition.StateAfter        = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+	barriers[0].Transition.Subresource       = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	dx12.uploadCmdList->ResourceBarrier(1, &barriers[0]);
+
+	dx12.uploadCmdList->Close();
+
+	{
+		ID3D12CommandList *ppCmdLists[] = { dx12.uploadCmdList };
+		dx12.commandQueue->ExecuteCommandLists(1, ppCmdLists);
+	}
+
+	DX12_WaitForUpload(dx12.commandQueue);
+	uploadBuffer->Release();
+}
+
+// ---------------------------------------------------------------------------
 // Stub implementations required by refexport_t
 // ---------------------------------------------------------------------------
 
@@ -278,6 +413,29 @@ static void RE_DX12_EndRegistration(void)
 
 static void RE_DX12_RenderScene(const refdef_t *fd)
 {
+	static cvar_t *r_norefresh_cv = NULL;
+
+	if (!r_norefresh_cv)
+	{
+		r_norefresh_cv = dx12.ri.Cvar_Get("r_norefresh", "0", CVAR_CHEAT);
+	}
+
+	if (r_norefresh_cv && r_norefresh_cv->integer)
+	{
+		return;
+	}
+
+	if (!fd)
+	{
+		return;
+	}
+
+	if (!dx12World.loaded && !(fd->rdflags & RDF_NOWORLDMODEL))
+	{
+		dx12.ri.Printf(PRINT_DEVELOPER, "RE_DX12_RenderScene: world model not loaded (fd->rdflags=0x%x)\n",
+		               fd->rdflags);
+	}
+
 	DX12_RenderScene(fd);
 }
 
@@ -343,6 +501,8 @@ static void RE_DX12_UploadCinematic(int w, int h, int cols, int rows,
 
 	if (client < 0 || client >= DX12_MAX_SCRATCH_IMAGES)
 	{
+		dx12.ri.Error(ERR_DROP, "RE_DX12_UploadCinematic: client index %d out of range [0, %d)\n",
+		              client, DX12_MAX_SCRATCH_IMAGES);
 		return;
 	}
 
@@ -361,6 +521,17 @@ static void RE_DX12_UploadCinematic(int w, int h, int cols, int rows,
 		return;
 	}
 
+	// Subimage update: reuse existing resource when dimensions are unchanged.
+	// Equivalent to GL's glTexSubImage2D path — avoids destroying and
+	// recreating the D3D12 resource for every dirty cinematic frame.
+	if (scratch->valid && dirty &&
+	    scratch->width == cols && scratch->height == rows)
+	{
+		DX12_UpdateScratchTexture(scratch, data, cols, rows);
+		return;
+	}
+
+	// Full recreate path: first call for this slot, or dimensions changed.
 	// Flush the GPU pipeline before releasing the old resource.
 	// Matches glFinish() in the GL renderer: ensures no in-flight draw commands
 	// are still reading the resource before we Release() it.
@@ -1805,6 +1976,15 @@ static int RE_DX12_LightForPoint(vec3_t point, vec3_t ambientLight, vec3_t direc
 
 static void RE_DX12_AddPolyToScene(qhandle_t hShader, int numVerts, const polyVert_t *verts)
 {
+	if (!dx12.initialized)
+	{
+		return;
+	}
+	if (!hShader)
+	{
+		dx12.ri.Printf(PRINT_WARNING, "WARNING RE_DX12_AddPolyToScene: NULL poly shader\n");
+		return;
+	}
 	DX12_AddScenePoly(hShader, numVerts, verts);
 }
 
@@ -1812,19 +1992,29 @@ static void RE_DX12_AddPolysToScene(qhandle_t hShader, int numVerts, const polyV
 {
 	int i;
 
+	if (!dx12.initialized)
+	{
+		return;
+	}
+	if (!hShader)
+	{
+		dx12.ri.Printf(PRINT_WARNING, "WARNING RE_DX12_AddPolysToScene: NULL poly shader\n");
+		return;
+	}
+
 	for (i = 0; i < numPolys; i++)
 	{
 		DX12_AddScenePoly(hShader, numVerts, verts + i * numVerts);
 	}
 }
 
+/// Cached pointer to r_dynamiclight – set once on first use, valid for the lifetime of the renderer.
+static cvar_t *dx12_r_dynamicLight = NULL;
+
 static void RE_DX12_AddLightToScene(const vec3_t org, float radius, float intensity,
                                     float r, float g, float b, qhandle_t hShader, int flags)
 {
 	dx12DLight_t *dl;
-	cvar_t       *r_dynamicLight;
-
-	(void)hShader; // No material lookup for dlights in the DX12 renderer yet
 
 	// Mirror GL's tr.registered guard – skip if the renderer is not initialised
 	if (!dx12.initialized)
@@ -1841,8 +2031,11 @@ static void RE_DX12_AddLightToScene(const vec3_t org, float radius, float intens
 	// exactly as GL's RE_AddLightToScene does.
 	if (!(flags & REF_FORCE_DLIGHT))
 	{
-		r_dynamicLight = dx12.ri.Cvar_Get("r_dynamiclight", "1", CVAR_ARCHIVE);
-		if (r_dynamicLight && r_dynamicLight->integer == 0)
+		if (!dx12_r_dynamicLight)
+		{
+			dx12_r_dynamicLight = dx12.ri.Cvar_Get("r_dynamiclight", "1", CVAR_ARCHIVE);
+		}
+		if (dx12_r_dynamicLight && dx12_r_dynamicLight->integer == 0)
 		{
 			return;
 		}
@@ -1867,12 +2060,20 @@ static void RE_DX12_AddLightToScene(const vec3_t org, float radius, float intens
 	dl->color[1]           = g;
 	dl->color[2]           = b;
 	dl->flags              = flags;
+	// Mirror GL: track whether a custom shader was supplied.  Shader-bearing dlights
+	// must not contribute to entity ambient light (GL tr_light.c:445).
+	dl->hasShader          = (hShader != 0) ? qtrue : qfalse;
 }
 
 static void RE_DX12_AddCoronaToScene(const vec3_t org, float r, float g, float b,
                                      float scale, int id, qboolean visible)
 {
 	dx12Corona_t *cor;
+
+	if (!dx12.initialized)
+	{
+		return;
+	}
 
 	if (!visible)
 	{
@@ -1917,6 +2118,103 @@ static void RE_DX12_AddCoronaToScene(const vec3_t org, float r, float g, float b
 static glfog_t dx12FogSettings[NUM_FOGS];
 /// Currently active fog slot (matches GL's glfogNum).
 static glfogType_t dx12FogNum = FOG_NONE;
+
+/**
+ * @brief DX12_SetupFog
+ * @details Per-frame scripted-fog consumer.  Mirrors GL's R_SetupFog() in tr_main.c.
+ *
+ * Reads dx12FogSettings[FOG_TARGET / FOG_LAST], computes FOG_CURRENT via lerp
+ * or snap (matching GL's transition logic), and writes the result into
+ * dx12World.globalFogColor / globalFogStart / globalFogDepth / globalFogActive.
+ *
+ * When scripted fog is active it takes priority over the BSP world-fog
+ * transition; both use ri.Milliseconds() as the time source so they are
+ * consistent.
+ *
+ * Called once per frame from DX12_RenderScene (dx12_scene.cpp).
+ */
+void DX12_SetupFog(void)
+{
+	static cvar_t *r_wolfFog_cv = NULL;
+	glfog_t *target, *last, *cur;
+	float    lerpPos;
+	int      now, fadeTime;
+
+	if (!r_wolfFog_cv)
+	{
+		r_wolfFog_cv = dx12.ri.Cvar_Get("r_wolfFog", "1", 0);
+	}
+
+	if (!r_wolfFog_cv || !r_wolfFog_cv->integer)
+	{
+		// wolfFog disabled — leave world fog state alone (map BSP fog may still be active)
+		return;
+	}
+
+	target = &dx12FogSettings[FOG_TARGET];
+	last   = &dx12FogSettings[FOG_LAST];
+	cur    = &dx12FogSettings[FOG_CURRENT];
+
+	// No scripted fog registered — world (BSP) fog handles rendering
+	if (!target->registered)
+	{
+		return;
+	}
+
+	now = dx12.ri.Milliseconds();
+
+	// Compute FOG_CURRENT (mirrors R_SetupFog in tr_main.c ~line 674)
+	if (target->finishTime && target->finishTime >= now)
+	{
+		// Cross-type transitions: fast snap (GL behaviour)
+		if ((last->mode == GL_EXP && target->mode == GL_LINEAR) ||
+		    (last->mode == GL_LINEAR && target->mode == GL_EXP))
+		{
+			Com_Memcpy(cur, target, sizeof(glfog_t));
+			target->finishTime = 0;
+		}
+		else
+		{
+			fadeTime = target->finishTime - target->startTime;
+			if (fadeTime <= 0)
+			{
+				fadeTime = 1;
+			}
+			lerpPos = (float)(now - target->startTime) / (float)fadeTime;
+			if (lerpPos > 1.0f)
+			{
+				lerpPos = 1.0f;
+			}
+
+			cur->start      = last->start + (target->start - last->start) * lerpPos;
+			cur->end        = last->end   + (target->end   - last->end)   * lerpPos;
+			cur->color[0]   = last->color[0] + (target->color[0] - last->color[0]) * lerpPos;
+			cur->color[1]   = last->color[1] + (target->color[1] - last->color[1]) * lerpPos;
+			cur->color[2]   = last->color[2] + (target->color[2] - last->color[2]) * lerpPos;
+			cur->density    = target->density;
+			cur->mode       = target->mode;
+			cur->clearscreen = (target->clearscreen || last->clearscreen) ? qtrue : qfalse;
+			cur->registered = qtrue;
+		}
+	}
+	else
+	{
+		// Transition done or no transition — snap to target
+		Com_Memcpy(cur, target, sizeof(glfog_t));
+	}
+
+	// Apply computed FOG_CURRENT to the fields read by DX12_RenderScene
+	dx12World.globalFogColor[0]   = cur->color[0];
+	dx12World.globalFogColor[1]   = cur->color[1];
+	dx12World.globalFogColor[2]   = cur->color[2];
+	dx12World.globalFogStart      = cur->start;
+	dx12World.globalFogDepth      = cur->end;
+	dx12World.globalFogActive     = (cur->end > 0.0f) ? qtrue : qfalse;
+
+	// Scripted fog wins: cancel any concurrent world-driven BSP fog transition
+	dx12World.globalFogTransEndTime   = 0;
+	dx12World.globalFogTransStartTime = 0;
+}
 
 /**
  * @brief RE_DX12_SetFog
@@ -2490,22 +2788,30 @@ static void RE_DX12_ProjectDecal(qhandle_t hShader, int numPoints, vec3_t *point
 	// BSP surfaces directly.
 	// ---------------------------------------------------------------------------
 
-	// Decal vertices built from the source polygon (xyz + standard ST layout)
 	typedef struct
 	{
 		vec3_t xyz;
-		float st[2];
+		float  st[2];
 	} dx12DeclVert_t;
 
 	dx12DeclVert_t dv[4];
-	vec4_t         texMat[2];
 	vec4_t         proj;              // working copy of projection
 	int            numDvPoints;
 	int            now, fadeStartTime, fadeEndTime;
 
-	// Buffers for RE_DX12_MarkFragments output
-	// DX12_AddMarkFragments writes xyz + 2 ST floats (stride 5) per point,
-	// so allocate 5 floats per slot to avoid buffer overflow and bad readback.
+	// Directional decal: single texMat pair + front/back planes for depth fade.
+	vec4_t   texMat[2];
+	vec4_t   frontPlane, backPlane;
+	qboolean validPlanes = qfalse;
+
+	// Omnidirectional: 3 texMat pairs (one per dominant axis) + sphere params.
+	// Index 0 = x-dominant (yz plane), 1 = y-dominant (xz), 2 = z-dominant (xy).
+	vec4_t   omniTexMat[3][2];
+	float    omniRadius = 0.0f;
+	vec3_t   omniCenter;
+	qboolean omnidirectional = qfalse;
+
+	// Buffers for RE_DX12_MarkFragments output (stride 5 floats: xyz + st).
 #define DX12_PROJ_MAX_POINTS    512
 #define DX12_PROJ_MAX_FRAGS     128
 	float          markPoints[DX12_PROJ_MAX_POINTS * 5];
@@ -2514,7 +2820,7 @@ static void RE_DX12_ProjectDecal(qhandle_t hShader, int numPoints, vec3_t *point
 	int            numFrags;
 	int            f, p;
 
-	// ---- Input validation (matches GL RE_ProjectDecal) ----------------------
+	// ---- Input validation ---------------------------------------------------
 	if (numPoints != 1 && numPoints != 3 && numPoints != 4)
 	{
 		return;
@@ -2528,7 +2834,7 @@ static void RE_DX12_ProjectDecal(qhandle_t hShader, int numPoints, vec3_t *point
 		return;
 	}
 
-	// ---- Timing (matches GL) ------------------------------------------------
+	// ---- Timing -------------------------------------------------------------
 	if (lifeTime < 0 || fadeTime < 0)
 	{
 		lifeTime = 0;
@@ -2538,7 +2844,7 @@ static void RE_DX12_ProjectDecal(qhandle_t hShader, int numPoints, vec3_t *point
 	fadeStartTime = now + lifeTime - fadeTime;
 	fadeEndTime   = fadeStartTime + fadeTime;
 
-	// ---- Byte colour components ---------------------------------------------
+	// ---- Byte base-colour components ----------------------------------------
 	byte colR = (byte)(color[0] * 255.0f);
 	byte colG = (byte)(color[1] * 255.0f);
 	byte colB = (byte)(color[2] * 255.0f);
@@ -2550,36 +2856,57 @@ static void RE_DX12_ProjectDecal(qhandle_t hShader, int numPoints, vec3_t *point
 	dv[2].st[0] = 1.0f; dv[2].st[1] = 1.0f;
 	dv[3].st[0] = 1.0f; dv[3].st[1] = 0.0f;
 
-	// Work on a local copy of projection so we can modify it for omnidirectional
+	// Working copy of projection (may be modified for omnidirectional)
 	proj[0] = projection[0];
 	proj[1] = projection[1];
 	proj[2] = projection[2];
 	proj[3] = projection[3];
 
-	// ---- Omnidirectional vs directional (matches GL) ------------------------
+	// ---- Omnidirectional vs directional -------------------------------------
 	if (numPoints == 1)
 	{
-		float  radius, iDist;
+		float  iDist;
 		vec3_t corner;
 
-		radius = projection[3];
-		iDist  = 1.0f / (radius * 2.0f);
+		omniRadius       = projection[3];
+		iDist            = 1.0f / (omniRadius * 2.0f);
+		omnidirectional  = qtrue;
 
-		// Reconfigure as a downward-facing quad (GL omnidirectional path)
-		proj[0] = 0.0f; proj[1] = 0.0f; proj[2] = -1.0f; proj[3] = radius * 2.0f;
+		// Project from above as a downward-facing quad
+		proj[0] = 0.0f; proj[1] = 0.0f; proj[2] = -1.0f; proj[3] = omniRadius * 2.0f;
 
-		VectorSet(dv[0].xyz, points[0][0] - radius, points[0][1] - radius, points[0][2] + radius);
-		VectorSet(dv[1].xyz, points[0][0] - radius, points[0][1] + radius, points[0][2] + radius);
-		VectorSet(dv[2].xyz, points[0][0] + radius, points[0][1] + radius, points[0][2] + radius);
-		VectorSet(dv[3].xyz, points[0][0] + radius, points[0][1] - radius, points[0][2] + radius);
+		VectorSet(dv[0].xyz, points[0][0] - omniRadius, points[0][1] - omniRadius, points[0][2] + omniRadius);
+		VectorSet(dv[1].xyz, points[0][0] - omniRadius, points[0][1] + omniRadius, points[0][2] + omniRadius);
+		VectorSet(dv[2].xyz, points[0][0] + omniRadius, points[0][1] + omniRadius, points[0][2] + omniRadius);
+		VectorSet(dv[3].xyz, points[0][0] + omniRadius, points[0][1] - omniRadius, points[0][2] + omniRadius);
 		numDvPoints = 4;
 
-		// Build texMat for z-axis plane (xy coordinates)
+		// The sphere centre for alpha distance-fade
+		VectorCopy(points[0], omniCenter);
+
+		// Corner used as the ST origin for all three axis planes
 		VectorCopy(dv[0].xyz, corner);
-		texMat[0][0] = iDist; texMat[0][1] = 0.0f; texMat[0][2] = 0.0f;
-		texMat[0][3] = -DotProduct(texMat[0], corner);
-		texMat[1][0] = 0.0f;  texMat[1][1] = iDist; texMat[1][2] = 0.0f;
-		texMat[1][3] = -DotProduct(texMat[1], corner);
+
+		// axis 0: x-dominant surface → project onto yz plane
+		// S = y * iDist,  T = z * iDist  (matches GL texMat[0])
+		VectorSet(omniTexMat[0][0], 0.0f, iDist, 0.0f);
+		omniTexMat[0][0][3] = -DotProduct(omniTexMat[0][0], corner);
+		VectorSet(omniTexMat[0][1], 0.0f, 0.0f, iDist);
+		omniTexMat[0][1][3] = -DotProduct(omniTexMat[0][1], corner);
+
+		// axis 1: y-dominant surface → project onto xz plane
+		// S = x * iDist,  T = z * iDist  (matches GL texMat[1])
+		VectorSet(omniTexMat[1][0], iDist, 0.0f, 0.0f);
+		omniTexMat[1][0][3] = -DotProduct(omniTexMat[1][0], corner);
+		VectorSet(omniTexMat[1][1], 0.0f, 0.0f, iDist);
+		omniTexMat[1][1][3] = -DotProduct(omniTexMat[1][1], corner);
+
+		// axis 2: z-dominant surface → project onto xy plane
+		// S = x * iDist,  T = y * iDist  (matches GL texMat[2])
+		VectorSet(omniTexMat[2][0], iDist, 0.0f, 0.0f);
+		omniTexMat[2][0][3] = -DotProduct(omniTexMat[2][0], corner);
+		VectorSet(omniTexMat[2][1], 0.0f, iDist, 0.0f);
+		omniTexMat[2][1][3] = -DotProduct(omniTexMat[2][1], corner);
 	}
 	else
 	{
@@ -2588,6 +2915,7 @@ static void RE_DX12_ProjectDecal(qhandle_t hShader, int numPoints, vec3_t *point
 		vec3_t pa, pb, pc;
 		vec3_t bary, origin, xyz;
 		vec3_t vecs[3], axis[3], lengths;
+		vec3_t backPoint;
 
 		VectorCopy(points[0], dv[0].xyz);
 		VectorCopy(points[1], dv[1].xyz);
@@ -2598,12 +2926,11 @@ static void RE_DX12_ProjectDecal(qhandle_t hShader, int numPoints, vec3_t *point
 		}
 		else
 		{
-			VectorCopy(points[2], dv[3].xyz); // pad degenerate quad
+			VectorCopy(points[2], dv[3].xyz); // pad triangle to quad
 		}
 		numDvPoints = 4;
 
 		// ---- MakeTextureMatrix (port of GL static MakeTextureMatrix) --------
-		// Project footprint triangle onto the projection plane
 		d = DotProduct(dv[0].xyz, proj) - proj[3];
 		VectorMA(dv[0].xyz, -d, proj, pa);
 		d = DotProduct(dv[1].xyz, proj) - proj[3];
@@ -2611,15 +2938,13 @@ static void RE_DX12_ProjectDecal(qhandle_t hShader, int numPoints, vec3_t *point
 		d = DotProduct(dv[2].xyz, proj) - proj[3];
 		VectorMA(dv[2].xyz, -d, proj, pc);
 
-		// Barycentric basis
 		bb = (dv[1].st[0] - dv[0].st[0]) * (dv[2].st[1] - dv[0].st[1])
 		     - (dv[2].st[0] - dv[0].st[0]) * (dv[1].st[1] - dv[0].st[1]);
 		if (Q_fabs(bb) < 0.00000001f)
 		{
-			return; // degenerate (matches GL "MakeTextureMatrix returns NULL")
+			return;
 		}
 
-		// Texture origin (s=0, t=0)
 		s         = 0.0f; t = 0.0f;
 		bary[0]   = ((dv[1].st[0] - s) * (dv[2].st[1] - t) - (dv[2].st[0] - s) * (dv[1].st[1] - t)) / bb;
 		bary[1]   = ((dv[2].st[0] - s) * (dv[0].st[1] - t) - (dv[0].st[0] - s) * (dv[2].st[1] - t)) / bb;
@@ -2628,7 +2953,6 @@ static void RE_DX12_ProjectDecal(qhandle_t hShader, int numPoints, vec3_t *point
 		origin[1] = bary[0] * pa[1] + bary[1] * pb[1] + bary[2] * pc[1];
 		origin[2] = bary[0] * pa[2] + bary[1] * pb[2] + bary[2] * pc[2];
 
-		// S direction (s=1, t=0)
 		s       = 1.0f; t = 0.0f;
 		bary[0] = ((dv[1].st[0] - s) * (dv[2].st[1] - t) - (dv[2].st[0] - s) * (dv[1].st[1] - t)) / bb;
 		bary[1] = ((dv[2].st[0] - s) * (dv[0].st[1] - t) - (dv[0].st[0] - s) * (dv[2].st[1] - t)) / bb;
@@ -2638,7 +2962,6 @@ static void RE_DX12_ProjectDecal(qhandle_t hShader, int numPoints, vec3_t *point
 		xyz[2]  = bary[0] * pa[2] + bary[1] * pb[2] + bary[2] * pc[2];
 		VectorSubtract(xyz, origin, vecs[0]);
 
-		// T direction (s=0, t=1)
 		s       = 0.0f; t = 1.0f;
 		bary[0] = ((dv[1].st[0] - s) * (dv[2].st[1] - t) - (dv[2].st[0] - s) * (dv[1].st[1] - t)) / bb;
 		bary[1] = ((dv[2].st[0] - s) * (dv[0].st[1] - t) - (dv[0].st[0] - s) * (dv[2].st[1] - t)) / bb;
@@ -2648,10 +2971,8 @@ static void RE_DX12_ProjectDecal(qhandle_t hShader, int numPoints, vec3_t *point
 		xyz[2]  = bary[0] * pa[2] + bary[1] * pb[2] + bary[2] * pc[2];
 		VectorSubtract(xyz, origin, vecs[1]);
 
-		// Projection (R) direction
 		VectorScale(proj, -1.0f, vecs[2]);
 
-		// Normalise to build texMat rows
 		for (i = 0; i < 3; i++)
 		{
 			lengths[i] = VectorNormalize2(vecs[i], axis[i]);
@@ -2665,11 +2986,22 @@ static void RE_DX12_ProjectDecal(qhandle_t hShader, int numPoints, vec3_t *point
 		}
 		texMat[0][3] = dv[0].st[0] - DotProduct(pa, texMat[0]);
 		texMat[1][3] = dv[0].st[1] - DotProduct(pa, texMat[1]);
+
+		// ---- Front / back planes for per-vertex depth fade (matches GL) -----
+		// frontPlane: the decal quad's own plane.
+		// backPlane : negated normal, offset by projection depth.
+		if (PlaneFromPoints(frontPlane, dv[0].xyz, dv[1].xyz, dv[2].xyz))
+		{
+			backPlane[0] = -frontPlane[0];
+			backPlane[1] = -frontPlane[1];
+			backPlane[2] = -frontPlane[2];
+			VectorMA(dv[0].xyz, projection[3], projection, backPoint);
+			backPlane[3]  = DotProduct(backPlane, backPoint);
+			validPlanes   = qtrue;
+		}
 	}
 
 	// ---- Call MarkFragments to get clipped world geometry -------------------
-	// MarkFragments expects projection as a vec3_t scaled by depth.
-	// proj[0..2] * proj[3] gives the directional extent vector.
 	scaledProj[0] = proj[0] * proj[3];
 	scaledProj[1] = proj[1] * proj[3];
 	scaledProj[2] = proj[2] * proj[3];
@@ -2677,10 +3009,10 @@ static void RE_DX12_ProjectDecal(qhandle_t hShader, int numPoints, vec3_t *point
 	{
 		vec3_t dvXyz[4];
 
-		dvXyz[0][0] = dv[0].xyz[0]; dvXyz[0][1] = dv[0].xyz[1]; dvXyz[0][2] = dv[0].xyz[2];
-		dvXyz[1][0] = dv[1].xyz[0]; dvXyz[1][1] = dv[1].xyz[1]; dvXyz[1][2] = dv[1].xyz[2];
-		dvXyz[2][0] = dv[2].xyz[0]; dvXyz[2][1] = dv[2].xyz[1]; dvXyz[2][2] = dv[2].xyz[2];
-		dvXyz[3][0] = dv[3].xyz[0]; dvXyz[3][1] = dv[3].xyz[1]; dvXyz[3][2] = dv[3].xyz[2];
+		VectorCopy(dv[0].xyz, dvXyz[0]);
+		VectorCopy(dv[1].xyz, dvXyz[1]);
+		VectorCopy(dv[2].xyz, dvXyz[2]);
+		VectorCopy(dv[3].xyz, dvXyz[3]);
 
 		numFrags = RE_DX12_MarkFragments(numDvPoints, (const vec3_t *)dvXyz,
 		                                 scaledProj,
@@ -2693,19 +3025,95 @@ static void RE_DX12_ProjectDecal(qhandle_t hShader, int numPoints, vec3_t *point
 		return;
 	}
 
-	// ---- For each fragment: apply texMat ST, store as persistent decal ------
+	// ---- For each fragment: apply texMat ST + colour fades ------------------
 	for (f = 0; f < numFrags; f++)
 	{
-		markFragment_t *mf = &markFrags[f];
-		polyVert_t     verts[DX12_MAX_DECAL_VERTS];
-		int            numV;
+		markFragment_t *mf    = &markFrags[f];
+		polyVert_t      verts[DX12_MAX_DECAL_VERTS];
+		int             numV;
+		int             fragNumPoints;
+		// Plane of this fragment's surface – needed for both omnidirectional
+		// alpha fade and unidirectional pd colour scale.
+		vec4_t          fragPlane;
+		qboolean        fragPlaneValid = qfalse;
+		// Per-fragment state for omnidirectional and unidirectional paths.
+		int             axis   = 2;   // default: z-dominant (xy plane)
+		float           fragAlpha = 1.0f;
+		float           pd     = 1.0f;
 
-		if (mf->numPoints < 3)
+		// MarkFragments flags MST_PLANAR fragments with negative numPoints to
+		// indicate pre-computed ST coordinates are stored at offsets +3/+4.
+		// Recover the true count before the guard check.
+		fragNumPoints = mf->numPoints < 0 ? -mf->numPoints : mf->numPoints;
+
+		if (fragNumPoints < 3)
 		{
 			continue;
 		}
 
-		numV = mf->numPoints < DX12_MAX_DECAL_VERTS ? mf->numPoints : DX12_MAX_DECAL_VERTS;
+		numV = fragNumPoints < DX12_MAX_DECAL_VERTS ? fragNumPoints : DX12_MAX_DECAL_VERTS;
+
+		// Derive the fragment surface plane from its first three clipped vertices.
+		// Used for omnidirectional axis selection + alpha, and for unidirectional pd.
+		{
+			float *p0 = markPoints + 5 * mf->firstPoint;
+			float *p1 = markPoints + 5 * (mf->firstPoint + 1);
+			float *p2 = markPoints + 5 * (mf->firstPoint + 2);
+			vec3_t a, b, c;
+
+			VectorCopy(p0, a); VectorCopy(p1, b); VectorCopy(p2, c);
+			fragPlaneValid = PlaneFromPoints(fragPlane, a, b, c);
+		}
+
+		if (omnidirectional)
+		{
+			// Select the texMat variant whose axis best aligns with the surface normal
+			// (matches GL ProjectDecalOntoWinding axis selection).
+			if (fragPlaneValid)
+			{
+				float ax = Q_fabs(fragPlane[0]);
+				float ay = Q_fabs(fragPlane[1]);
+				float az = Q_fabs(fragPlane[2]);
+
+				if (ax >= ay && ax >= az)
+				{
+					axis = 0;
+				}
+				else if (ay >= ax && ay >= az)
+				{
+					axis = 1;
+				}
+				else
+				{
+					axis = 2;
+				}
+
+				// Alpha fades by distance from the projector centre to the surface
+				// (matches GL: alpha = 1 - |d| / radius).
+				{
+					float d = DotProduct(omniCenter, fragPlane) - fragPlane[3];
+					fragAlpha = 1.0f - (Q_fabs(d) / omniRadius);
+					if (fragAlpha < 0.0f)
+					{
+						continue;
+					}
+					if (fragAlpha > 1.0f)
+					{
+						fragAlpha = 1.0f;
+					}
+				}
+			}
+		}
+		else if (validPlanes && fragPlaneValid)
+		{
+			// pd: dot product of projector front plane and surface plane.
+			// Darkens grazing-angle fragments (matches GL ProjectDecalOntoWinding).
+			pd = DotProduct(frontPlane, fragPlane);
+			if (pd < 0.0f)
+			{
+				pd = 0.0f;
+			}
+		}
 
 		for (p = 0; p < numV; p++)
 		{
@@ -2715,15 +3123,46 @@ static void RE_DX12_ProjectDecal(qhandle_t hShader, int numPoints, vec3_t *point
 			verts[p].xyz[1] = xyz[1];
 			verts[p].xyz[2] = xyz[2];
 
-			// ST from texMat (matches GL ProjectDecalOntoWinding)
-			verts[p].st[0] = DotProduct(xyz, texMat[0]) + texMat[0][3];
-			verts[p].st[1] = DotProduct(xyz, texMat[1]) + texMat[1][3];
+			if (omnidirectional)
+			{
+				// Use the axis-selected texMat pair
+				verts[p].st[0] = DotProduct(xyz, omniTexMat[axis][0]) + omniTexMat[axis][0][3];
+				verts[p].st[1] = DotProduct(xyz, omniTexMat[axis][1]) + omniTexMat[axis][1][3];
 
-			// Base colour (time-based alpha applied per-frame in DX12_RenderScene)
-			verts[p].modulate[0] = colR;
-			verts[p].modulate[1] = colG;
-			verts[p].modulate[2] = colB;
-			verts[p].modulate[3] = colA;
+				verts[p].modulate[0] = (byte)(pd * fragAlpha * color[0] * 255.0f);
+				verts[p].modulate[1] = (byte)(pd * fragAlpha * color[1] * 255.0f);
+				verts[p].modulate[2] = (byte)(pd * fragAlpha * color[2] * 255.0f);
+				verts[p].modulate[3] = colA;
+			}
+			else
+			{
+				verts[p].st[0] = DotProduct(xyz, texMat[0]) + texMat[0][3];
+				verts[p].st[1] = DotProduct(xyz, texMat[1]) + texMat[1][3];
+
+				if (validPlanes)
+				{
+					// Per-vertex depth fade: smooth alpha from front to back plane
+					// (matches GL ProjectDecalOntoWinding alpha calculation).
+					float d  = DotProduct(xyz, frontPlane) - frontPlane[3];
+					float d2 = DotProduct(xyz, backPlane)  - backPlane[3];
+					float a  = (d + d2 > 0.0001f) ? (2.0f * d2 / (d + d2)) : 0.0f;
+
+					if (a > 1.0f) { a = 1.0f; }
+					else if (a < 0.0f) { a = 0.0f; }
+
+					verts[p].modulate[0] = (byte)(pd * a * color[0] * 255.0f);
+					verts[p].modulate[1] = (byte)(pd * a * color[1] * 255.0f);
+					verts[p].modulate[2] = (byte)(pd * a * color[2] * 255.0f);
+					verts[p].modulate[3] = (byte)(pd * a * color[3] * 255.0f);
+				}
+				else
+				{
+					verts[p].modulate[0] = colR;
+					verts[p].modulate[1] = colG;
+					verts[p].modulate[2] = colB;
+					verts[p].modulate[3] = colA;
+				}
+			}
 		}
 
 		DX12_AddDecalToScene(hShader, numV, verts, fadeStartTime, fadeEndTime);
@@ -2746,7 +3185,20 @@ static int RE_DX12_LerpTag(orientation_t *tag, const refEntity_t *refent,
 
 static void RE_DX12_ModelBounds(qhandle_t model, vec3_t mins, vec3_t maxs)
 {
-	int idx = (int)model - 1;
+	int submodelIdx;
+	int idx;
+
+	// Inline BSP sub-models ("*N") are not stored in dx12ModelData; their
+	// bounds live in dx12World.models[N] (matches GL MOD_BRUSH path).
+	submodelIdx = DX12_GetBrushSubmodelIdx(model);
+	if (submodelIdx > 0 && submodelIdx < dx12World.numModels)
+	{
+		VectorCopy(dx12World.models[submodelIdx].mins, mins);
+		VectorCopy(dx12World.models[submodelIdx].maxs, maxs);
+		return;
+	}
+
+	idx = (int)model - 1;
 
 	if (idx >= 0 && idx < DX12_MAX_MODELS && dx12ModelData[idx].valid)
 	{
@@ -2798,6 +3250,16 @@ static void RE_DX12_DrawDebugPolygon(int color, int numpoints, float *points)
 
 	// Route through the poly system using the __white__ texture (handle 0).
 	DX12_AddScenePoly(0, numpoints, verts);
+
+	// Second pass: white wireframe outline, always on top (matches GL glDepthRange(0,0) + GLS_POLYMODE_LINE).
+	for (i = 0; i < numpoints; i++)
+	{
+		verts[i].modulate[0] = 255;
+		verts[i].modulate[1] = 255;
+		verts[i].modulate[2] = 255;
+		verts[i].modulate[3] = 255;
+	}
+	DX12_AddScenePolyWireframe(0, numpoints, verts);
 }
 
 static void RE_DX12_DrawDebugText(const vec3_t org, float r, float g, float b,
@@ -3002,6 +3464,11 @@ static void RE_DX12_purgeCache(void)
 	// rendering is active.
 	Com_Memset(dx12FogSettings, 0, sizeof(dx12FogSettings));
 	dx12FogNum = FOG_NONE;
+
+	// ---- 7. Reset persistent corona flare state ----------------------------
+	// Flare fade state is keyed by corona id; ids from the previous map must
+	// not bleed into the next map (ids may be reused).
+	DX12_ClearFlares();
 }
 
 static qboolean RE_DX12_LoadDynamicShader(const char *shadername, const char *shadertext)
@@ -3009,7 +3476,16 @@ static qboolean RE_DX12_LoadDynamicShader(const char *shadername, const char *sh
 	dx12DynShader_t *cur, *prev, *node;
 	size_t          textLen;
 
-	// NULL name + NULL text → purge all dynamic shaders (mirrors GL RE_LoadDynamicShader)
+	// NULL name with non-NULL text is a caller error (mirrors GL RE_LoadDynamicShader)
+	if (!shadername && shadertext)
+	{
+		dx12.ri.Printf(PRINT_WARNING,
+		               "RE_DX12_LoadDynamicShader: called with NULL shadername and non-NULL shadertext:\n%s\n",
+		               shadertext);
+		return qfalse;
+	}
+
+	// NULL name + NULL text → purge all dynamic shaders
 	if (!shadername && !shadertext)
 	{
 		DX12_PurgeDynamicShaders();
@@ -3139,10 +3615,12 @@ static int RE_DX12_GetTextureId(const char *imagename)
 
 static void RE_DX12_Finish(void)
 {
-	if (dx12.initialized && dx12.commandQueue)
-	{
-		DX12_WaitForUpload(dx12.commandQueue);
-	}
+	// Mirrors glFinish(): stall until all in-flight GPU commands have completed.
+	// DX12_FlushGpu() is the correct analogue — it signals the main command queue
+	// fence, waits for completion, and updates fenceValues[frameIndex] for proper
+	// frame-pacing bookkeeping. DX12_WaitForUpload() is an upload-only drain and
+	// does not update the frame fence values.
+	DX12_FlushGpu();
 }
 
 // Forward declaration – defined in renderercommon/tr_image_jpg.c, linked with this module.

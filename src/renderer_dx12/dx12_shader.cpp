@@ -86,6 +86,21 @@ void DX12_AddShaderRemap(const char *oldName, const char *newName, float timeOff
 	COM_StripExtension(oldName, strippedOld, sizeof(strippedOld));
 	COM_StripExtension(newName, strippedNew, sizeof(strippedNew));
 
+	// Mirror GL: remapping a shader to itself cancels any existing remap
+	// (GL sets sh->remappedShader = NULL for all hash-chain matches).
+	if (!DX12_Stricmp(strippedOld, strippedNew))
+	{
+		for (i = 0; i < dx12NumShaderRemaps; i++)
+		{
+			if (dx12ShaderRemaps[i].active &&
+			    !DX12_Stricmp(dx12ShaderRemaps[i].oldName, strippedOld))
+			{
+				dx12ShaderRemaps[i].active = qfalse;
+			}
+		}
+		return;
+	}
+
 	// Update existing entry if old name matches
 	for (i = 0; i < dx12NumShaderRemaps; i++)
 	{

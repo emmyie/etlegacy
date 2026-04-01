@@ -54,19 +54,23 @@
 /** Maximum DX12 coronas per frame – matches GL renderer's MAX_CORONAS. */
 #define DX12_MAX_CORONAS MAX_CORONAS
 
+/** Maximum persistent flare entries (for fade continuity across frames). */
+#define DX12_MAX_FLARES 128
+
 /**
  * @struct dx12DLight_t
  * @brief Per-frame dynamic light entry (mirrors GL dlight_t without GL internals).
  */
 typedef struct
 {
-	vec3_t origin;               ///< World-space position
-	vec3_t transformed;          ///< Origin in local (entity) coordinate system
-	vec3_t color;                ///< Normalised RGB [0,1]
-	float  radius;               ///< Influence radius in world units
-	float  radiusInverseCubed;   ///< 1/(radius^3) – attenuation optimisation, matches GL dlight_t
-	float  intensity;            ///< Light strength (1.0 = fullbright)
-	int    flags;                ///< REF_*_DLIGHT flags
+	vec3_t   origin;               ///< World-space position
+	vec3_t   transformed;          ///< Origin in local (entity) coordinate system
+	vec3_t   color;                ///< Normalised RGB [0,1]
+	float    radius;               ///< Influence radius in world units
+	float    radiusInverseCubed;   ///< 1/(radius^3) – attenuation optimisation, matches GL dlight_t
+	float    intensity;            ///< Light strength (1.0 = fullbright)
+	int      flags;                ///< REF_*_DLIGHT flags
+	qboolean hasShader;            ///< qtrue when a custom shader handle was supplied
 } dx12DLight_t;
 
 /**
@@ -81,6 +85,28 @@ typedef struct
 	int      id;        ///< Unique id for fading continuity
 	qboolean visible;   ///< qtrue when the corona is currently visible
 } dx12Corona_t;
+
+/**
+ * @struct dx12Flare_t
+ * @brief Persistent per-id flare state for corona fade continuity across frames.
+ *
+ * Mirrors GL renderer's flare_t (tr_flares.c) without depth-buffer occlusion.
+ * One slot per unique corona id; pool is reset only by DX12_ClearFlares().
+ */
+typedef struct
+{
+	int      id;              ///< Unique id from AddCoronaToScene (0 = inactive)
+	qboolean active;          ///< qtrue when this slot is in use
+	qboolean visible;         ///< Current fade direction: qtrue = fading in
+	float    drawIntensity;   ///< Current alpha (0.0 = invisible, 1.0 = fully visible)
+	int      fadeTime;        ///< Timestamp (ms) when the last fade direction change started
+	float    color[3];        ///< RGB color from the most recent corona submission
+	float    scale;           ///< Scale factor from the most recent submission
+	float    windowX;         ///< Screen-pixel X of the corona this frame
+	float    windowY;         ///< Screen-pixel Y of the corona this frame
+	float    eyeZ;            ///< View-space depth (positive = in front of camera)
+	int      addedFrame;      ///< Value of dx12FlareFrameCount when last updated
+} dx12Flare_t;
 
 // ---------------------------------------------------------------------------
 // Decal (ProjectDecal / ClearDecals)
@@ -114,6 +140,9 @@ typedef struct
 
 /** Maximum distinct poly draw-batches per scene (one per unique shader call). */
 #define DX12_MAX_SCENE_POLY_BATCHES 1024
+
+/** Special wireframe-outline marker used by debug polygon rendering. */
+#define DX12_POLY_BATCH_WIREFRAME 1
 
 /** Maximum expanded triangle-list vertices stored in the poly buffer. */
 #define DX12_MAX_SCENE_POLYVERTS 8192
@@ -277,6 +306,8 @@ typedef struct
 	qhandle_t shaderHandle; ///< Texture / material handle
 	int       firstVert;    ///< Index of first vertex in dx12Scene.polyVerts
 	int       numVerts;     ///< Number of consecutive vertices
+	qboolean  wireframe;    ///< qtrue → use wireframe PSO (debug polygon outline pass)
+	int       fogIndex;     ///< BSP fog-volume index (0 = no fog), mirrors GL poly->fogIndex
 } dx12ScenePolyBatch_t;
 
 // ---------------------------------------------------------------------------
@@ -297,6 +328,7 @@ typedef struct
 	ID3D12PipelineState  *pso3DSky;         ///< Sky PSO: no depth write, depth always passes, no back-face cull
 	ID3D12PipelineState  *pso3DAdditive;    ///< Multi-stage additive layer (ONE/ONE, no depth write)
 	ID3D12PipelineState  *pso3DModulate;    ///< Multi-stage modulate layer (DST_COLOR/ZERO, no depth write)
+	ID3D12PipelineState  *pso3DWireframe;   ///< Debug wireframe (wireframe fill, additive blend, depth test disabled)
 
 	// Per-frame constant buffer (upload heap, persistently mapped, CBV_SIZE aligned)
 	ID3D12Resource *constantBuffer;       ///< Holds DX12_FRAME_COUNT * DX12_MAX_CB_SLOTS_PER_FRAME slots
@@ -348,6 +380,16 @@ extern dx12SceneState_t dx12Scene;
 // ---------------------------------------------------------------------------
 
 /**
+ * @brief DX12_SetupFog – per-frame scripted-fog consumer.
+ * Reads dx12FogSettings[FOG_TARGET / FOG_LAST], computes FOG_CURRENT
+ * (lerp or snap), and writes the result into dx12World.globalFogColor /
+ * globalFogStart / globalFogDepth / globalFogActive.  Scripted fog
+ * (from RE_DX12_SetFog / cgame) takes priority over the BSP world-fog
+ * transition.  Call once per frame near the top of DX12_RenderScene.
+ */
+void DX12_SetupFog(void);
+
+/**
  * @brief DX12_SceneInit  – create 3D PSO, root signature, and constant buffer.
  * @return qtrue on success.
  */
@@ -383,6 +425,13 @@ void DX12_ClearScene(void);
 void DX12_AddScenePoly(qhandle_t hShader, int numVerts, const polyVert_t *verts);
 
 /**
+ * @brief DX12_AddScenePolyWireframe – same as DX12_AddScenePoly but marks the
+ * batch for wireframe rendering (debug polygon outline pass).
+ * Mirrors GL's second pass: GLS_POLYMODE_LINE + glDepthRange(0,0).
+ */
+void DX12_AddScenePolyWireframe(qhandle_t hShader, int numVerts, const polyVert_t *verts);
+
+/**
  * @brief DX12_AddDecalToScene – store an already-projected world-space decal polygon.
  *
  * Decals are NOT cleared by DX12_ClearScene().  Call DX12_ClearDecals() explicitly
@@ -402,6 +451,12 @@ void DX12_AddDecalToScene(qhandle_t hShader, int numVerts, const polyVert_t *ver
  * Called by RE_DX12_ClearDecals; safe to call at any time.
  */
 void DX12_ClearDecals(void);
+
+/**
+ * @brief DX12_ClearFlares – reset all persistent flare/corona fade state.
+ * Called once at renderer init (DX12_SceneInit) and on full shutdown.
+ */
+void DX12_ClearFlares(void);
 
 /**
  * @brief DX12_RenderScene – render a full 3D scene.

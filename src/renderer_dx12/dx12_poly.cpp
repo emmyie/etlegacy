@@ -549,11 +549,10 @@ void DX12_DrawStretchPicGradient(float x, float y, float w, float h,
 	float            r, g, b, a;
 	float            gr, gg, gb, ga;
 	float            nx1, ny1, nx2, ny2;
-	float            tl_r, tl_g, tl_b, tl_a;  // top-left  color
-	float            tr_r, tr_g, tr_b, tr_a;  // top-right color
-	float            bl_r, bl_g, bl_b, bl_a;  // bottom-left  color
-	float            br_r, br_g, br_b, br_a;  // bottom-right color
 	dx12QuadVertex_t verts[6];
+
+	(void)gradientType; // GL's RB_StretchPicGradient never reads gradientType;
+	                    // always applies a top-to-bottom vertical gradient.
 
 	if (!dx12.frameOpen)
 	{
@@ -566,68 +565,64 @@ void DX12_DrawStretchPicGradient(float x, float y, float w, float h,
 		return;
 	}
 
-	r  = dx12.color2D[0];
-	g  = dx12.color2D[1];
-	b  = dx12.color2D[2];
-	a  = dx12.color2D[3];
-	gr = gradientColor ? gradientColor[0] : r;
-	gg = gradientColor ? gradientColor[1] : g;
-	gb = gradientColor ? gradientColor[2] : b;
-	ga = gradientColor ? gradientColor[3] : a;
+	r = dx12.color2D[0];
+	g = dx12.color2D[1];
+	b = dx12.color2D[2];
+	a = dx12.color2D[3];
+
+	// Match GL: NULL gradientColor falls back to opaque white, not color2D.
+	if (gradientColor)
+	{
+		gr = gradientColor[0];
+		gg = gradientColor[1];
+		gb = gradientColor[2];
+		ga = gradientColor[3];
+	}
+	else
+	{
+		gr = 1.0f; gg = 1.0f; gb = 1.0f; ga = 1.0f;
+	}
 
 	nx1 = NDC_X(x);
 	ny1 = NDC_Y(y);
 	nx2 = NDC_X(x + w);
 	ny2 = NDC_Y(y + h);
 
-	if (gradientType == 0)
-	{
-		// Horizontal: left = base, right = gradient
-		tl_r = r;  tl_g = g;  tl_b = b;  tl_a = a;
-		tr_r = gr; tr_g = gg; tr_b = gb; tr_a = ga;
-		bl_r = r;  bl_g = g;  bl_b = b;  bl_a = a;
-		br_r = gr; br_g = gg; br_b = gb; br_a = ga;
-	}
-	else
-	{
-		// Vertical: top = base, bottom = gradient
-		tl_r = r;  tl_g = g;  tl_b = b;  tl_a = a;
-		tr_r = r;  tr_g = g;  tr_b = b;  tr_a = a;
-		bl_r = gr; bl_g = gg; bl_b = gb; bl_a = ga;
-		br_r = gr; br_g = gg; br_b = gb; br_a = ga;
-	}
+	// Vertical gradient (top = base color, bottom = gradientColor).
+	// Matches GL's RB_StretchPicGradient: v0/v1 (top row) get backEnd.color2D,
+	// v2/v3 (bottom row) get cmd->gradientColor — gradientType is ignored.
 
 	// Triangle 1: TL, TR, BL
 	verts[0].pos[0]   = nx1; verts[0].pos[1]   = ny1;
 	verts[0].uv[0]    = s1;  verts[0].uv[1]    = t1;
-	verts[0].color[0] = tl_r; verts[0].color[1] = tl_g;
-	verts[0].color[2] = tl_b; verts[0].color[3] = tl_a;
+	verts[0].color[0] = r;   verts[0].color[1] = g;
+	verts[0].color[2] = b;   verts[0].color[3] = a;
 
 	verts[1].pos[0]   = nx2; verts[1].pos[1]   = ny1;
 	verts[1].uv[0]    = s2;  verts[1].uv[1]    = t1;
-	verts[1].color[0] = tr_r; verts[1].color[1] = tr_g;
-	verts[1].color[2] = tr_b; verts[1].color[3] = tr_a;
+	verts[1].color[0] = r;   verts[1].color[1] = g;
+	verts[1].color[2] = b;   verts[1].color[3] = a;
 
 	verts[2].pos[0]   = nx1; verts[2].pos[1]   = ny2;
 	verts[2].uv[0]    = s1;  verts[2].uv[1]    = t2;
-	verts[2].color[0] = bl_r; verts[2].color[1] = bl_g;
-	verts[2].color[2] = bl_b; verts[2].color[3] = bl_a;
+	verts[2].color[0] = gr;  verts[2].color[1] = gg;
+	verts[2].color[2] = gb;  verts[2].color[3] = ga;
 
 	// Triangle 2: TR, BR, BL
 	verts[3].pos[0]   = nx2; verts[3].pos[1]   = ny1;
 	verts[3].uv[0]    = s2;  verts[3].uv[1]    = t1;
-	verts[3].color[0] = tr_r; verts[3].color[1] = tr_g;
-	verts[3].color[2] = tr_b; verts[3].color[3] = tr_a;
+	verts[3].color[0] = r;   verts[3].color[1] = g;
+	verts[3].color[2] = b;   verts[3].color[3] = a;
 
 	verts[4].pos[0]   = nx2; verts[4].pos[1]   = ny2;
 	verts[4].uv[0]    = s2;  verts[4].uv[1]    = t2;
-	verts[4].color[0] = br_r; verts[4].color[1] = br_g;
-	verts[4].color[2] = br_b; verts[4].color[3] = br_a;
+	verts[4].color[0] = gr;  verts[4].color[1] = gg;
+	verts[4].color[2] = gb;  verts[4].color[3] = ga;
 
 	verts[5].pos[0]   = nx1; verts[5].pos[1]   = ny2;
 	verts[5].uv[0]    = s1;  verts[5].uv[1]    = t2;
-	verts[5].color[0] = bl_r; verts[5].color[1] = bl_g;
-	verts[5].color[2] = bl_b; verts[5].color[3] = bl_a;
+	verts[5].color[0] = gr;  verts[5].color[1] = gg;
+	verts[5].color[2] = gb;  verts[5].color[3] = ga;
 
 	DX12_AppendToBatch(verts, 6, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, tex);
 }

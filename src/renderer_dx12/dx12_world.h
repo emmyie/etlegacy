@@ -216,8 +216,9 @@ typedef struct
 	int          clusterBytes;  ///< Bytes per cluster row in vis[]
 	const byte  *externalVisData; ///< Override from RE_DX12_SetWorldVisData (not malloc'd)
 
-	// Global fog override (set by RE_DX12_SetGlobalFog)
+	// Global fog override (set by RE_DX12_SetGlobalFog / DX12_SetupFog)
 	float    globalFogColor[3];         ///< Current fog RGB [0,1]
+	float    globalFogStart;            ///< Distance at which fog begins (GL fog start)
 	float    globalFogDepth;            ///< Depth at which fog is fully opaque (0 = no override)
 	qboolean globalFogActive;           ///< qtrue when a global fog override is in effect
 	float    globalFogOrigColor[4];     ///< Saved original fog state (RGB + depth) for restore
