@@ -3427,6 +3427,14 @@ void DX12_RenderScene(const refdef_t *fd)
 				{
 					if (!g_dbgDisableModelEntities)
 					{
+						// Reset to the opaque PSO for model entities.
+						// SCN_DrawSurface (used for world surfaces and brush entities) selects
+						// stage-specific PSOs (translucent, additive, modulate, sky …).
+						// Without an explicit reset here, model entities would inherit whatever
+						// blend state the last world/brush draw left active, producing dark or
+						// colour-shifted entity rendering.
+						dx12.commandList->SetPipelineState(dx12Scene.pso3D);
+
 						// Per-surface root constants for entity: isEntity=1, identity UV transform, white stageColor
 						entPsc.uvM00              = 1.0f;
 						entPsc.uvM11              = 1.0f;
