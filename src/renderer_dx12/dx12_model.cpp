@@ -434,11 +434,14 @@ qboolean DX12_LoadMD3(int slot, const char *name)
 		// Register the surface's diffuse texture / shader (fallback when no skin)
 		if (surf->numShaders > 0 && shaders[0].name[0])
 		{
-			ms->texHandle = DX12_RegisterTexture(shaders[0].name);
+			ms->texHandle     = DX12_RegisterTexture(shaders[0].name);
 			if (!ms->texHandle)
 			{
 				ms->texHandle = DX12_RegisterMaterial(shaders[0].name);
 			}
+			// Always register as a full material so multi-stage effects (alpha test,
+			// animated textures, blend modes) work for entity model surfaces.
+			ms->materialHandle = DX12_RegisterMaterial(shaders[0].name);
 		}
 
 		entry->numSurfaces++;
@@ -689,6 +692,8 @@ qboolean DX12_LoadMDC(int slot, const char *name)
 			{
 				ms->texHandle = DX12_RegisterMaterial(shaders[0].name);
 			}
+			// Always register as a full material for multi-stage effects.
+			ms->materialHandle = DX12_RegisterMaterial(shaders[0].name);
 		}
 
 		entry->numSurfaces++;
@@ -768,10 +773,11 @@ qboolean DX12_LoadMDC(int slot, const char *name)
 		entry->valid     = qtrue;
 		entry->modelType = DX12_MOD_MD3;  // same draw path as MD3
 		dx12.ri.Printf(PRINT_DEVELOPER,
-		               "DX12_LoadMDC: loaded '%s' (%d surface%s, %d tags)\n",
+		               "DX12_LoadMDC: loaded '%s' (%d surface%s, %d tag%s)\n",
 		               name, entry->numSurfaces,
 		               entry->numSurfaces == 1 ? "" : "s",
-		               entry->numTags);
+		               entry->numTags,
+		               entry->numTags == 1 ? "" : "s");
 	}
 
 	return entry->valid;
@@ -1151,85 +1157,39 @@ void DX12_DrawEntity(const dx12SceneEntity_t *ent, D3D12_GPU_VIRTUAL_ADDRESS cbG
 
 	// -------------------------------------------------------------------------
 	// MD3 / MDC – rigid mesh (static GPU VB/IB)
+	// Draw each surface through the full material stage pipeline so that alpha
+	// testing, animated textures, tcMod scroll/rotate, and multi-stage blend
+	// effects work on entity models the same as on world BSP surfaces.
 	// -------------------------------------------------------------------------
 	for (s = 0; s < entry->numSurfaces; s++)
 	{
-		dx12ModelSurface_t         *ms = &entry->surfaces[s];
-		dx12Texture_t              *tex;
-		D3D12_VERTEX_BUFFER_VIEW    vbv = {};
-		D3D12_INDEX_BUFFER_VIEW     ibv = {};
-		D3D12_GPU_DESCRIPTOR_HANDLE srvDiffuse;
+		dx12ModelSurface_t *ms = &entry->surfaces[s];
+		qhandle_t           skinTexHandle = 0;
 
 		if (!ms->vertexBuffer || !ms->indexBuffer || ms->numIndices == 0)
 		{
 			continue;
 		}
 
-		// Resolve diffuse texture: skin override → MD3 embedded → skip surface
+		// Resolve skin override (takes priority over material stage textures on
+		// stage 0, matching GL R_SetupEntityLighting / skin lookup behaviour).
+		if (ent->customSkin)
 		{
-			qhandle_t resolvedHandle = 0;
-
-			// 1. Custom skin overrides the MD3's embedded shader
-			if (ent->customSkin)
-			{
-				resolvedHandle = DX12_GetSkinTexture(ent->customSkin, ms->surfName);
-			}
-
-			// 2. Fall back to the texture registered at model-load time
-			if (!resolvedHandle)
-			{
-				resolvedHandle = ms->texHandle;
-			}
-
-			// 3. No texture at all – skip to avoid rendering opaque white
-			if (!resolvedHandle)
-			{
-				dx12.ri.Printf(PRINT_DEVELOPER,
-				               "DX12: Missing skin entry for surface '%s' (skin %d)\n",
-				               ms->surfName, (int)ent->customSkin);
-				continue;
-			}
-
-			tex = DX12_GetTexture(resolvedHandle);
+			skinTexHandle = DX12_GetSkinTexture(ent->customSkin, ms->surfName);
 		}
 
-		if (tex && tex->resource)
+		// If no skin resolved and no material/texture is available, skip the
+		// surface rather than drawing it with the white fallback.
+		if (!skinTexHandle && !ms->materialHandle && !ms->texHandle)
 		{
-			srvDiffuse = tex->gpuHandle;
-		}
-		else
-		{
-			// Fallback: slot-0 (white) texture
-			srvDiffuse = dx12.srvHeap->GetGPUDescriptorHandleForHeapStart();
-		}
-
-		// Diffuse at t0 (root param 1).
-		// Models have no lightmap; bind the white texture (slot 0) at t1
-		// (root param 2) so the shader computes: diffuse * white * 2 * color
-		// = diffuse * 2 * color, matching the standard world overbright factor.
-		{
-			D3D12_GPU_DESCRIPTOR_HANDLE srvWhite;
-
-			// Slot 0 of the SRV heap is always the 1×1 white fallback
-			srvWhite.ptr = dx12.srvHeap->GetGPUDescriptorHandleForHeapStart().ptr;
-
-			dx12.commandList->SetGraphicsRootDescriptorTable(1, srvDiffuse);
-			dx12.commandList->SetGraphicsRootDescriptorTable(2, srvWhite);
+			dx12.ri.Printf(PRINT_DEVELOPER,
+			               "DX12: Missing skin/material for surface '%s' (skin %d)\n",
+			               ms->surfName, (int)ent->customSkin);
+			continue;
 		}
 
-		// Vertex buffer
-		vbv.BufferLocation = ms->vertexBuffer->GetGPUVirtualAddress();
-		vbv.SizeInBytes    = ms->numVertices * (UINT)sizeof(dx12WorldVertex_t);
-		vbv.StrideInBytes  = (UINT)sizeof(dx12WorldVertex_t);
-
-		// Index buffer
-		ibv.BufferLocation = ms->indexBuffer->GetGPUVirtualAddress();
-		ibv.SizeInBytes    = ms->numIndices * (UINT)sizeof(int);
-		ibv.Format         = DXGI_FORMAT_R32_UINT;
-
-		dx12.commandList->IASetVertexBuffers(0, 1, &vbv);
-		dx12.commandList->IASetIndexBuffer(&ibv);
-		dx12.commandList->DrawIndexedInstanced(ms->numIndices, 1, 0, 0, 0);
+		// Full material-stage draw (alpha test, blend, tcMod, rgbGen/alphaGen …)
+		DX12_DrawEntityModelSurface(ms, skinTexHandle, cbGpuVA);
 	}
 }
 

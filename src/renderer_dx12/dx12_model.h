@@ -82,7 +82,8 @@ typedef struct
 	ID3D12Resource *indexBuffer;           ///< Default-heap IB (UINT32[])
 	UINT            numVertices;
 	UINT            numIndices;
-	qhandle_t       texHandle;             ///< Diffuse texture / material handle (from MD3 shader name)
+	qhandle_t       texHandle;             ///< Diffuse texture handle (raw image, from DX12_RegisterTexture)
+	qhandle_t       materialHandle;        ///< Material handle (from DX12_RegisterMaterial) for multi-stage draw
 	char            surfName[MAX_QPATH];   ///< MD3 surface name (lower-cased), used for skin lookup
 } dx12ModelSurface_t;
 
@@ -251,5 +252,23 @@ int DX12_LerpTag(orientation_t *tag, const refEntity_t *refent,
  * @param[in]  tag     Tag in parent-local Q3 space.
  */
 void DX12_ApplyTagTransform(float out[4][4], const float parent[4][4], const md3Tag_t *tag);
+
+/**
+ * @brief Draw one MD3/MDC model surface through the full material stage pipeline
+ * with entity lighting (isEntity=1, useLightmap=0).
+ *
+ * Iterates all active stages of the surface's material applying tcMod chains,
+ * rgbGen/alphaGen, blend-mode PSO selection, and per-stage SRV binding.
+ * Falls back to a single opaque draw when no material stages are present.
+ *
+ * Defined in dx12_scene.cpp (needs access to static scene helpers).
+ *
+ * @param[in] ms             Surface descriptor: VB, IB, materialHandle, texHandle.
+ * @param[in] skinTexHandle  Resolved skin texture (0 = use material / embedded).
+ * @param[in] cbGpuVA        Per-entity constant-buffer GPU virtual address.
+ */
+void DX12_DrawEntityModelSurface(const dx12ModelSurface_t *ms,
+                                 qhandle_t skinTexHandle,
+                                 D3D12_GPU_VIRTUAL_ADDRESS cbGpuVA);
 
 #endif // _WIN32

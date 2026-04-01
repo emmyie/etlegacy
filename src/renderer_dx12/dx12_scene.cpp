@@ -1014,10 +1014,16 @@ D3D12_BLEND_DESC DX12_BlendFromGL(int src, int dst)
 /**
  * @brief Select the appropriate PSO for a material stage based on its blend factors.
  *
- * For the first active stage (@p isFirstStage == qtrue), depth writes are enabled
- * (uses pso3D for opaque, pso3DTranslucent for blended).  For subsequent stages
- * (where depth has already been written by the first pass), a no-depth-write PSO
- * is chosen:
+ * For the first active stage (@p isFirstStage == qtrue), depth writes are ALWAYS
+ * enabled unless @p isTranslucent is also qtrue.  This matches the GL renderer
+ * where the first pass of any opaque multi-stage material (e.g. the standard
+ * "$lightmap + diffuse filter" two-stage world shader) writes depth so that the
+ * geometry is correctly occluded, regardless of the blend function declared for
+ * that stage.  Only explicitly translucent materials (glass, water, smoke) skip
+ * depth writes on their first stage.
+ *
+ * For subsequent stages (where depth has already been written by the first pass),
+ * a no-depth-write PSO is chosen based on the blend factors:
  *   ONE / ONE        → pso3DAdditive
  *   DST_COLOR / ZERO → pso3DModulate
  *   all others       → pso3DTranslucent (SRC_ALPHA/INV_SRC_ALPHA, no depth write)
@@ -1027,20 +1033,29 @@ D3D12_BLEND_DESC DX12_BlendFromGL(int src, int dst)
  *
  * Falls back to pso3D when the preferred PSO has not been created.
  *
- * @param[in] srcBlend      D3D12 source blend factor from dx12MaterialStage_t.
- * @param[in] dstBlend      D3D12 destination blend factor.
- * @param[in] isFirstStage  qtrue when this is the first drawn stage of the surface.
- * @param[in] isDoubleSided qtrue when the material has "cull none"/"cull twosided".
+ * @param[in] srcBlend       D3D12 source blend factor from dx12MaterialStage_t.
+ * @param[in] dstBlend       D3D12 destination blend factor.
+ * @param[in] isFirstStage   qtrue when this is the first drawn stage of the surface.
+ * @param[in] isDoubleSided  qtrue when the material has "cull none"/"cull twosided".
+ * @param[in] isTranslucent  qtrue when the material has surfaceparm trans.  Only
+ *                           when this is qtrue will the first stage use a
+ *                           depth-write-OFF PSO.
  * @return Pointer to the selected ID3D12PipelineState.
  */
 static ID3D12PipelineState *SCN_SelectStagePSO(D3D12_BLEND srcBlend, D3D12_BLEND dstBlend,
-                                               qboolean isFirstStage, qboolean isDoubleSided)
+                                               qboolean isFirstStage, qboolean isDoubleSided,
+                                               qboolean isTranslucent)
 {
 	qboolean isOpaque = ( srcBlend == D3D12_BLEND_ONE && dstBlend == D3D12_BLEND_ZERO ) ? qtrue : qfalse;
 
 	if (isFirstStage)
 	{
-		if (isOpaque)
+		// Non-translucent materials always get a depth-write-ON PSO for the first stage,
+		// even when the stage declares a non-opaque blendfunc.  Multi-pass GL shaders
+		// (e.g. "$lightmap + blendFunc filter") mark stage 0 ($lightmap) inactive, so
+		// stage 1 becomes the first draw; but it still needs to write depth so that
+		// subsequent geometry is correctly occluded.
+		if (!isTranslucent || isOpaque)
 		{
 			if (isDoubleSided && dx12Scene.pso3DOpaqueTwoSided)
 			{
@@ -1049,7 +1064,7 @@ static ID3D12PipelineState *SCN_SelectStagePSO(D3D12_BLEND srcBlend, D3D12_BLEND
 			return dx12Scene.pso3D;
 		}
 
-		// First stage but with blending: use the translucent PSO (depth-write disabled)
+		// Explicitly translucent first stage (glass, window, alpha-blended particles).
 		return dx12Scene.pso3DTranslucent ? dx12Scene.pso3DTranslucent : dx12Scene.pso3D;
 	}
 
@@ -1215,7 +1230,7 @@ static void SCN_DrawSurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDRESS 
 
 			// Select PSO based on blend mode and stage index
 			stagePso = SCN_SelectStagePSO(st->srcBlend, st->dstBlend, firstDraw,
-			                              mat->isDoubleSided);
+			                              mat->isDoubleSided, mat->isTranslucent);
 			dx12.commandList->SetPipelineState(stagePso);
 
 			// Per-surface root constants (14 DWORDs)
@@ -1271,6 +1286,180 @@ static void SCN_DrawSurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDRESS 
 	{
 		dx12.commandList->SetPipelineState(dx12Scene.pso3D);
 	}
+}
+
+// ---------------------------------------------------------------------------
+// DX12_DrawEntityModelSurface
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Draw one MD3/MDC model surface through the full material stage pipeline.
+ *
+ * This is the entity-model equivalent of SCN_DrawSurface.  Key differences from
+ * the world-surface path:
+ *   - isEntity = 1.0 (HLSL uses entityAmbient + N.L * entityDirected, not lightmap)
+ *   - useLightmap = 0.0 (entity models have no BSP lightmap)
+ *   - VB/IB come from the model's GPU buffers (not the world VB/IB)
+ *   - Multiple draw calls are issued when the material has more than one stage
+ *     (e.g. glow overlays, animated layers, additive or modulate blending)
+ *   - Alpha testing (e.g. chain-link fences, foliage) is applied from the stage's
+ *     alphaTestThreshold, fixing surfaces that appeared solid in the single-draw path
+ *
+ * When no material is found (or the material has no active stages), the fallback
+ * texture handle (@p fallbackTexHandle) is used for a single opaque draw, preserving
+ * the same appearance as the old code.
+ *
+ * @param[in] ms                Surface descriptor (VB, IB, materialHandle, texHandle).
+ * @param[in] skinTexHandle     Resolved skin texture (0 = use material / embedded tex).
+ * @param[in] cbGpuVA           Per-entity constant-buffer GPU virtual address.
+ */
+void DX12_DrawEntityModelSurface(const dx12ModelSurface_t *ms,
+                                 qhandle_t skinTexHandle,
+                                 D3D12_GPU_VIRTUAL_ADDRESS cbGpuVA)
+{
+	dx12Material_t            *mat;
+	D3D12_VERTEX_BUFFER_VIEW   vbv = {};
+	D3D12_INDEX_BUFFER_VIEW    ibv = {};
+	D3D12_GPU_DESCRIPTOR_HANDLE white;
+	float                      timeSec;
+	qboolean                   firstDraw;
+	int                        si;
+
+	if (!ms || !ms->vertexBuffer || !ms->indexBuffer || ms->numIndices == 0)
+	{
+		return;
+	}
+
+	// Bind CB and set up VB/IB once for all stages of this surface
+	dx12.commandList->SetGraphicsRootConstantBufferView(DX12_SCENE_ROOT_PARAM_CB, cbGpuVA);
+
+	vbv.BufferLocation = ms->vertexBuffer->GetGPUVirtualAddress();
+	vbv.SizeInBytes    = ms->numVertices * (UINT)sizeof(dx12WorldVertex_t);
+	vbv.StrideInBytes  = (UINT)sizeof(dx12WorldVertex_t);
+
+	ibv.BufferLocation = ms->indexBuffer->GetGPUVirtualAddress();
+	ibv.SizeInBytes    = ms->numIndices * (UINT)sizeof(int);
+	ibv.Format         = DXGI_FORMAT_R32_UINT;
+
+	dx12.commandList->IASetVertexBuffers(0, 1, &vbv);
+	dx12.commandList->IASetIndexBuffer(&ibv);
+
+	// Slot 0 of the SRV heap is the 1×1 white fallback – used for the lightmap
+	// slot because entity models have no BSP lightmap.
+	white = dx12.srvHeap->GetGPUDescriptorHandleForHeapStart();
+	dx12.commandList->SetGraphicsRootDescriptorTable(DX12_SCENE_ROOT_PARAM_LIGHTMAP, white);
+
+	timeSec   = (float)g_sceneTimeMs / 1000.0f;
+	firstDraw = qtrue;
+
+	mat = DX12_GetMaterial(ms->materialHandle);
+
+	if (mat && mat->numStages > 0)
+	{
+		for (si = 0; si < mat->numStages; si++)
+		{
+			const dx12MaterialStage_t *st = &mat->stages[si];
+			dx12PerSurfConstants_t     psc;
+			qhandle_t                  stageTexHandle = 0;
+			dx12Texture_t             *stageTex;
+			D3D12_GPU_DESCRIPTOR_HANDLE srvHandle;
+			ID3D12PipelineState        *stagePso;
+
+			if (!st->active)
+			{
+				continue;
+			}
+
+			// When a custom skin overrides the surface, use the skin's texture for
+			// stage 0; subsequent stages use their own texture handles.
+			if (skinTexHandle && firstDraw)
+			{
+				stageTexHandle = skinTexHandle;
+			}
+			else
+			{
+				// animMap: select current animation frame
+				if (st->animNumFrames > 0 && st->animFps > 0.0f)
+				{
+					int frameIdx = (int)(timeSec * st->animFps);
+
+					frameIdx       = ((frameIdx % st->animNumFrames) + st->animNumFrames) % st->animNumFrames;
+					stageTexHandle = st->animFrames[frameIdx];
+				}
+				else
+				{
+					stageTexHandle = st->texHandle;
+				}
+
+				// If the material stage has no texture, fall back to the embedded one
+				if (!stageTexHandle)
+				{
+					stageTexHandle = ms->texHandle;
+				}
+			}
+
+			// Build per-surface constants for this stage
+			Com_Memset(&psc, 0, sizeof(psc));
+			SCN_BuildUVMatrix(&psc, st, timeSec);
+
+			psc.alphaTestThreshold = st->alphaTestThreshold;
+			psc.isEntity           = 1.0f; // use entity ambient + directed lighting
+			psc.useLightmap        = 0.0f; // entity models have no lightmap
+			psc.useVertexColor     = (st->rgbGen == DX12_CGEN_VERTEX
+			                          || st->rgbGen == DX12_CGEN_EXACT_VERTEX) ? 1.0f : 0.0f;
+			SCN_ComputeStageColor(&psc, st, timeSec);
+
+			// Select PSO: entity model surfaces are never translucent in the same
+			// sense as world glass (they're drawn last and only once per entity pass).
+			// Use the material's isTranslucent flag to allow proper alpha blending.
+			stagePso = SCN_SelectStagePSO(st->srcBlend, st->dstBlend, firstDraw,
+			                              mat->isDoubleSided, mat->isTranslucent);
+			dx12.commandList->SetPipelineState(stagePso);
+			dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
+			                                                DX12_SCENE_PERSURF_DWORDS, &psc, 0);
+
+			stageTex  = DX12_GetTexture(stageTexHandle);
+			srvHandle = (stageTex && stageTex->resource)
+			            ? stageTex->gpuHandle
+			            : white;
+			dx12.commandList->SetGraphicsRootDescriptorTable(DX12_SCENE_ROOT_PARAM_DIFFUSE, srvHandle);
+
+			dx12.commandList->DrawIndexedInstanced(ms->numIndices, 1, 0, 0, 0);
+
+			firstDraw = qfalse;
+		}
+	}
+
+	if (firstDraw)
+	{
+		// No material or no active stages: fall back to a single opaque draw using
+		// the skin/embedded texture so the surface is at least visible.
+		dx12PerSurfConstants_t psc;
+		dx12Texture_t         *tex;
+		D3D12_GPU_DESCRIPTOR_HANDLE srvHandle;
+
+		Com_Memset(&psc, 0, sizeof(psc));
+		psc.uvM00         = 1.0f;
+		psc.uvM11         = 1.0f;
+		psc.isEntity      = 1.0f;
+		psc.stageColor[0] = 1.0f;
+		psc.stageColor[1] = 1.0f;
+		psc.stageColor[2] = 1.0f;
+		psc.stageColor[3] = 1.0f;
+
+		dx12.commandList->SetPipelineState(dx12Scene.pso3D);
+		dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
+		                                                DX12_SCENE_PERSURF_DWORDS, &psc, 0);
+
+		tex       = DX12_GetTexture(skinTexHandle ? skinTexHandle : ms->texHandle);
+		srvHandle = (tex && tex->resource) ? tex->gpuHandle : white;
+		dx12.commandList->SetGraphicsRootDescriptorTable(DX12_SCENE_ROOT_PARAM_DIFFUSE, srvHandle);
+
+		dx12.commandList->DrawIndexedInstanced(ms->numIndices, 1, 0, 0, 0);
+	}
+
+	// Restore opaque PSO for subsequent draws
+	dx12.commandList->SetPipelineState(dx12Scene.pso3D);
 }
 
 // ---------------------------------------------------------------------------
@@ -1519,7 +1708,7 @@ static void DX12_DrawSkySurface(const dx12DrawSurf_t *ds, D3D12_GPU_VIRTUAL_ADDR
 			SCN_ComputeStageColor(&psc, st, timeSec);
 
 			// Select PSO based on blend mode (regular world PSO, NOT sky PSO).
-			stagePso = SCN_SelectStagePSO(st->srcBlend, st->dstBlend, firstDraw, qfalse);
+			stagePso = SCN_SelectStagePSO(st->srcBlend, st->dstBlend, firstDraw, qfalse, qfalse);
 			dx12.commandList->SetPipelineState(stagePso);
 
 			dx12.commandList->SetGraphicsRoot32BitConstants(DX12_SCENE_ROOT_PARAM_PERSURF,
@@ -3437,15 +3626,19 @@ void DX12_RenderScene(const refdef_t *fd)
 				{
 					if (!g_dbgDisableModelEntities)
 					{
-						// Reset to the opaque PSO for model entities.
-						// SCN_DrawSurface (used for world surfaces and brush entities) selects
-						// stage-specific PSOs (translucent, additive, modulate, sky …).
-						// Without an explicit reset here, model entities would inherit whatever
-						// blend state the last world/brush draw left active, producing dark or
-						// colour-shifted entity rendering.
+						// Reset to the opaque PSO as a safe starting state.
+						// DX12_DrawEntity dispatches per model type:
+						//   - MD3/MDC: each surface is drawn via DX12_DrawEntityModelSurface,
+						//     which iterates material stages (alpha test, blend, tcMod, rgbGen)
+						//     and selects the appropriate PSO per stage.
+						//   - MDS/MDM: drawn with the per-surface constants set below, which
+						//     use identity UV and white stageColor (basic single-pass draw).
 						dx12.commandList->SetPipelineState(dx12Scene.pso3D);
 
-						// Per-surface root constants for entity: isEntity=1, identity UV transform, white stageColor
+						// Per-surface root constants for MDS/MDM entity surfaces:
+						// isEntity=1 (entity lighting), identity UV, white stageColor.
+						// These are overridden per-surface by DX12_DrawEntityModelSurface for
+						// MD3/MDC; MDS/MDM uses these as-is.
 						entPsc.uvM00              = 1.0f;
 						entPsc.uvM11              = 1.0f;
 						entPsc.alphaTestThreshold = 0.0f;
