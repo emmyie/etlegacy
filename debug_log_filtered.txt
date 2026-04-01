@@ -21,6 +21,7 @@
 0 Warning: cvar "r_mode" given initial values: "-2" and "4"
 0 Warning: cvar "team_nocontrols" given initial values: "0" and "1"
 0 ^1 ...per monitor v2: failed
+0 ^1DX12_SceneInit: CreateGraphicsPipelineState (wireframe) failed (0x80004005)
 0 ^1ERROR: Can't find 0.dat
 0 ^1ERROR: Can't find autoexec_default.cfg
 0 ^1ERROR: Can't find autoexec_fueldump.cfg
@@ -785,6 +786,7 @@
 0 ^1ERROR: Can't find maps/fueldump/lm_0255.tga
 0 ^1ERROR: Can't find maps/fueldump_loc_local.dat
 0 ^1ERROR: Can't find mapscripts/fueldump.script
+0 ^1ERROR: Can't find mapvoteplayerscount.cfg
 0 ^1ERROR: Can't find models/ammo/grenade.jpg
 0 ^1ERROR: Can't find models/ammo/grenade.png
 0 ^1ERROR: Can't find models/ammo/grenade.tga
@@ -1220,22 +1222,7 @@
 0 ^1ERROR: Can't find textures/xlab_wall/xmetal_c03.tga
 0 ^1Warning: setstate (axissidetower) called and no entities found
 0 ^1Warning: setstate (axistunneltower) called and no entities found
-0 ^1trap_R_RegisterSkin: Failed to load skin: 'models/players/temperate/allied/engineer/acc/backpack_engineer.'
-0 ^1trap_R_RegisterSkin: Failed to load skin: 'models/players/temperate/allied/fieldops/acc/backpack_fieldops.'
-0 ^1trap_R_RegisterSkin: Failed to load skin: 'models/players/temperate/allied/medic/acc/backpack_medic.skin'
-0 ^1trap_R_RegisterSkin: Failed to load skin: 'models/players/temperate/allied/soldier/acc/backpack_soldier.sk'
-0 ^1trap_R_RegisterSkin: Failed to load skin: 'models/players/temperate/axis/engineer/acc/backpack_engineer.sk'
-0 ^1trap_R_RegisterSkin: Failed to load skin: 'models/players/temperate/axis/fieldops/acc/backpack_fieldops.sk'
-0 ^1trap_R_RegisterSkin: Failed to load skin: 'models/players/temperate/axis/medic/acc/backpack_medic.skin'
-0 ^1trap_R_RegisterSkin: Failed to load skin: 'models/players/temperate/axis/soldier/acc/backpack_soldier.skin'
-0 ^1trap_R_RegisterSkin: Failed to load skin: 'models/players/temperate/common/rank_cap_cvops.skin'
-0 ^1trap_R_RegisterSkin: Failed to load skin: 'models/players/temperate/common/rank_helmet_engineer.skin'
-0 ^1trap_R_RegisterSkin: Failed to load skin: 'models/players/temperate/common/rank_helmet_fieldops.skin'
-0 ^1trap_R_RegisterSkin: Failed to load skin: 'models/players/temperate/common/rank_helmet_medic.skin'
-0 ^1trap_R_RegisterSkin: Failed to load skin: 'models/players/temperate/common/rank_helmet_soldier.skin'
-0 ^2trap_R_RegisterShaderNoMip: register shader no mip: 'ui/assets2/stamp_failed'
 0 ^3WARNING G_ScriptAction_SetChargeTimeFactor: 'lieutenant' is a deprecated keyword, use 'fieldops' instead
-0 ^3WARNING: Wrong number of elements in Q_sscanfc. Expected 4 was 0 in src\qcommon\q_shared.c:2179
 0 ^3WARNING: sound/hitsounds/hit.wav is a 8 bit audio file
 0 ^3WARNING: sound/hitsounds/hithead.wav is a 8 bit audio file
 0 ^3WARNING: sound/hitsounds/hitteam.wav is a 8 bit audio file
@@ -1245,5 +1232,12 @@
 0 ^3WARNING: sound/weapons/landmine/mine_bounce.wav is a 8 bit audio file
 0 ^3WARNING: sound/weapons/satchel/satchel_bounce.wav is a 8 bit audio file
 0 ^3Warning: No config with filename '0' found
-0 trap_R_RegisterShaderNoMip : loaded ui/assets2/stamp_failed in 23 msec
-1400 ^3WARNING: Wrong number of elements in Q_sscanfc. Expected 4 was 0 in src\qcommon\q_shared.c:2179
+D3D12 ERROR: ID3D12Device::CreateInputLayout: Input Signature in bytecode could not be parsed.  Data may be corrupt or in an unrecognizable format. [ STATE_CREATION ERROR #63: CREATEINPUTLAYOUT_UNPARSEABLEINPUTSIGNATURE]
+D3D12 ERROR: ID3D12Device::CreatePixelShader: Pixel Shader is corrupt or in an unrecognized format. [ STATE_CREATION ERROR #93: CREATEPIXELSHADER_INVALIDSHADERBYTECODE]
+D3D12 ERROR: ID3D12Device::CreatePixelShader: Shader is corrupt or in an unrecognized format. [ STATE_CREATION ERROR #93: CREATEPIXELSHADER_INVALIDSHADERBYTECODE]
+D3D12 ERROR: ID3D12Device::CreateVertexShader: Shader is corrupt or in an unrecognized format. [ STATE_CREATION ERROR #67: CREATEVERTEXSHADER_INVALIDSHADERBYTECODE]
+D3D12 ERROR: ID3D12Device::CreateVertexShader: Vertex Shader is corrupt or in an unrecognized format. [ STATE_CREATION ERROR #67: CREATEVERTEXSHADER_INVALIDSHADERBYTECODE]
+Exception thrown at 0x75FA3184 in etl.exe: Microsoft C++ exception: _com_error at memory location 0x07AF48FC.
+Exception thrown at 0x75FA3184 in etl.exe: Microsoft C++ exception: _com_error at memory location 0x07AF4B20.
+Exception thrown at 0x75FA3184 in etl.exe: Microsoft C++ exception: _com_error at memory location 0x07AFA99C.
+Exception thrown at 0x75FA3184 in etl.exe: Microsoft C++ exception: _com_error at memory location 0x07AFABB8.

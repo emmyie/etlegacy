@@ -90,6 +90,12 @@ static void DX12_DecodeTGA(const byte *buf, int bufSize,
 	imageDescriptor = buf[17];
 	topLeft         = (imageDescriptor & 0x20) != 0;
 
+	// Validate ID field doesn't extend past EOF (prevent buffer overflow)
+	if (idLength > (bufSize - TGA_HEADER_SIZE))
+	{
+		return;
+	}
+
 	// Color-mapped images are not supported
 	if (colorMapType != 0)
 	{
@@ -113,6 +119,13 @@ static void DX12_DecodeTGA(const byte *buf, int bufSize,
 		return;
 	}
 
+	// Prevent integer overflow when calculating pixel count
+	// Maximum reasonable image size: 16384 x 16384 (256 megapixels)
+	if (w > 16384 || h > 16384)
+	{
+		return;
+	}
+
 	bytesPerPixel = pixelDepth / 8;
 	numPixels     = w * h;
 	out           = (byte *)dx12.ri.Z_Malloc((size_t)numPixels * 4);
@@ -123,6 +136,13 @@ static void DX12_DecodeTGA(const byte *buf, int bufSize,
 
 	src = buf + TGA_HEADER_SIZE + idLength;
 	end = buf + bufSize;
+
+	// Validate that src pointer is still within bounds (ID field doesn't extend past EOF)
+	if (src > end)
+	{
+		dx12.ri.Free(out);
+		return;
+	}
 	dst = out;
 
 	if (imageType == 2)

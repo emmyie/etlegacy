@@ -2376,7 +2376,10 @@ qboolean DX12_SceneInit(void)
 		// CPU staging array (always allocate so AddScenePoly can accumulate)
 		dx12Scene.polyVerts = (dx12WorldVertex_t *)dx12.ri.Z_Malloc(
 			DX12_MAX_SCENE_POLYVERTS * sizeof(dx12WorldVertex_t));
-		// If malloc fails the poly pass will be silently skipped
+		if (!dx12Scene.polyVerts)
+		{
+			dx12.ri.Printf(PRINT_WARNING, "DX12_SceneInit: failed to allocate poly vertex staging buffer; poly rendering disabled\n");
+		}
 	}
 
 	// ----------------------------------------------------------------

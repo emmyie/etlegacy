@@ -642,12 +642,18 @@ void DX12_LoadWorld(const char *name)
 	int        bufLen    = 0;
 	dheader_t *header    = NULL;
 	byte      *fileBase  = NULL;
+	char       fixedName[MAX_QPATH];
 	int        i;
 
 	if (!name || !name[0])
 	{
 		return;
 	}
+
+	// Normalize path: convert backslashes to forward slashes
+	Q_strncpyz(fixedName, name, sizeof(fixedName));
+	DX12_FixPath(fixedName);
+	name = fixedName;
 
 	// Release any previously loaded world
 	DX12_ShutdownWorld();

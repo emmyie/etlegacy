@@ -1344,6 +1344,7 @@ static qhandle_t RE_DX12_RegisterSkin(const char *name)
 	char       *text_p;
 	char       *token;
 	char       surfName[MAX_QPATH];
+	char       fixedName[MAX_QPATH];
 	int        totalSurfaces = 0;
 
 	if (!name || !name[0])
@@ -1357,6 +1358,11 @@ static qhandle_t RE_DX12_RegisterSkin(const char *name)
 		dx12.ri.Printf(PRINT_WARNING, "RE_DX12_RegisterSkin: skin name exceeds MAX_QPATH: '%s'\n", name);
 		return 0;
 	}
+
+	// Normalize path: convert backslashes to forward slashes
+	Q_strncpyz(fixedName, name, sizeof(fixedName));
+	DX12_FixPath(fixedName);
+	name = fixedName;
 
 	// Deduplicate: return existing handle (1-based).
 	// Return 0 for slots that previously failed to load (numSurfaces == 0),
@@ -1578,6 +1584,7 @@ static void RE_DX12_RegisterFont(const char *fontName, int pointSize, void *font
 {
 	fontInfo_t          *fi = (fontInfo_t *)font;
 	char                datName[MAX_QPATH];
+	char                fixedFontName[MAX_QPATH];
 	void                *faceData = NULL;
 	int                 len;
 	const unsigned char *p;
@@ -1596,6 +1603,11 @@ static void RE_DX12_RegisterFont(const char *fontName, int pointSize, void *font
 	{
 		return;
 	}
+
+	// Normalize path: convert backslashes to forward slashes
+	Q_strncpyz(fixedFontName, fontName, sizeof(fixedFontName));
+	DX12_FixPath(fixedFontName);
+	fontName = fixedFontName;
 
 	// Clamp degenerate point sizes, matching GL's RE_RegisterFont.
 	if (pointSize <= 0)

@@ -148,7 +148,7 @@ typedef struct
 #define DX12_MAX_SCENE_POLYVERTS 8192
 
 /** Near clip plane distance (units).  Matches Q3 defaults. */
-#define DX12_SCENE_NEAR   4.0f
+#define DX12_SCENE_NEAR   3.0f
 /** Far clip plane distance (units). */
 #define DX12_SCENE_FAR    65536.0f
 
