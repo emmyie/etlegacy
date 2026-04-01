@@ -695,6 +695,72 @@ qboolean DX12_LoadMDC(int slot, const char *name)
 		surf = (mdcSurface_t *)((byte *)surf + surf->ofsEnd);
 	}
 
+	// -----------------------------------------------------------------------
+	// Parse tag data (all frames) for DX12_LerpTag.
+	//
+	// MDC stores per-frame tags as mdcTag_t (compressed short xyz + short
+	// Euler angles) rather than the full md3Tag_t float matrix.  We decode
+	// them to md3Tag_t format here at load time, exactly mirroring what
+	// GL's R_LerpTag does on-demand for every frame lookup (tr_model.c).
+	// After conversion the MD3 tag interpolation path in DX12_LerpTag works
+	// identically for both MD3 and MDC models.
+	// -----------------------------------------------------------------------
+	if (header->numTags > 0 && header->numFrames > 0
+	    && header->ofsTags >= (int)sizeof(mdcHeader_t)
+	    && header->ofsTagNames >= (int)sizeof(mdcHeader_t)
+	    && header->ofsTags < fileLen
+	    && header->ofsTagNames < fileLen)
+	{
+		int           tagTotal   = header->numFrames * header->numTags;
+		size_t        tagBytes   = (size_t)tagTotal * sizeof(md3Tag_t);
+		size_t        nameBytes  = (size_t)header->numTags * sizeof(mdcTagName_t);
+		size_t        mdcBytes   = (size_t)tagTotal * sizeof(mdcTag_t);
+
+		// Validate both tag-data blocks fit inside the file
+		if (header->ofsTags     + (int)mdcBytes  <= fileLen
+		    && header->ofsTagNames + (int)nameBytes <= fileLen)
+		{
+			const mdcTagName_t *tagNames = (const mdcTagName_t *)((byte *)fileData + header->ofsTagNames);
+			const mdcTag_t     *mdcTags  = (const mdcTag_t *)((byte *)fileData + header->ofsTags);
+
+			entry->tags = (md3Tag_t *)dx12.ri.Z_Malloc(tagBytes);
+			if (entry->tags)
+			{
+				int frameIdx, tagIdx;
+
+				for (frameIdx = 0; frameIdx < header->numFrames; frameIdx++)
+				{
+					for (tagIdx = 0; tagIdx < header->numTags; tagIdx++)
+					{
+						const mdcTag_t *src  = &mdcTags[frameIdx * header->numTags + tagIdx];
+						md3Tag_t       *dst  = &entry->tags[frameIdx * header->numTags + tagIdx];
+						vec3_t          angles;
+						int             component;
+
+						// Decompress origin
+						for (component = 0; component < 3; component++)
+						{
+							dst->origin[component] = (float)(src->xyz[component]) * (float)MD3_XYZ_SCALE;
+						}
+
+						// Decompress rotation: angles → axis matrix
+						angles[0] = (float)(src->angles[0]) * (float)MDC_TAG_ANGLE_SCALE;
+						angles[1] = (float)(src->angles[1]) * (float)MDC_TAG_ANGLE_SCALE;
+						angles[2] = (float)(src->angles[2]) * (float)MDC_TAG_ANGLE_SCALE;
+						AnglesToAxis(angles, dst->axis);
+
+						// Copy tag name (only needs to be set once per tag index, but
+						// we set it for every frame so any frame's tag is self-describing)
+						Q_strncpyz(dst->name, tagNames[tagIdx].name, sizeof(dst->name));
+					}
+				}
+
+				entry->numTags   = header->numTags;
+				entry->numFrames = header->numFrames;
+			}
+		}
+	}
+
 	dx12.ri.FS_FreeFile(fileData);
 
 	if (entry->numSurfaces > 0)
@@ -702,9 +768,10 @@ qboolean DX12_LoadMDC(int slot, const char *name)
 		entry->valid     = qtrue;
 		entry->modelType = DX12_MOD_MD3;  // same draw path as MD3
 		dx12.ri.Printf(PRINT_DEVELOPER,
-		               "DX12_LoadMDC: loaded '%s' (%d surface%s)\n",
+		               "DX12_LoadMDC: loaded '%s' (%d surface%s, %d tags)\n",
 		               name, entry->numSurfaces,
-		               entry->numSurfaces == 1 ? "" : "s");
+		               entry->numSurfaces == 1 ? "" : "s",
+		               entry->numTags);
 	}
 
 	return entry->valid;

@@ -277,6 +277,7 @@ typedef struct
 	vec3_t    axis[3];         ///< Rotation axes: [0]=forward [1]=left [2]=up
 	qhandle_t hModel;          ///< Model handle (0 = no model)
 	qhandle_t customSkin;      ///< Skin handle (0 = use MD3 embedded shaders)
+	int       renderfx;        ///< RF_* flags (RF_THIRD_PERSON, RF_FIRST_PERSON, …)
 	// Light grid sample – filled by DX12_RenderScene before the entity draw loop
 	vec3_t    ambientLight;    ///< Trilinearly sampled ambient light from light grid
 	vec3_t    directedLight;   ///< Trilinearly sampled directed light from light grid

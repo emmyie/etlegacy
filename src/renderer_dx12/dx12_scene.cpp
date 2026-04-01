@@ -2623,6 +2623,7 @@ void DX12_AddEntityToScene(const refEntity_t *re)
 	ent           = &dx12Scene.entities[dx12Scene.numEntities++];
 	ent->hModel    = re->hModel;
 	ent->customSkin = re->customSkin;
+	ent->renderfx  = re->renderfx;
 	ent->origin[0] = re->origin[0];
 	ent->origin[1] = re->origin[1];
 	ent->origin[2] = re->origin[2];
@@ -3347,6 +3348,15 @@ void DX12_RenderScene(const refdef_t *fd)
 			if (i >= DX12_MAX_SCENE_ENTITIES)
 			{
 				break;
+			}
+
+			// RF_THIRD_PERSON entities (e.g. local player's own body model) must
+			// not be drawn in the normal first-person view – they are only meant
+			// for 3rd-person / mirror / portal views which the DX12 renderer does
+			// not yet support.  Skipping them matches GL tr_main.c:1677.
+			if (ent->renderfx & RF_THIRD_PERSON)
+			{
+				continue;
 			}
 
 			// Each entity gets its own unique slot within this frame
